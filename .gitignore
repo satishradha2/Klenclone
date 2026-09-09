@@ -1,0 +1,26 @@
+# Source-system exports contain confidential business and personal data.
+source_exports/
+source_evidence/
+downloads/
+
+# Local secrets and authenticated-session material must never be committed.
+.env
+.env.*
+!.env.example
+!.env.asas.example
+!.env.asas.operational.example
+*.cookie
+*.session
+.secrets/
+
+# Local/editor and operating-system artifacts.
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Derived staging databases contain the same confidential source information.
+var/
+__pycache__/
+.pytest_cache/
+*.pyc

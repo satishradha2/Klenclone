@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sign in | Asas ERP</title>
+  <link rel="stylesheet" href="/static/asas-login.css">
+</head>
+<body>
+  <main class="login-shell">
+    <section class="identity">
+      <div class="brand"><span>A</span><div><b>ASAS ERP</b><small>Asas General Trading LLC</small></div></div>
+      <div><p>INDEPENDENT BUSINESS PLATFORM</p><h1>Your trade operations,<br>preserved and controlled.</h1><p class="copy">Review the cloned BizModo registers in the new Asas environment. HR and payroll are excluded.</p></div>
+      <small>BizModo source access remains read-only.</small>
+    </section>
+    <section class="form-side">
+      <form id="login-form" autocomplete="on">
+        <p class="eyebrow">PROVISIONED ACCESS</p>
+        <h2>Sign in to Asas ERP</h2>
+        <p class="intro">Use the independent administrator credentials created for this preview.</p>
+        <label>Username<input id="username" name="username" autocomplete="username" required></label>
+        <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+        <button type="submit">Sign in</button>
+        <p id="error" class="error" role="alert"></p>
+        <div class="safety"><b>Read-only preview</b><span>Transaction posting and production activation are disabled.</span></div>
+      </form>
+    </section>
+  </main>
+  <script src="/static/asas-login.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Asas ERP | Business operations</title>
+  <link rel="stylesheet" href="/static/erp.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span class="brand-mark">A</span><div><b>ASAS ERP</b><small>Trade operations</small></div></div>
+    <nav id="nav">
+      <a href="#overview" data-route="overview" class="active"><span>◫</span>Overview</a>
+      <p>OPERATIONS</p>
+      <a href="#sales" data-route="sales"><span>↗</span>Sales</a>
+      <a href="#sales-returns" data-route="sales-returns"><span>↩</span>Sales returns</a>
+      <a href="#purchases" data-route="purchases"><span>↙</span>Purchasing</a>
+      <a href="#drafts" data-route="drafts"><span>＋</span>Draft entry</a>
+      <a href="#inventory" data-route="inventory"><span>▦</span>Inventory</a>
+      <a href="#inventory-operations" data-route="inventory-operations"><span>⇄</span>Stock operations</a>
+      <a href="#goods-receipts" data-route="goods-receipts"><span>✓</span>Goods receipts</a>
+      <p>MASTERS</p>
+      <a href="#products" data-route="products"><span>◇</span>Products</a>
+      <a href="#customers" data-route="customers"><span>○</span>Customers</a>
+      <a href="#suppliers" data-route="suppliers"><span>△</span>Suppliers</a>
+      <p>FINANCE</p>
+      <a href="#accounting" data-route="accounting"><span>≋</span>Accounting</a>
+      <a href="#reports" data-route="reports"><span>▥</span>Reports</a>
+    </nav>
+    <div class="source-card"><span class="dot"></span><div><b>Clone database online</b><small>BizModo remains read-only</small></div></div>
+  </aside>
+  <main>
+    <header>
+      <div><p class="eyebrow">ASAS GENERAL TRADING LLC</p><h1 id="page-title">Overview</h1></div>
+      <div class="header-actions"><span class="preview-pill">READ-ONLY PREVIEW</span><span id="signed-in-user" class="signed-user"></span><button id="logout" class="logout" type="button">Sign out</button><div class="avatar">AA</div></div>
+    </header>
+    <section id="notice" class="notice"><b>Independent clone preview</b><span>This application reads only the cloned BizModo evidence. Posting and production activation remain disabled.</span></section>
+    <section id="content" aria-live="polite"><div class="loading">Loading cloned data…</div></section>
+  </main>
+  <script src="/static/erp.js" defer></script>
+</body>
+</html>

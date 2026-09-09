@@ -1,0 +1,110 @@
+const fmt=n=>new Intl.NumberFormat('en-US').format(n??0);
+const fmtValue=(v,type)=>type==='amount'?new Intl.NumberFormat('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}).format(v??0):type==='quantity'?new Intl.NumberFormat('en-US',{maximumFractionDigits:3}).format(v??0):fmt(v);
+const get=async path=>{const r=await fetch(path);if(!r.ok)throw new Error(await r.text());return r.json()};
+const post=async(path,body,headers={})=>{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(body)});const data=await r.json();if(!r.ok)throw new Error(data.detail||'Request failed');return data};
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[c]));
+const human=s=>String(s??'Unspecified').replaceAll('_',' ').replace(/\b\w/g,c=>c.toUpperCase());
+async function load(){try{
+  const [health,summary,gates,coverage,exceptions,audit]=await Promise.all(['/api/v1/health','/api/v1/summary','/api/v1/gates','/api/v1/coverage','/api/v1/exceptions','/api/v1/audit-events'].map(get));
+  if(health.uat_authentication_enabled){document.getElementById('authButton').hidden=false;document.getElementById('uatNav').hidden=false}
+  document.getElementById('health').innerHTML='<span></span>Local database reachable';
+  document.getElementById('organizationName').textContent=summary.organization_name;
+  document.getElementById('snapshotText').textContent=`${summary.source_system} · ${summary.snapshot} · ${summary.atomic?'atomic':'non-atomic browser evidence'}`;
+  const cards=[['Raw records',summary.raw_records],['Coverage',summary.coverage_records],['Documents',summary.documents],['Movements',summary.inventory_movements],['Journals',summary.journals],['Exceptions',summary.exceptions]];
+  document.getElementById('summaryCards').innerHTML=cards.map(([l,v])=>`<div class="card"><strong>${fmt(v)}</strong><span>${esc(l)}</span></div>`).join('');
+  const blocked=gates.items.filter(x=>x.status==='blocked').length;document.getElementById('gateTotal').textContent=`${blocked} blocked · 0 active`;
+  document.getElementById('gates').innerHTML=gates.items.filter(x=>x.domain!=='coverage').map(x=>`<div class="gate"><span class="domain">${esc(x.domain)}</span><span>${esc(x.name)}</span><span class="status ${esc(x.status)}">${esc(x.status.replaceAll('_',' '))} · ${fmt(x.issues)}</span></div>`).join('');
+  const max=Math.max(...coverage.items.map(x=>x.source_row_count),1);document.getElementById('coverage').innerHTML=coverage.items.slice().sort((a,b)=>b.source_row_count-a.source_row_count).slice(0,12).map(x=>`<div class="coverage-row"><div><span>${esc(x.source_entity.replaceAll('_',' '))}</span><strong>${fmt(x.source_row_count)}</strong></div><div class="bar"><i style="width:${Math.max(2,x.source_row_count/max*100)}%"></i></div></div>`).join('');
+  document.getElementById('exceptions').innerHTML=exceptions.items.slice(0,12).map(x=>`<div class="exception"><span>${esc(x.exception_code.replaceAll('_',' '))}</span><span class="severity">${esc(x.severity)}</span><strong>${fmt(x.count)}</strong></div>`).join('');
+  document.getElementById('audit').innerHTML=audit.items.map(x=>`<div class="audit-row"><strong>#${x.id}</strong><span>${esc(x.event_type.replaceAll('_',' '))}</span><small>${esc(x.occurred_at)}</small></div>`).join('');
+}catch(e){document.getElementById('health').className='health blocked';document.getElementById('health').textContent='Control center unavailable';console.error(e)}}
+
+async function showModule(module){
+  document.querySelectorAll('.module-nav button').forEach(button=>button.classList.toggle('active',button.dataset.module===module));
+  const overview=document.getElementById('overviewView'), workspace=document.getElementById('moduleView'), uat=document.getElementById('uatView');
+  overview.hidden=true;workspace.hidden=true;uat.hidden=true;
+  if(module==='overview'){overview.hidden=false;history.replaceState(null,'','#overview');return}
+  if(module==='uat'){uat.hidden=false;history.replaceState(null,'','#uat');await ensureSession();return}
+  workspace.hidden=false;
+  document.getElementById('moduleTitle').textContent='Loading module…';
+  document.getElementById('moduleSubtitle').textContent='Reading reconciled clone aggregates';
+  document.getElementById('moduleCards').innerHTML='';
+  document.getElementById('moduleBreakdowns').innerHTML='<div class="loading">Loading controlled evidence…</div>';
+  document.getElementById('moduleBlockers').innerHTML='';
+  try{
+    const data=await get(`/api/v1/modules/${encodeURIComponent(module)}`);
+    document.getElementById('moduleTitle').textContent=data.title;
+    document.getElementById('moduleSubtitle').textContent=`${data.subtitle} · ${data.snapshot}`;
+    document.getElementById('moduleCards').innerHTML=data.cards.map(card=>`<div class="card"><strong>${fmtValue(card.value,card.format)}</strong><span>${esc(card.label)}</span></div>`).join('');
+    document.getElementById('moduleBreakdowns').innerHTML=data.breakdowns.map(group=>`<section class="breakdown"><h3>${esc(group.title)}</h3>${group.items.length?group.items.map(item=>`<div><span>${esc(human(item.label))}</span><strong>${fmt(item.count)}</strong></div>`).join(''):'<p>No evidence rows</p>'}</section>`).join('');
+    document.getElementById('moduleBlockers').innerHTML=data.blockers.length?data.blockers.map(item=>`<div class="exception"><span>${esc(item.label)}</span><span class="severity">${esc(item.status)}</span><strong>${fmt(item.count)}</strong></div>`).join(''):'<div class="empty-state">No module-specific exception rows. Enterprise activation gates still apply.</div>';
+    history.replaceState(null,'',`#${module}`);
+  }catch(e){
+    document.getElementById('moduleTitle').textContent='Module unavailable';
+    document.getElementById('moduleSubtitle').textContent='The controlled module summary could not be loaded.';
+    document.getElementById('moduleBreakdowns').innerHTML='<div class="empty-state">Check the local service and retry.</div>';
+    console.error(e);
+  }
+}
+
+document.querySelectorAll('.module-nav button').forEach(button=>button.addEventListener('click',()=>showModule(button.dataset.module)));
+document.getElementById('authButton').addEventListener('click',()=>showModule('uat'));
+load().then(()=>{const requested=location.hash.slice(1);if(requested&&document.querySelector(`[data-module="${CSS.escape(requested)}"]`))showModule(requested)});
+
+let authState={authenticated:false,csrf_token:null,principal:null};
+let activeRecord='customers',recordOffset=0,searchTimer=null;
+const pageSize=25;
+const recordSets={
+  customers:{title:'Customers and contacts',path:'/api/v1/secure/parties',detail:id=>`/api/v1/secure/parties/${id}`,columns:[['party_code','Code'],['party_kind','Type'],['legal_or_business_name','Business name'],['master_status','Status']]},
+  suppliers:{title:'Suppliers',path:'/api/v1/secure/suppliers',detail:id=>`/api/v1/secure/suppliers/${id}`,columns:[['party_code','Code'],['party_kind','Type'],['legal_or_business_name','Business name'],['master_status','Status']]},
+  products:{title:'Products and UOM',path:'/api/v1/secure/products',detail:id=>`/api/v1/secure/products/${id}`,columns:[['sku','SKU'],['name','Product'],['category_name','Category'],['brand_name','Brand'],['uom_profiles','UOM profiles'],['master_status','Status']]},
+  sales:{title:'Sales, returns and payments',path:'/api/v1/secure/sales',detail:id=>`/api/v1/secure/sales/${id}`,columns:[['document_no','Document'],['source_kind','Type'],['occurred_at','Date'],['total_amount','Total'],['paid_amount','Paid'],['due_amount','Due'],['migration_status','Status']]},
+  purchases:{title:'Purchases and returns',path:'/api/v1/secure/purchases',detail:id=>`/api/v1/secure/purchases/${id}`,columns:[['document_no','Document'],['source_kind','Type'],['occurred_at','Date'],['total_amount','Total'],['paid_amount','Paid'],['due_amount','Due'],['migration_status','Status']]},
+  inventory:{title:'Inventory movements and transfers',path:'/api/v1/secure/inventory',detail:id=>`/api/v1/secure/inventory/${id}`,columns:[['movement_type','Movement'],['occurred_at','Date'],['product_id','Product ID'],['entered_quantity','Entered qty'],['entered_uom','Entered UOM'],['quantity_base','Base qty'],['canonical_uom','Base UOM'],['migration_status','Status']]},
+  accounting:{title:'Accounting controls',path:'/api/v1/secure/accounting-summary',summary:true,columns:[['label','Journal status'],['count','Count']]},
+  workflows:{title:'Workflow blueprints',path:'/api/v1/secure/workflows',columns:[['workflow_code','Code'],['workflow_name','Workflow'],['initial_state','Initial state'],['state_count','States'],['transition_count','Transitions'],['workflow_status','Status'],['execution_enabled','Execution']]},
+  discrepancies:{title:'Discrepancy review',path:'/api/v1/secure/discrepancies',review:true,columns:[['id','ID'],['exception_code','Exception'],['severity','Severity'],['source_kind','Source type'],['source_id','Source ID'],['queue_status','Queue'],['proposal_count','Drafts']]},
+  governance:{title:'Approval governance',path:'/api/v1/secure/approval-governance',columns:[['policy_code','Policy'],['step_no','Step'],['required_role','Required role'],['draft_assignee','Synthetic assignee'],['draft_locations','Locations'],['synthetic_assignment_status','Status'],['assignment_enabled','Enabled']]},
+  segregation:{title:'Segregation controls',path:'/api/v1/secure/segregation-controls',columns:[['rule_code','Rule'],['rule_name','Control'],['maker_capability','Maker'],['checker_capability','Checker'],['status','Status'],['enforcement_enabled','Enforced']]},
+  exports:{title:'Business review exports',tabLabel:'Exports',path:'/api/v1/secure/export-catalog',exports:true,noSearch:true,columns:[['module','Module'],['required_permission','Required permission'],['format','Package format'],['latest_uat_decision','Latest UAT decision'],['package_path','Download'],['review_action','Review']]},
+  business_reviews:{title:'Package review decisions',tabLabel:'Decisions',path:'/api/v1/secure/business-reviews',noSearch:true,columns:[['module_code','Module'],['package_sha256','Package SHA-256'],['decision_version','Version'],['decision_code','Decision'],['decided_by','Reviewer'],['location_codes','Locations'],['production_signoff','Production sign-off'],['created_at','Recorded']]}
+};
+function renderRecordTabs(){document.getElementById('recordTabs').innerHTML=Object.entries(recordSets).map(([key,item])=>`<button type="button" data-record="${key}" class="${key===activeRecord?'active':''}">${esc(item.tabLabel||item.title.split(' ')[0].replace(/[,&]/g,''))}</button>`).join('');document.querySelectorAll('[data-record]').forEach(button=>button.addEventListener('click',()=>{activeRecord=button.dataset.record;recordOffset=0;renderRecordTabs();loadRecords()}))}
+function setAuthView(){document.getElementById('loginPanel').hidden=authState.authenticated;document.getElementById('recordsPanel').hidden=!authState.authenticated;document.getElementById('authButton').textContent=authState.authenticated?authState.principal.login_name:'UAT sign in';if(authState.authenticated){const p=authState.principal;document.getElementById('uatIdentity').textContent=`${p.login_name} · ${p.roles.join(', ')||'No role'} · ${p.locations.map(x=>x.code).join(', ')||'No location'}`;renderRecordTabs();loadRecords()}else{document.getElementById('uatIdentity').textContent='Sign in with a synthetic UAT user. Migrated user passwords are never used.';document.getElementById('authMessage').textContent='';document.getElementById('authMessage').className=''}}
+async function ensureSession(){try{const session=await get('/api/v1/auth/session');authState=session;setAuthView()}catch(e){authState={authenticated:false};setAuthView()}}
+document.getElementById('loginForm').addEventListener('submit',async event=>{event.preventDefault();const loginForm=event.currentTarget;const message=document.getElementById('authMessage');message.className='';message.textContent='Signing in…';const form=new FormData(loginForm);try{authState=await post('/api/v1/auth/login',{username:form.get('username'),password:form.get('password')});loginForm.reset();message.textContent='Authenticated with synthetic UAT credentials.';setAuthView()}catch(e){message.className='auth-error';message.textContent=e.message}});
+document.getElementById('resetButton').addEventListener('click',async()=>{const username=document.querySelector('#loginForm [name="username"]').value||'unknown';const message=document.getElementById('authMessage');try{const result=await post('/api/v1/auth/reset-request',{username});message.className='';message.textContent=result.message}catch(e){message.className='auth-error';message.textContent=e.message}});
+document.getElementById('logoutButton').addEventListener('click',async()=>{try{await post('/api/v1/auth/logout',{}, {'X-CSRF-Token':authState.csrf_token});authState={authenticated:false};setAuthView()}catch(e){console.error(e)}});
+let currentDiscrepancies=[];
+async function loadRecords(){
+  const config=recordSets[activeRecord],body=document.getElementById('recordBody'),head=document.getElementById('recordHead');
+  if(!config.review)document.getElementById('proposalPanel').hidden=true;
+  if(!config.exports)document.getElementById('businessReviewPanel').hidden=true;
+  document.getElementById('recordDetailPanel').hidden=true;
+  body.innerHTML='<tr><td>Loading protected rows…</td></tr>';document.getElementById('recordTitle').textContent=config.title;
+  try{
+    const q=document.getElementById('recordSearch').value.trim();
+    const data=await get(`${config.path}?limit=${pageSize}&offset=${recordOffset}${q&&!config.summary&&!config.noSearch?`&q=${encodeURIComponent(q)}`:''}`);
+    const items=config.summary?Object.entries(data.journal_status||{}).map(([label,count])=>({label,count})):data.items;
+    if(config.review)currentDiscrepancies=items;
+    head.innerHTML=`<tr>${config.columns.map(([,label])=>`<th>${esc(label)}</th>`).join('')}</tr>`;
+    body.innerHTML=items.length?items.map(item=>`<tr ${config.review?`class="review-row" tabindex="0" data-exception-id="${item.id}"`:config.detail?`class="detail-row" tabindex="0" data-record-id="${item.id}"`:''}>${config.columns.map(([key])=>key==='package_path'?`<td><button type="button" class="export-package" data-export-path="${esc(item[key])}" data-export-module="${esc(item.module)}">Download ZIP</button></td>`:key==='review_action'?`<td><button type="button" class="review-package" data-review-module="${esc(item.module)}" disabled>Download first</button></td>`:`<td>${esc(item[key])}</td>`).join('')}</tr>`).join(''):'<tr><td colspan="9">No accessible rows for this role and location.</td></tr>';
+    if(config.review)document.querySelectorAll('.review-row').forEach(row=>{const open=()=>openProposal(Number(row.dataset.exceptionId),data.allowed_resolution_codes||[]);row.addEventListener('click',open);row.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();open()}})});
+    if(config.detail)document.querySelectorAll('.detail-row').forEach(row=>{const open=()=>openRecordDetail(config,Number(row.dataset.recordId));row.addEventListener('click',open);row.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();open()}})});
+    if(config.exports)document.querySelectorAll('.export-package').forEach(button=>button.addEventListener('click',()=>downloadReviewPackage(button)));
+    if(config.exports)document.querySelectorAll('.review-package').forEach(button=>button.addEventListener('click',()=>openBusinessReview(button.dataset.reviewModule,button.dataset.packageSha)));
+    const total=config.summary?items.length:data.total;document.getElementById('recordCount').textContent=`${fmt(total)} scoped rows`;document.getElementById('pageStatus').textContent=config.summary?'Protected aggregate':`${fmt(recordOffset+1)}–${fmt(Math.min(recordOffset+pageSize,total))} of ${fmt(total)}`;document.getElementById('previousPage').disabled=recordOffset===0||config.summary;document.getElementById('nextPage').disabled=config.summary||recordOffset+pageSize>=total;
+  }catch(e){body.innerHTML=`<tr><td class="auth-error">${esc(e.message)}</td></tr>`;document.getElementById('recordCount').textContent='Access denied'}
+}
+async function downloadReviewPackage(button){const original=button.textContent;button.disabled=true;button.textContent='Preparing…';try{const response=await fetch(button.dataset.exportPath);if(!response.ok)throw new Error(await response.text());const blob=await response.blob();const digest=response.headers.get('x-content-sha256');const disposition=response.headers.get('content-disposition')||'';const match=disposition.match(/filename="?([^";]+)"?/i);const filename=match?match[1]:`${button.dataset.exportModule}-business-review.zip`;const link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=filename;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(link.href),1000);const reviewButton=document.querySelector(`.review-package[data-review-module="${CSS.escape(button.dataset.exportModule)}"]`);if(reviewButton&&digest){reviewButton.dataset.packageSha=digest;reviewButton.disabled=false;reviewButton.textContent='Record decision'}button.textContent='Downloaded';setTimeout(()=>{button.textContent=original;button.disabled=false},1200)}catch(e){button.textContent='Access denied';button.title=e.message;setTimeout(()=>{button.textContent=original;button.disabled=false},1800)}}
+function openBusinessReview(module,digest){const panel=document.getElementById('businessReviewPanel');document.getElementById('businessReviewModule').value=module;document.getElementById('businessReviewSha').value=digest;document.getElementById('businessReviewTitle').textContent=`${human(module)} package review`;document.getElementById('businessReviewRationale').value='';document.getElementById('businessReviewMessage').textContent='This records a synthetic UAT decision only. It cannot activate production governance.';panel.hidden=false;panel.scrollIntoView({behavior:'smooth',block:'start'})}
+document.getElementById('businessReviewForm').addEventListener('submit',async event=>{event.preventDefault();const module=document.getElementById('businessReviewModule').value,message=document.getElementById('businessReviewMessage');message.className='';message.textContent='Recording append-only UAT decision…';try{const result=await post(`/api/v1/uat/business-reviews/${encodeURIComponent(module)}`,{package_sha256:document.getElementById('businessReviewSha').value,decision_code:document.getElementById('businessReviewCode').value,rationale:document.getElementById('businessReviewRationale').value},{'X-CSRF-Token':authState.csrf_token});message.textContent=`Version ${result.decision.decision_version} recorded. Production sign-off remains false and business data is unchanged.`}catch(e){message.className='auth-error';message.textContent=e.message}});
+async function openRecordDetail(config,recordId){const panel=document.getElementById('recordDetailPanel'),content=document.getElementById('recordDetailContent');panel.hidden=false;document.getElementById('recordDetailTitle').textContent=`${config.title} · #${recordId}`;content.textContent='Loading protected detail…';panel.scrollIntoView({behavior:'smooth',block:'start'});try{const data=await get(config.detail(recordId));content.textContent=JSON.stringify(data,null,2)}catch(e){content.textContent=`Access denied or record unavailable: ${e.message}`}}
+function openProposal(exceptionId,codes){
+  const item=currentDiscrepancies.find(value=>value.id===exceptionId);if(!item)return;
+  document.getElementById('proposalPanel').hidden=false;document.getElementById('proposalExceptionId').value=String(item.id);document.getElementById('proposalTitle').textContent=`Draft proposal for exception #${item.id}`;
+  document.getElementById('proposalEvidence').textContent=JSON.stringify({exception_code:item.exception_code,severity:item.severity,source_kind:item.source_kind,source_id:item.source_id,evidence:item.evidence,latest_proposal:item.latest_proposal},null,2);
+  document.getElementById('proposalCode').innerHTML=codes.map(code=>`<option value="${esc(code)}">${esc(human(code))}</option>`).join('');document.getElementById('proposalMessage').textContent='';document.getElementById('proposalRationale').value='';document.getElementById('proposalValue').value='{}';document.getElementById('proposalPanel').scrollIntoView({behavior:'smooth',block:'start'});
+}
+document.getElementById('proposalForm').addEventListener('submit',async event=>{event.preventDefault();const message=document.getElementById('proposalMessage');message.className='';message.textContent='Saving append-only draft…';try{const proposedValue=JSON.parse(document.getElementById('proposalValue').value||'{}');const result=await post('/api/v1/uat/discrepancy-proposals',{exception_id:Number(document.getElementById('proposalExceptionId').value),resolution_code:document.getElementById('proposalCode').value,proposed_value:proposedValue,rationale:document.getElementById('proposalRationale').value},{'X-CSRF-Token':authState.csrf_token});message.textContent=`Draft version ${result.proposal.proposal_version} saved in the separate review sidecar. Source exception unchanged.`;await loadRecords()}catch(e){message.className='auth-error';message.textContent=e.message}});
+document.getElementById('previousPage').addEventListener('click',()=>{recordOffset=Math.max(0,recordOffset-pageSize);loadRecords()});document.getElementById('nextPage').addEventListener('click',()=>{recordOffset+=pageSize;loadRecords()});document.getElementById('recordSearch').addEventListener('input',()=>{clearTimeout(searchTimer);searchTimer=setTimeout(()=>{recordOffset=0;loadRecords()},250)});

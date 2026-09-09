@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Klen ERP Migration Control Center</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/module-workspaces.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><span class="brand-mark">K+</span><strong>Klen ERP</strong><span class="subtitle">Migration Control Center</span></div>
+    <div class="top-actions"><button id="authButton" class="auth-button" type="button" hidden>UAT sign in</button><div class="lock">READ-ONLY · NON-POSTING</div></div>
+  </header>
+  <nav class="module-nav" aria-label="ERP modules">
+    <button class="active" type="button" data-module="overview">Overview</button>
+    <button type="button" data-module="sales">Sales <small>Read only</small></button>
+    <button type="button" data-module="purchasing">Purchasing <small>Read only</small></button>
+    <button type="button" data-module="inventory">Inventory <small>Read only</small></button>
+    <button type="button" data-module="accounting">Accounting <small>Read only</small></button>
+    <button type="button" data-module="crm">CRM <small>Read only</small></button>
+    <button type="button" data-module="delivery">Delivery <small>Read only</small></button>
+    <button type="button" data-module="reports">Reports <small>Read only</small></button>
+    <button id="uatNav" type="button" data-module="uat" hidden>UAT records <small>Protected</small></button>
+  </nav>
+  <main>
+    <section id="overviewView">
+    <section class="hero">
+      <div><p class="eyebrow" id="organizationName">ERP MIGRATION ASSURANCE</p><h1>Migration assurance, without touching the source.</h1>
+        <p id="snapshotText">Loading controlled snapshot…</p></div>
+      <div class="health" id="health"><span></span>Checking local service</div>
+    </section>
+    <section class="cards" id="summaryCards"></section>
+    <section class="grid">
+      <article class="panel span-two"><div class="panel-head"><div><p class="eyebrow">ACTIVATION CONTROL</p><h2>Gate status</h2></div><span id="gateTotal" class="pill">Loading</span></div><div id="gates" class="gate-list"></div></article>
+      <article class="panel"><div class="panel-head"><div><p class="eyebrow">DATA ASSURANCE</p><h2>Coverage</h2></div></div><div id="coverage" class="coverage"></div></article>
+      <article class="panel"><div class="panel-head"><div><p class="eyebrow">REVIEW QUEUE</p><h2>Exceptions</h2></div></div><div id="exceptions" class="exception-list"></div></article>
+      <article class="panel span-two"><div class="panel-head"><div><p class="eyebrow">AUDIT TRAIL</p><h2>Recent immutable events</h2></div></div><div id="audit" class="audit-list"></div></article>
+    </section>
+    </section>
+    <section id="moduleView" class="module-view" hidden>
+      <div class="module-hero">
+        <div><p class="eyebrow">CONTROLLED MODULE WORKSPACE</p><h1 id="moduleTitle">Module assurance</h1><p id="moduleSubtitle"></p></div>
+        <div class="module-lock"><strong>Operational processing locked</strong><span>Aggregate cloned evidence only</span></div>
+      </div>
+      <section class="cards" id="moduleCards"></section>
+      <section class="workspace-grid">
+        <article class="panel workspace-main"><div class="panel-head"><div><p class="eyebrow">RECONCILED BREAKDOWNS</p><h2>Evidence status</h2></div></div><div id="moduleBreakdowns" class="breakdown-grid"></div></article>
+        <article class="panel"><div class="panel-head"><div><p class="eyebrow">ACTIVATION BLOCKERS</p><h2>Review queue</h2></div><span class="pill">Non-posting</span></div><div id="moduleBlockers" class="exception-list"></div></article>
+      </section>
+      <div class="assurance-note">No names, contact details, transaction rows or source payloads are exposed in this workspace. Authentication and operational actions remain disabled.</div>
+    </section>
+    <section id="uatView" class="module-view" hidden>
+      <div class="module-hero"><div><p class="eyebrow">SYNTHETIC AUTHENTICATED UAT</p><h1>Protected read-only records</h1><p id="uatIdentity">Sign in with a synthetic UAT user. Migrated user passwords are never used.</p></div><div class="module-lock"><strong>Business mutations blocked</strong><span>Location and permission scope enforced</span></div></div>
+      <section id="loginPanel" class="panel auth-panel">
+        <form id="loginForm"><label>Username<input name="username" autocomplete="username" required maxlength="200"></label><label>Password<input name="password" type="password" autocomplete="current-password" required maxlength="500"></label><button type="submit">Sign in to UAT</button></form>
+        <button id="resetButton" class="link-button" type="button">Test password-reset request</button><p id="authMessage" role="status"></p>
+      </section>
+      <section id="recordsPanel" hidden>
+        <div class="record-toolbar"><div class="record-tabs" id="recordTabs"></div><label class="search-box">Search<input id="recordSearch" type="search" maxlength="100" placeholder="Code, name or document no."></label><button id="logoutButton" type="button">Sign out</button></div>
+        <article class="panel record-panel"><div class="panel-head"><div><p class="eyebrow" id="recordEyebrow">PROTECTED DATA</p><h2 id="recordTitle">Records</h2></div><span id="recordCount" class="pill"></span></div><div class="table-wrap"><table><thead id="recordHead"></thead><tbody id="recordBody"></tbody></table></div><div class="pager"><button id="previousPage" type="button">Previous</button><span id="pageStatus"></span><button id="nextPage" type="button">Next</button></div></article>
+        <article id="recordDetailPanel" class="panel proposal-panel" hidden>
+          <div class="panel-head"><div><p class="eyebrow">PROTECTED READ-ONLY DETAIL</p><h2 id="recordDetailTitle">Record detail</h2></div><span class="pill">No edits</span></div>
+          <pre id="recordDetailContent"></pre>
+        </article>
+        <article id="businessReviewPanel" class="panel proposal-panel" hidden>
+          <div class="panel-head"><div><p class="eyebrow">CHECKSUM-BOUND UAT DECISION</p><h2 id="businessReviewTitle">Record package review</h2></div><span class="pill">Synthetic only</span></div>
+          <form id="businessReviewForm">
+            <input id="businessReviewModule" type="hidden">
+            <label>Package SHA-256<input id="businessReviewSha" readonly required minlength="64" maxlength="64"></label>
+            <label>UAT decision<select id="businessReviewCode" required><option value="evidence_requested">Evidence requested</option><option value="conditionally_accepted_for_uat">Conditionally accepted for UAT</option><option value="accepted_for_uat">Accepted for UAT</option><option value="rejected_for_uat">Rejected for UAT</option></select></label>
+            <label>Rationale<textarea id="businessReviewRationale" rows="4" minlength="10" maxlength="2000" required></textarea></label>
+            <button type="submit">Record append-only UAT decision</button>
+          </form>
+          <p id="businessReviewMessage" role="status"></p>
+        </article>
+        <article id="proposalPanel" class="panel proposal-panel" hidden>
+          <div class="panel-head"><div><p class="eyebrow">TARGET-SIDE REVIEW METADATA</p><h2 id="proposalTitle">Draft a resolution proposal</h2></div><span class="pill">No source mutation</span></div>
+          <pre id="proposalEvidence"></pre>
+          <form id="proposalForm">
+            <input id="proposalExceptionId" type="hidden">
+            <label>Resolution type<select id="proposalCode" required></select></label>
+            <label>Proposed target value (JSON)<textarea id="proposalValue" rows="3" maxlength="4000">{}</textarea></label>
+            <label>Rationale<textarea id="proposalRationale" rows="3" minlength="10" maxlength="2000" required></textarea></label>
+            <button type="submit">Save append-only draft</button>
+          </form>
+          <p id="proposalMessage" role="status"></p>
+        </article>
+      </section>
+    </section>
+  </main>
+  <footer>No operational posting, approvals, number reservations or accounting postings are available in this build. UAT login, when explicitly enabled, accepts synthetic users only.</footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

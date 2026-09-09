@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+!.env.example
+.secrets
+.pytest_cache
+__pycache__
+*.pyc
+source_exports
+source_evidence
+downloads
+var
+docs
