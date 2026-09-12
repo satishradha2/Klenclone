@@ -395,9 +395,16 @@ def initialize_operational_database(engine) -> None:
     # Import extension models before create_all so every operational entrypoint
     # creates the same schema without relying on import order.
     from . import data_governance as _data_governance  # noqa: F401
+    from . import data_reviews as _data_reviews  # noqa: F401
     from . import goods_receipts as _goods_receipts  # noqa: F401
     from . import inventory_operations as _inventory_operations  # noqa: F401
+    from . import operational_masters as _operational_masters  # noqa: F401
+    from . import payments as _payments  # noqa: F401
+    from . import posting_integration as _posting_integration  # noqa: F401
+    from . import purchase_returns as _purchase_returns  # noqa: F401
     from . import sales_returns as _sales_returns  # noqa: F401
+    from . import security_runtime as _security_runtime  # noqa: F401
+    from . import source_verification as _source_verification  # noqa: F401
 
     OperationalBase.metadata.create_all(engine)
     dialect = engine.dialect.name
@@ -440,6 +447,15 @@ def initialize_operational_database(engine) -> None:
         for name, definition in period_additions.items():
             if name not in period_columns:
                 connection.execute(text(f"ALTER TABLE operational_fiscal_periods ADD COLUMN {name} {definition}"))
+        review_columns = {column["name"] for column in inspect(connection).get_columns("operational_data_reviews")}
+        review_additions = {
+            "supplemental_payload": "TEXT",
+            "superseded_correction_payload": "TEXT",
+            "source_enrichment_note": "TEXT",
+        }
+        for name, definition in review_additions.items():
+            if name not in review_columns:
+                connection.execute(text(f"ALTER TABLE operational_data_reviews ADD COLUMN {name} {definition}"))
         if dialect == "postgresql":
             connection.execute(text("ALTER TABLE operational_drafts DROP CONSTRAINT IF EXISTS ck_operational_draft_status"))
             connection.execute(text("ALTER TABLE operational_drafts ADD CONSTRAINT ck_operational_draft_status CHECK (status IN ('draft','submitted','approved','cancelled','posted','reversed'))"))
@@ -458,6 +474,14 @@ def initialize_operational_database(engine) -> None:
             "0009": "9c570c5962504739810a1428746697d71532a3995f08d4db29805241a2e40d5c",
             "0010": "09dd2e807ac19aa7768c07be7f0b0b56f41357589ba4bbb8c2eaf9627ee7116c",
             "0011": "322d0b32c0fa45e7ec20ec0c29356914454ad2acebd8aca3f325c5ca6a6fdde3",
+            "0012": "6d28757c3618d39573d2e46fe5dc6ad9749f976f640181133460c2ec6d7d53b8",
+            "0013": "43234cab9c775993f0b02b33fc015fd80fae3792b32e82fe4af04ef5611648e1",
+            "0014": "c71d1557ad8f69f93e6a03920368fba8c94b6d2626dd2b0ffaf79cc663430857",
+            "0015": "5225ad92d878ba15ad5e34379c1910b889f20bcd45bc5339df8f794698482612",
+            "0016": "934f74cfc0d53db9cfdd7a5d12f392a749a24a3c01a5a1d777d87b0efba1cb3a",
+            "0017": "c335e711a4772c9b41878cb7d5571ab84dc979413d941867b121d527c04d39cc",
+            "0018": "97bbbaeb89e0b43d3bb9698d380496a23ab8df0366076476191ddbd750ac57e9",
+            "0019": "1912f01953c2646c676ba2c4a051ba8aaf7a6dbb46f64e8531aae10cc183abe3",
         }
         for version, checksum in migrations.items():
             if version in applied and applied[version] != checksum:

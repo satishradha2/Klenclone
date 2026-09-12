@@ -1,0 +1,7 @@
+.pagination{display:flex;align-items:center;justify-content:flex-end;gap:9px;margin:12px 0 18px;color:var(--muted);font-size:10px}
+.pagination span{margin-right:auto}
+.pagination b{min-width:90px;text-align:center;color:var(--ink);font-size:10px}
+.pagination button{padding:7px 10px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--ink);font:inherit;font-weight:800;cursor:pointer}
+.pagination button:hover:not(:disabled){border-color:var(--green);color:var(--green)}
+.pagination button:disabled{cursor:not-allowed;opacity:.45}
+@media(max-width:600px){.pagination{flex-wrap:wrap;justify-content:center}.pagination span{flex:0 0 100%;margin:0;text-align:center}}

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from klen_clone.auth import hash_password
 from klen_clone.db import Base, make_engine
 from klen_clone.erp_preview import create_app
+from klen_clone.data_reviews import OperationalDataReview, start_review, transition_review
 from klen_clone.models import (
     ErpAuditEvent, ErpLocation, ErpOrganization, ErpParty, ErpProductMaster, ErpProductUom,
     RawFileManifest, RawRecord, SourceSnapshot, StgContact, StgProduct, StgProductUomProfile,
@@ -19,6 +20,7 @@ from klen_clone.operational import (
     OperationalSchemaMigration, OperationalStockPosition, OperationalStockReservation,
     OperationalSubledgerEntry, OperationalWorkflowEvent, execute_posting, execute_reversal,
 )
+from klen_clone.operational_masters import OperationalPartyMaster, OperationalProductMaster
 
 
 def preview_client(tmp_path) -> TestClient:
@@ -135,7 +137,10 @@ def test_preview_is_independent_read_only_and_excludes_hr_payroll(tmp_path):
     assert health.json()["posting_enabled"] is False
     assert health.json()["hr_payroll_enabled"] is False
     assert health.headers["x-frame-options"] == "DENY"
-    assert client.post("/api/v1/products", json={}).status_code == 405
+    rejected = client.post("/api/v1/products", json={})
+    assert rejected.status_code == 405
+    assert rejected.headers["x-content-type-options"] == "nosniff"
+    assert rejected.headers["x-request-id"]
 
 
 def test_preview_overview_and_product_register_use_clone_database(tmp_path):
@@ -148,7 +153,133 @@ def test_preview_overview_and_product_register_use_clone_database(tmp_path):
     assert products.status_code == 200
     assert products.json()["total"] == 1
     assert products.json()["items"][0]["name"] == "Source product"
-    assert "ASAS ERP" in client.get("/").text
+    page = client.get("/").text
+    assert "ASAS ERP" in page
+    assert "/static/glossary.js" in page and "/static/glossary.css" in page
+    assert "/static/table-pagination.js" in page and "/static/pagination.css" in page
+    glossary = client.get("/static/glossary.js")
+    assert glossary.status_code == 200
+    assert "PROVISIONAL_OVERLAY" in glossary.text
+    paginator = client.get("/static/table-pagination.js")
+    assert paginator.status_code == 200 and "pageSize = 25" in paginator.text
+
+
+def test_promoted_product_can_be_edited_and_deactivated_with_revision_control(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_ADMIN_USERNAME", "asas-admin")
+    monkeypatch.setenv("ASAS_ADMIN_PASSWORD_HASH", hash_password("temporary strong password"))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'masters.db'}")
+    client = preview_client(tmp_path)
+    with client.app.state.operational_sessions() as session:
+        session.add(OperationalProductMaster(product_key="product-1", sku="SKU-001", name="Promoted product",
+            base_uom="Piece", canonical_base_uom="piece", factor_to_base=1, purchase_price=2,
+            selling_price=3, tax_rate=5, status="active", source_promoted=True,
+            source_snapshot_name="preview-snapshot", source_checksum="a" * 64,
+            created_by="migration", updated_by="migration"))
+        session.commit()
+    login = client.post("/api/v1/auth/login", json={"username": "asas-admin", "password": "temporary strong password"}).json()
+    headers = {"X-CSRF-Token": login["csrf_token"]}
+    listed = client.get("/api/v1/products?q=SKU-001").json()["items"][0]
+    assert listed["name"] == "Promoted product" and listed["revision"] == 1
+    updated = client.patch("/api/v1/master-data/products/SKU-001", headers=headers, json={
+        "expected_revision": 1, "name": "Updated product", "category_name": "Cleaning",
+        "brand_name": None, "purchase_price": "2.50", "selling_price": "4.00", "tax_rate": "5",
+    })
+    assert updated.status_code == 200 and updated.json()["revision"] == 2
+    stale = client.post("/api/v1/master-data/products/SKU-001/deactivate", headers=headers,
+                        json={"expected_revision": 1})
+    assert stale.status_code == 409
+    inactive = client.post("/api/v1/master-data/products/SKU-001/deactivate", headers=headers,
+                           json={"expected_revision": 2, "note": "Stopped"})
+    assert inactive.status_code == 200 and inactive.json()["master_status"] == "inactive"
+    blocked_draft = client.post("/api/v1/drafts", headers=headers, json={
+        "document_type": "sale", "party_code": "CO-001", "location_code": "SHJ",
+        "discount_amount": "0", "lines": [{"sku": "SKU-001", "quantity": "1",
+            "uom": "Piece", "unit_price": "4.00", "tax_rate": "5"}],
+    })
+    assert blocked_draft.status_code == 422
+    assert "inactive in the operational master" in blocked_draft.json()["detail"]
+
+
+def test_operational_product_register_exposes_every_record_through_pagination(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'paged-masters.db'}")
+    client = preview_client(tmp_path)
+    with client.app.state.operational_sessions() as session:
+        session.add_all([OperationalProductMaster(
+            product_key=f"product-{index}", sku=f"SKU-{index:03d}", name=f"Product {index:03d}",
+            base_uom="Piece", canonical_base_uom="piece", factor_to_base=1,
+            purchase_price=2, selling_price=3, tax_rate=5, status="active",
+            source_promoted=True, source_snapshot_name="preview-snapshot",
+            source_checksum=f"{index:064x}", created_by="migration", updated_by="migration",
+        ) for index in range(55)])
+        session.commit()
+    first = client.get("/api/v1/products?limit=25&offset=0").json()
+    middle = client.get("/api/v1/products?limit=25&offset=25").json()
+    last = client.get("/api/v1/products?limit=25&offset=50").json()
+    assert first["total"] == middle["total"] == last["total"] == 55
+    assert len(first["items"]) == len(middle["items"]) == 25
+    assert len(last["items"]) == 5
+    assert {row["sku"] for row in first["items"]}.isdisjoint(
+        {row["sku"] for row in middle["items"]})
+
+
+def test_review_queue_open_filter_excludes_verified_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'review-filter.db'}")
+    client = preview_client(tmp_path)
+    with client.app.state.operational_sessions() as session:
+        verified = start_review(session, entity_type="sale", source_record_key="INV-VERIFIED",
+                                source_status="captured", original_payload={"document_no": "INV-VERIFIED"},
+                                actor="test-reviewer")
+        transition_review(session, verified, action="verify", expected_revision=verified.revision,
+                          actor="test-reviewer", rationale="Matched source evidence")
+        corrected = start_review(session, entity_type="purchase", source_record_key="PO-CORRECTED",
+                                 source_status="captured", original_payload={"document_no": "PO-CORRECTED"},
+                                 actor="test-reviewer")
+        transition_review(session, corrected, action="correct", expected_revision=corrected.revision,
+                          actor="test-reviewer", rationale="Corrected from source document",
+                          corrected_payload={"document_no": "PO-CORRECTED", "total_amount": "10.00"})
+        session.commit()
+
+    open_queue = client.get("/api/v1/data-reviews?status=open").json()
+    verified_history = client.get("/api/v1/data-reviews?status=verified").json()
+    assert open_queue["total"] == 1
+    assert open_queue["items"][0]["status"] == "corrected"
+    assert verified_history["total"] == 1
+    assert verified_history["items"][0]["status"] == "verified"
+
+
+def test_promoted_party_can_be_edited_and_reactivated_with_audit(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_ADMIN_USERNAME", "asas-admin")
+    monkeypatch.setenv("ASAS_ADMIN_PASSWORD_HASH", hash_password("temporary strong password"))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'party-masters.db'}")
+    client = preview_client(tmp_path)
+    with client.app.state.operational_sessions() as session:
+        session.add(OperationalPartyMaster(
+            party_key="party-1", party_code="CO-001", party_kind="customer",
+            legal_or_business_name="Promoted customer", status="inactive", source_promoted=True,
+            source_snapshot_name="preview-snapshot", source_checksum="b" * 64,
+            created_by="migration", updated_by="migration",
+        ))
+        session.commit()
+    login = client.post("/api/v1/auth/login", json={
+        "username": "asas-admin", "password": "temporary strong password",
+    }).json()
+    headers = {"X-CSRF-Token": login["csrf_token"]}
+    listed = client.get("/api/v1/customers?q=CO-001").json()["items"][0]
+    assert listed["email"] is None and listed["revision"] == 1
+    updated = client.patch("/api/v1/master-data/parties/CO-001", headers=headers, json={
+        "expected_revision": 1, "legal_or_business_name": "Updated customer",
+        "contact_name": "Buyer", "email": "buyer@example.com", "mobile": "0500000000",
+        "address": "Dubai", "tax_number": "TRN-001",
+    })
+    assert updated.status_code == 200 and updated.json()["revision"] == 2
+    active = client.post("/api/v1/master-data/parties/CO-001/reactivate", headers=headers,
+                         json={"expected_revision": 2, "note": "Approved for trading"})
+    assert active.status_code == 200 and active.json()["master_status"] == "active"
+    with client.app.state.operational_sessions() as session:
+        assert session.scalar(select(func.count(OperationalAuditEvent.id)).where(
+            OperationalAuditEvent.resource_key == "party-1")) == 2
 
 
 def test_preview_authentication_session_csrf_and_audit(tmp_path, monkeypatch):
@@ -168,6 +299,10 @@ def test_preview_authentication_session_csrf_and_audit(tmp_path, monkeypatch):
     assert login.json()["principal"]["roles"] == ["operations_administrator"]
     assert login.json()["principal"]["posting_enabled"] is False
     assert client.get("/api/v1/overview").status_code == 200
+    deployment = client.get("/api/v1/deployment/readiness")
+    assert deployment.status_code == 200
+    assert deployment.json()["production_ready"] is False
+    assert deployment.json()["gates"]["hr_payroll_excluded"] is True
     csrf = login.json()["csrf_token"]
     locations = client.get("/api/v1/selectors/locations").json()["items"]
     assert locations == [{"code": "DXB", "name": "Dubai"}, {"code": "SHJ", "name": "SHJ"}]
@@ -337,7 +472,7 @@ def test_independent_approver_and_transactional_posting_rehearsal(tmp_path, monk
 
     with client.app.state.operational_sessions() as session:
         assert session.scalar(select(func.count(OperationalPostingProbe.id))) == 0
-        assert session.scalar(select(func.count(OperationalSchemaMigration.version))) == 11
+        assert session.scalar(select(func.count(OperationalSchemaMigration.version))) == 19
         assert session.scalar(select(func.count(OperationalStockReservation.id))) == 1
         assert session.scalar(select(func.count(OperationalJournalBatch.id))) == 0
         assert session.scalar(select(func.count(OperationalSubledgerEntry.id))) == 0
@@ -446,3 +581,54 @@ def test_inventory_transfer_api_enforces_scope_maker_checker_and_rehearsal(tmp_p
     assert register["total"] == 1
     assert register["posting_enabled"] is False
     assert register["controls"]["active_reservations"] == 1
+
+
+def test_customer_advance_receipt_api_is_permission_protected_and_nonposting(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_ADMIN_USERNAME", "asas-admin")
+    monkeypatch.setenv("ASAS_ADMIN_PASSWORD_HASH", hash_password("temporary strong password"))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'payments-api.db'}")
+    client = preview_client(tmp_path)
+    seed_operational_controls(client)
+    login = client.post("/api/v1/auth/login", json={
+        "username": "asas-admin", "password": "temporary strong password",
+    }).json()
+    csrf = login["csrf_token"]
+    payload = {"payment_type": "customer_receipt", "party_code": "CO-001",
+        "location_code": "SHJ", "payment_date": "2026-09-09", "payment_method": "cash",
+        "cash_bank_account_code": "Cash - SHJ", "amount": "125.50", "allocations": []}
+    assert client.post("/api/v1/payments", json=payload).status_code == 403
+    created = client.post("/api/v1/payments", json=payload,
+                          headers={"X-CSRF-Token": csrf})
+    assert created.status_code == 201
+    assert created.json()["allocated_amount"] == 0.0
+    assert created.json()["unallocated_amount"] == 125.5
+    submitted = client.post(f"/api/v1/payments/{created.json()['payment_key']}/submit",
+        json={"expected_revision": 1}, headers={"X-CSRF-Token": csrf})
+    assert submitted.status_code == 200 and submitted.json()["status"] == "submitted"
+    register = client.get("/api/v1/payments").json()
+    assert register["total"] == 1 and register["controls"]["posted"] == 0
+    ageing = client.get("/api/v1/reports/ageing?ledger_kind=receivable&as_of=2026-09-09")
+    assert ageing.status_code == 200
+    assert ageing.json()["age_basis"] == "invoice_date"
+    assert ageing.json()["due_date_available"] is False
+    accounting = client.get("/api/v1/accounting").json()
+    assert accounting["accounting_summary"]["source_evidence_only"] is True
+
+
+def test_ageing_rejects_partial_location_scope_for_companywide_opening_balances(tmp_path, monkeypatch):
+    password = "finance temporary password"
+    users_file = tmp_path / "finance-users.json"
+    users_file.write_text(json.dumps({"users": [{"id": 1, "username": "finance",
+        "password_hash": hash_password(password), "roles": ["finance_reader"],
+        "permissions": ["clone.read", "financial_report.read"], "allowed_locations": ["SHJ"]}]}),
+        encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'ageing-scope.db'}")
+    client = preview_client(tmp_path)
+    login = client.post("/api/v1/auth/login", json={"username": "finance", "password": password})
+    assert login.status_code == 200
+    response = client.get("/api/v1/reports/ageing?ledger_kind=receivable")
+    assert response.status_code == 403
+    assert "Company-wide location scope" in response.json()["detail"]

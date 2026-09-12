@@ -61,27 +61,27 @@
         <article class="panel record-panel"><div class="panel-head"><div><p class="eyebrow" id="recordEyebrow">PROTECTED DATA</p><h2 id="recordTitle">Records</h2></div><span id="recordCount" class="pill"></span></div><div class="table-wrap"><table><thead id="recordHead"></thead><tbody id="recordBody"></tbody></table></div><div class="pager"><button id="previousPage" type="button">Previous</button><span id="pageStatus"></span><button id="nextPage" type="button">Next</button></div></article>
         <article id="recordDetailPanel" class="panel proposal-panel" hidden>
           <div class="panel-head"><div><p class="eyebrow">PROTECTED READ-ONLY DETAIL</p><h2 id="recordDetailTitle">Record detail</h2></div><span class="pill">No edits</span></div>
-          <pre id="recordDetailContent"></pre>
+          <div id="recordDetailContent" class="readable-detail"></div>
         </article>
         <article id="businessReviewPanel" class="panel proposal-panel" hidden>
           <div class="panel-head"><div><p class="eyebrow">CHECKSUM-BOUND UAT DECISION</p><h2 id="businessReviewTitle">Record package review</h2></div><span class="pill">Synthetic only</span></div>
           <form id="businessReviewForm">
             <input id="businessReviewModule" type="hidden">
-            <label>Package SHA-256<input id="businessReviewSha" readonly required minlength="64" maxlength="64"></label>
-            <label>UAT decision<select id="businessReviewCode" required><option value="evidence_requested">Evidence requested</option><option value="conditionally_accepted_for_uat">Conditionally accepted for UAT</option><option value="accepted_for_uat">Accepted for UAT</option><option value="rejected_for_uat">Rejected for UAT</option></select></label>
-            <label>Rationale<textarea id="businessReviewRationale" rows="4" minlength="10" maxlength="2000" required></textarea></label>
+            <label>Downloaded package fingerprint<input id="businessReviewSha" readonly required minlength="64" maxlength="64"></label>
+            <label>Review decision<select id="businessReviewCode" required><option value="evidence_requested">More information required</option><option value="conditionally_accepted_for_uat">Accept with corrections required</option><option value="accepted_for_uat">Accept for testing</option><option value="rejected_for_uat">Reject this package</option></select></label>
+            <label>Reason for this decision<textarea id="businessReviewRationale" rows="4" minlength="10" maxlength="2000" required placeholder="Explain what you checked and why you selected this decision"></textarea></label>
             <button type="submit">Record append-only UAT decision</button>
           </form>
           <p id="businessReviewMessage" role="status"></p>
         </article>
         <article id="proposalPanel" class="panel proposal-panel" hidden>
           <div class="panel-head"><div><p class="eyebrow">TARGET-SIDE REVIEW METADATA</p><h2 id="proposalTitle">Draft a resolution proposal</h2></div><span class="pill">No source mutation</span></div>
-          <pre id="proposalEvidence"></pre>
+          <div id="proposalEvidence" class="readable-detail"></div>
           <form id="proposalForm">
             <input id="proposalExceptionId" type="hidden">
             <label>Resolution type<select id="proposalCode" required></select></label>
-            <label>Proposed target value (JSON)<textarea id="proposalValue" rows="3" maxlength="4000">{}</textarea></label>
-            <label>Rationale<textarea id="proposalRationale" rows="3" minlength="10" maxlength="2000" required></textarea></label>
+            <label>Correct value or required action<textarea id="proposalValue" rows="3" maxlength="4000" placeholder="Enter the corrected value or describe exactly what should change"></textarea></label>
+            <label>Reason for correction<textarea id="proposalRationale" rows="3" minlength="10" maxlength="2000" required placeholder="Explain how you verified the correction"></textarea></label>
             <button type="submit">Save append-only draft</button>
           </form>
           <p id="proposalMessage" role="status"></p>

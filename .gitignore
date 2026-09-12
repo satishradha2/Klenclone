@@ -9,6 +9,7 @@ downloads/
 !.env.example
 !.env.asas.example
 !.env.asas.operational.example
+!.env.asas.production.example
 *.cookie
 *.session
 .secrets/

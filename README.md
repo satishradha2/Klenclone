@@ -41,6 +41,7 @@ Raw exports are excluded from source control because they contain confidential c
 - `docs/CANONICAL_TRANSACTION_CHECKPOINT.md` — non-posting documents, lines, payments, inventory movements and exception queue.
 - `docs/CANONICAL_ACCOUNTING_CHECKPOINT.md` — locked GL, journals, AR/AP, VAT, cash, trial balance and financial activation gates.
 - `docs/SECURITY_WORKFLOW_CHECKPOINT.md` — disabled users/RBAC, location scopes, approval bindings, SoD and security gates.
+- `docs/PRODUCTION_SECURITY_DEPLOYMENT_CHECKPOINT_20260909.md` — fail-closed production configuration, persistent sessions, TLS/host controls and activation runbook.
 - `docs/SOURCE_COVERAGE_CHECKPOINT.md` — every raw row mapped, classified or explicitly blocked for structured promotion.
 - `docs/RESIDUAL_WORKFLOW_CHECKPOINT.md` — portal, quotation/draft, shipment, sales-target and transfer-detail structures.
 - `docs/APPLICATION_FOUNDATION_CHECKPOINT.md` — read-only API, migration dashboard and HTTP safety controls.
@@ -194,7 +195,7 @@ validated against cloned party, product and location masters. They are expressly
 non-posting: no inventory, accounting, tax, payment, or source-system record is
 created. See `docs/OPERATIONAL_DRAFT_FOUNDATION_CHECKPOINT_20260909.md`.
 
-Operational schema versions `0001` through `0007` are checksum-recorded.
+Operational schema versions `0001` through `0015` are checksum-recorded.
 Drafts use database row locks plus optimistic revision checks, immutable workflow
 events, controlled submit/cancel/approve transitions, and per-line base-quantity
 snapshots. Product, party and location selectors and printable review are active.
@@ -206,6 +207,18 @@ Both roles are explicitly scoped to cloned locations `DXB`, `MAIN`, `RAK` and
 basis; purchase rehearsal allocates header discount across incoming stock value.
 The first PostgreSQL backup/restore drill is recorded in
 `docs/OPERATIONAL_BACKUP_SCOPE_VALUATION_CHECKPOINT_20260909.md`.
+
+### Production deployment template
+
+`compose.production.yaml` is a hardened overlay for an approved reverse-proxy deployment. It removes workstation evidence mounts and local port publishing, requires external clone and operational PostgreSQL URLs, uses a Docker secret for provisioned identities, enables persistent database sessions, validates explicit hosts and trusted proxy addresses, and keeps posting disabled unless confirmation plus an approval reference are both supplied.
+
+Validate it with environment-specific secret references before deployment:
+
+```powershell
+docker compose -f compose.yaml -f compose.production.yaml config --quiet
+```
+
+Do not activate posting during the infrastructure deployment. Complete TLS, backup/restore, monitoring, access review and final BizModo reconciliation first.
 
 Migration `0005` adds stock-position and reservation bounds, fiscal-period
 rehearsal locks, deterministic posting fingerprints, permanent journal and
@@ -259,3 +272,13 @@ $env:KLEN_DATABASE_URL='postgresql+psycopg://...'
 $env:PYTHONPATH='src'
 python -m klen_clone.cli copy-db --source-url 'sqlite:///var/klen_staging.db'
 ```
+
+Stage a checksum-verified frozen browser delta in a new disposable database:
+
+```powershell
+python -m klen_clone.cli browser-delta-stage --capture source_exports/2026-09-10-frozen-browser-cutover --output var/frozen_browser_delta_staging/run/browser_delta_staging.db
+```
+
+This command refuses existing outputs and capture-integrity failures. Its
+database is explicitly marked validation-only with production merge and posting
+disabled.

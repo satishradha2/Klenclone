@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from .db import Base, SessionFactory, make_engine
 from .importer import import_evidence
@@ -32,6 +36,11 @@ from .capture_watermark import build_capture_watermark
 from .erp_master_rehearsal import build_erp_master_package
 from .erp_opening_rehearsal import build_erp_opening_package
 from .reconciliation_refresh import build_reconciliation_refresh
+from .browser_delta_staging import stage_browser_delta
+from .delta_overlay import load_delta_overlay
+from .models import SourceSnapshot
+from .operational import initialize_operational_database, make_operational_engine
+from .operational_masters import promote_operational_masters
 
 
 def parser() -> argparse.ArgumentParser:
@@ -118,6 +127,14 @@ def parser() -> argparse.ArgumentParser:
     refresh.add_argument("--capture", type=Path, required=True)
     refresh.add_argument("--prior-capture", type=Path, required=True)
     refresh.add_argument("--output", type=Path, required=True)
+    browser_delta = commands.add_parser("browser-delta-stage")
+    browser_delta.add_argument("--capture", type=Path, required=True)
+    browser_delta.add_argument("--output", type=Path, required=True)
+    promote_masters = commands.add_parser("promote-operational-masters")
+    promote_masters.add_argument("--snapshot", required=True)
+    promote_masters.add_argument("--delta-capture", type=Path)
+    promote_masters.add_argument("--operational-database-url")
+    promote_masters.add_argument("--actor", default="migration-controller")
     return root
 
 
@@ -180,6 +197,27 @@ def main() -> None:
         return
     if args.command == "reconciliation-refresh":
         result = build_reconciliation_refresh(args.capture, args.prior_capture, args.output)
+        print(json.dumps(result, indent=2, default=str))
+        return
+    if args.command == "browser-delta-stage":
+        result = stage_browser_delta(args.capture, args.output)
+        print(json.dumps(result, indent=2, default=str))
+        if result["status"] == "failed":
+            raise SystemExit(1)
+        return
+    if args.command == "promote-operational-masters":
+        clone_engine = make_engine(args.database_url)
+        operational_url = args.operational_database_url or os.getenv("ASAS_OPERATIONAL_DATABASE_URL")
+        if not operational_url:
+            raise SystemExit("ASAS_OPERATIONAL_DATABASE_URL or --operational-database-url is required")
+        operational_engine = make_operational_engine(operational_url)
+        initialize_operational_database(operational_engine)
+        overlay = load_delta_overlay(args.delta_capture) if args.delta_capture else None
+        with Session(clone_engine) as clone, Session(operational_engine) as operational:
+            snapshot = clone.scalar(select(SourceSnapshot).where(SourceSnapshot.name == args.snapshot))
+            if not snapshot:
+                raise SystemExit(f"Snapshot not found: {args.snapshot}")
+            result = promote_operational_masters(clone, operational, snapshot, overlay, actor=args.actor)
         print(json.dumps(result, indent=2, default=str))
         return
     engine = make_engine(args.database_url)

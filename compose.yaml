@@ -81,7 +81,7 @@ services:
     ports:
       - "127.0.0.1:${ASAS_ERP_PREVIEW_PORT:-18082}:8080"
     volumes:
-      - ./source_exports/2026-09-09-current-non-atomic:/evidence/current:ro
+      - ./source_exports/2026-09-10-frozen-browser-cutover:/evidence/current:ro
       - ./source_exports/2026-09-09-reconciliation-20260909T101320Z:/evidence/reconciled-stock:ro
       - ./var/erp_reconciliation_refreshes/20260909T101320Z/package/PACKAGE_STATUS.json:/evidence/reconciled-stock-status.json:ro
       - ./.secrets/asas-users.json:/run/asas-secrets/users.json:ro

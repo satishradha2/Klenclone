@@ -26,7 +26,10 @@ def load_provisioned_users(path: str | None, fallback_username: str, fallback_ha
             "permissions": ["clone.read", "migration.review", "draft.create", "draft.edit", "draft.submit", "draft.cancel",
                             "inventory.create", "inventory.edit", "inventory.submit", "inventory.cancel",
                             "goods_receipt.create", "goods_receipt.edit", "goods_receipt.submit", "goods_receipt.cancel",
-                            "sales_return.create", "sales_return.edit", "sales_return.submit", "sales_return.cancel"],
+                            "sales_return.create", "sales_return.edit", "sales_return.submit", "sales_return.cancel",
+                            "purchase_return.create", "purchase_return.edit", "purchase_return.submit", "purchase_return.cancel",
+                            "payment.create", "payment.edit", "payment.submit", "payment.cancel",
+                            "financial_report.read", "posting.execute", "posting.reverse"],
             "allowed_locations": ["*"],
         }]
     else:

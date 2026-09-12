@@ -1,0 +1,5 @@
+[data-erp-help]{cursor:help;text-decoration-line:underline;text-decoration-style:dotted;text-decoration-color:#7f9a93;text-underline-offset:3px}
+.status[data-erp-help],.badge[data-erp-help],.preview-pill[data-erp-help]{text-decoration:none;box-shadow:inset 0 -1px #7f9a93}
+#erp-glossary-tooltip{position:fixed;display:none;z-index:10000;max-width:310px;padding:9px 11px;border:1px solid #315b53;border-radius:8px;background:#102f2b;color:#f6fbf9;box-shadow:0 8px 24px rgba(8,31,28,.24);font-size:11px;line-height:1.45;pointer-events:none}
+#erp-glossary-tooltip.visible{display:block}
+@media (prefers-reduced-motion:no-preference){#erp-glossary-tooltip{transition:opacity .12s ease}}

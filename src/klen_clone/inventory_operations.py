@@ -412,7 +412,8 @@ def rehearse_inventory_posting(session: Session, document: OperationalInventoryD
     session.commit()
     return {
         "document_key": document.document_key, "document_no": document.document_no,
-        "posting_enabled": False, "fingerprint": fingerprint,
+        "posting_enabled": False, "period_key": period.period_key,
+        "fingerprint": fingerprint, "posting_fingerprint": fingerprint,
         "idempotency_key": f"{document.document_key}:{document.revision}:{fingerprint[:16]}",
         "movements": movements, "journal": journal, "debit": debit, "credit": credit,
         "quantity_delta": sum((row["quantity_base"] for row in movements), Decimal("0")),

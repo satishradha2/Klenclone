@@ -1,0 +1,35 @@
+/* Long module navigation scrolls independently while the source badge remains visible. */
+@media (min-width:721px) {
+  .sidebar {
+    overflow: hidden;
+  }
+
+  .sidebar .brand {
+    flex: 0 0 auto;
+  }
+
+  .sidebar nav {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-right: 5px;
+    scrollbar-color: #557a73 transparent;
+    scrollbar-width: thin;
+  }
+
+  .sidebar nav::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .sidebar nav::-webkit-scrollbar-thumb {
+    background: #557a73;
+    border-radius: 999px;
+  }
+
+  .sidebar .source-card {
+    flex: 0 0 auto;
+    margin-top: 12px;
+  }
+}

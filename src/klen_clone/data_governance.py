@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import uuid
 from datetime import datetime
 
 from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
-from .operational import OperationalBase, utc_now
+from .operational import OperationalAuditEvent, OperationalBase, utc_now
 
 
 class OperationalPromotionBatch(OperationalBase):
@@ -108,6 +111,115 @@ def promotion_control_counts(session: Session) -> dict:
         "open_exceptions": session.scalar(select(func.count(OperationalPromotionException.id)).where(
             OperationalPromotionException.status == "open")) or 0,
     }
+
+
+def plan_historical_promotion(session: Session, *, source_system: str, source_snapshot_name: str,
+                              source_manifest_checksum: str, expected_records: int,
+                              exceptions: list[dict], actor: str) -> dict:
+    """Create an idempotent, non-posting batch and quarantine every known exception."""
+    normalized = sorted(({"source_exception_id": int(item["source_exception_id"]),
+                          "source_kind": str(item["source_kind"]),
+                          "reason_code": str(item["reason_code"]),
+                          "detail": item["detail"]} for item in exceptions),
+                        key=lambda item: item["source_exception_id"])
+    exception_checksum = hashlib.sha256(json.dumps(
+        normalized, default=str, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    batch_key = f"HISTORY-{source_manifest_checksum[:12].upper()}-{exception_checksum[:12].upper()}"
+    existing = session.scalar(select(OperationalPromotionBatch).where(
+        OperationalPromotionBatch.batch_key == batch_key))
+    if existing:
+        return {"batch_key": existing.batch_key, "status": existing.status,
+                "expected_records": existing.expected_records, "mapped_records": existing.mapped_records,
+                "exception_records": existing.exception_records, "posting_enabled": False,
+                "idempotent_replay": True}
+    batch = OperationalPromotionBatch(
+        batch_key=batch_key, source_system=source_system, source_snapshot_name=source_snapshot_name,
+        source_manifest_checksum=source_manifest_checksum, status="planned", posting_enabled=False,
+        expected_records=expected_records, mapped_records=0, exception_records=len(normalized),
+        created_by=actor,
+    )
+    session.add(batch)
+    session.flush()
+    session.add_all([OperationalPromotionException(
+        batch_id=batch.id, entity_type=item["source_kind"],
+        source_record_key=f'exception:{item["source_exception_id"]}',
+        reason_code=item["reason_code"], detail=json.dumps(item["detail"], default=str, sort_keys=True),
+        status="open",
+    ) for item in normalized])
+    session.add(OperationalAuditEvent(
+        event_key=str(uuid.uuid4()), event_type="promotion.planned", actor=actor,
+        resource_key=batch_key,
+        detail=json.dumps({"expected_records": expected_records,
+                           "exception_records": len(normalized),
+                           "exception_checksum": exception_checksum,
+                           "posting_enabled": False}, sort_keys=True),
+    ))
+    session.flush()
+    return {"batch_key": batch.batch_key, "status": batch.status,
+            "expected_records": batch.expected_records, "mapped_records": batch.mapped_records,
+            "exception_records": batch.exception_records, "posting_enabled": False,
+            "idempotent_replay": False}
+
+
+def resolve_promotion_exception(session: Session, *, batch_key: str, source_exception_id: int,
+                                actor: str, resolution_code: str, evidence: dict) -> dict:
+    """Resolve one operational quarantine item without changing its source evidence.
+
+    Resolution is allowed only with a structured evidence payload. The original exception
+    detail remains immutable; the decision and an evidence checksum are written to the
+    operational audit trail. This function never maps, promotes, or posts a source row.
+    """
+    if not actor.strip():
+        raise ValueError("actor is required")
+    if not resolution_code.strip():
+        raise ValueError("resolution_code is required")
+    if not isinstance(evidence, dict) or not evidence:
+        raise ValueError("structured resolution evidence is required")
+
+    batch = session.scalar(select(OperationalPromotionBatch).where(
+        OperationalPromotionBatch.batch_key == batch_key))
+    if batch is None:
+        raise ValueError("promotion batch not found")
+    source_record_key = f"exception:{int(source_exception_id)}"
+    exception = session.scalar(select(OperationalPromotionException).where(
+        OperationalPromotionException.batch_id == batch.id,
+        OperationalPromotionException.source_record_key == source_record_key,
+    ))
+    if exception is None:
+        raise ValueError("promotion exception not found")
+    if exception.status == "resolved":
+        return {"batch_key": batch_key, "source_record_key": source_record_key,
+                "status": "resolved", "posting_enabled": False, "idempotent_replay": True}
+    if exception.status != "open":
+        raise ValueError(f"promotion exception is {exception.status}")
+
+    normalized_evidence = json.loads(json.dumps(evidence, default=str, sort_keys=True))
+    evidence_checksum = hashlib.sha256(json.dumps(
+        normalized_evidence, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    exception.status = "resolved"
+    exception.resolved_by = actor.strip()
+    exception.resolved_at = utc_now()
+    session.add(OperationalAuditEvent(
+        event_key=str(uuid.uuid4()), event_type="promotion.exception.resolved",
+        actor=actor.strip(), resource_key=source_record_key,
+        detail=json.dumps({
+            "batch_key": batch_key,
+            "reason_code": exception.reason_code,
+            "resolution_code": resolution_code.strip(),
+            "evidence": normalized_evidence,
+            "evidence_checksum": evidence_checksum,
+            "source_exception_modified": False,
+            "mapping_performed": False,
+            "posting_enabled": False,
+        }, sort_keys=True),
+    ))
+    session.flush()
+    return {"batch_key": batch_key, "source_record_key": source_record_key,
+            "status": "resolved", "resolution_code": resolution_code.strip(),
+            "evidence_checksum": evidence_checksum, "posting_enabled": False,
+            "idempotent_replay": False}
 
 
 PROMOTION_GATES = (

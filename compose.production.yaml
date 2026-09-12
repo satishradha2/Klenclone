@@ -1,0 +1,36 @@
+services:
+  erp-preview:
+    env_file: !reset []
+    environment:
+      KLEN_DATABASE_URL: "${KLEN_DATABASE_URL:?Set KLEN_DATABASE_URL}"
+      KLEN_SNAPSHOT: "${KLEN_SNAPSHOT:-bizmodo-production-cutover}"
+      ASAS_DELTA_CAPTURE: ""
+      ASAS_AUTH_ENABLED: "true"
+      ASAS_PRODUCTION_MODE: "true"
+      ASAS_POSTING_ENABLED: "${ASAS_POSTING_ENABLED:-false}"
+      ASAS_POSTING_ACTIVATION_CONFIRMED: "${ASAS_POSTING_ACTIVATION_CONFIRMED:-false}"
+      ASAS_POSTING_APPROVAL_REFERENCE: "${ASAS_POSTING_APPROVAL_REFERENCE:-}"
+      ASAS_SESSION_SECRET: "${ASAS_SESSION_SECRET:?Set ASAS_SESSION_SECRET}"
+      ASAS_SECURE_COOKIES: "true"
+      ASAS_ALLOWED_HOSTS: "${ASAS_ALLOWED_HOSTS:?Set ASAS_ALLOWED_HOSTS}"
+      ASAS_USERS_FILE: /run/secrets/asas_users
+      ASAS_OPERATIONAL_DATABASE_URL: "${ASAS_OPERATIONAL_DATABASE_URL:?Set ASAS_OPERATIONAL_DATABASE_URL}"
+    secrets:
+      - asas_users
+    volumes: !reset []
+    ports: !reset []
+    depends_on: !reset {}
+    expose:
+      - "8080"
+    command: ["python", "-m", "uvicorn", "klen_clone.erp_preview:app", "--host", "0.0.0.0", "--port", "8080", "--no-server-header", "--proxy-headers", "--forwarded-allow-ips", "${ASAS_TRUSTED_PROXY_IPS:?Set ASAS_TRUSTED_PROXY_IPS}"]
+    init: true
+    pids_limit: 256
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 4096
+    stop_grace_period: 30s
+
+secrets:
+  asas_users:
+    file: ${ASAS_USERS_SECRET_FILE:?Set ASAS_USERS_SECRET_FILE}
