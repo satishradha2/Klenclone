@@ -5,7 +5,7 @@ import pytest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from klen_clone.finance import choose_line_semantics, controlled_return_offset, controlled_rounding_adjustment, controlled_settlement_rounding, expected_document_total, local_datetime_key, normalize_party
+from klen_clone.finance import choose_line_semantics, controlled_purchase_return_line_offset, controlled_return_offset, controlled_rounding_adjustment, controlled_settlement_rounding, expected_document_total, local_datetime_key, normalize_party, settlement_residual_with_return_due
 
 
 def test_sales_lines_already_include_tax_and_only_header_discount_is_removed():
@@ -55,3 +55,27 @@ def test_small_difference_is_rounding_only_when_tax_control_matches():
     assert controlled_rounding_adjustment(Decimal("0.05"), None) == Decimal("0")
     assert controlled_settlement_rounding(Decimal("-0.10")) == Decimal("-0.10")
     assert controlled_settlement_rounding(Decimal("-0.11")) == Decimal("0")
+
+
+def test_sales_return_due_offsets_receipts_above_the_net_invoice_total():
+    assert settlement_residual_with_return_due(
+        Decimal("58.85"), Decimal("60.00"), Decimal("0"), Decimal("1.15")
+    ) == Decimal("0.00")
+
+
+def test_purchase_return_restores_only_a_tax_proven_line_gap():
+    assert controlled_purchase_return_line_offset(
+        "purchase", Decimal("246.00"), Decimal("258.30"),
+        Decimal("1841.50"), Decimal("92.075"),
+    ) == Decimal("246.00")
+    assert controlled_purchase_return_line_offset(
+        "purchase", Decimal("246.00"), Decimal("250.00"),
+        Decimal("1841.50"), Decimal("92.075"),
+    ) == Decimal("0")
+    assert controlled_purchase_return_line_offset(
+        "sale", Decimal("246.00"), Decimal("258.30"),
+        Decimal("1841.50"), Decimal("92.075"),
+    ) == Decimal("0")
+    assert settlement_residual_with_return_due(
+        Decimal("287.75"), Decimal("250.00"), Decimal("37.75"), Decimal("0")
+    ) == Decimal("0.00")

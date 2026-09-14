@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from klen_clone.inventory import canonical_uom, parse_uom_definition, uom_key
+from klen_clone.inventory import canonical_uom, parse_uom_definition, uom_family, uom_key
 
 
 def test_common_source_uom_aliases_are_canonicalized_without_changing_dimension():
@@ -27,3 +27,9 @@ def test_base_unit_without_factor_remains_identity_only():
 
 def test_package_name_key_ignores_display_spacing():
     assert uom_key("Carton (20 Pack)") == uom_key("Carton (20Pack)")
+
+
+def test_uom_family_extracts_the_outer_package():
+    assert uom_family("Carton (20 Pack)") == "carton"
+    assert uom_family("CTN(1x6)") == "carton"
+    assert uom_family("Pc(s)") == "piece"

@@ -56,6 +56,13 @@ def uom_key(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
 
 
+def uom_family(value: str | None) -> str | None:
+    text = clean_uom(value)
+    if not text:
+        return None
+    return canonical_uom(re.split(r"\s*\(", text, maxsplit=1)[0])
+
+
 def parse_uom_definition(name: str | None, short_name: str | None) -> dict:
     source_name = clean_uom(name)
     short = clean_uom(short_name)
@@ -155,6 +162,34 @@ def build_inventory_snapshot(session: Session, snapshot_name: str) -> dict:
     for row in session.scalars(select(StgReturn).where(StgReturn.snapshot_id == snapshot.id)):
         returns_by_key[(row.direction, row.document_no)].append(row)
 
+    sale_lines = session.scalars(select(StgSaleLine).where(StgSaleLine.snapshot_id == snapshot.id)).all()
+    purchase_lines = session.scalars(select(StgPurchaseLine).where(StgPurchaseLine.snapshot_id == snapshot.id)).all()
+    document_lines = session.scalars(select(StgDocumentLine).where(
+        StgDocumentLine.snapshot_id == snapshot.id,
+        StgDocumentLine.source_entity.in_(("sales_return", "purchase_return", "stock_transfer")),
+    )).all()
+    product_factor_hints: dict[tuple[int, str, str], set[Decimal]] = defaultdict(set)
+    for source_kind, rows in (
+        ("sale_line", sale_lines),
+        ("purchase_line", purchase_lines),
+        ("document_line", document_lines),
+    ):
+        for line in rows:
+            product_id = product_links[source_kind].get(line.id)
+            product = product_by_id.get(product_id)
+            source_family = uom_family(line.unit)
+            base_canonical = canonical_uom(product.stock_unit) if product else None
+            if not product or not source_family or not base_canonical:
+                continue
+            if source_family == uom_family(product.stock_unit):
+                factor = Decimal("1")
+            else:
+                candidates = definitions.get((uom_key(line.unit), base_canonical), set())
+                if len(candidates) != 1:
+                    continue
+                factor = next(iter(candidates))
+            product_factor_hints[(product.id, source_family, base_canonical)].add(factor)
+
     observed: dict[int, set[str]] = defaultdict(set)
     unresolved_pairs: Counter[tuple[str | None, str | None]] = Counter()
     movement_counts: Counter[str] = Counter()
@@ -173,18 +208,30 @@ def build_inventory_snapshot(session: Session, snapshot_name: str) -> dict:
         conversion_status = "product_unresolved" if not product else "missing_uom"
         if product and source_canonical and base_canonical:
             observed[product.id].add(clean_uom(unit) or source_canonical)
+            source_family = uom_family(unit)
+            base_family = uom_family(product.stock_unit)
             if source_canonical == base_canonical:
                 factor = Decimal("1")
                 conversion_status = "identity"
+            elif source_family == base_family:
+                factor = Decimal("1")
+                conversion_status = "identity_family"
             else:
                 candidates = definitions.get((uom_key(unit), base_canonical), set())
                 if len(candidates) == 1:
                     factor = next(iter(candidates))
                     conversion_status = "explicit_registry"
-                elif len(candidates) > 1:
-                    conversion_status = "ambiguous_registry"
                 else:
-                    conversion_status = "no_conversion_definition"
+                    hints = product_factor_hints.get((product.id, source_family, base_canonical), set())
+                    if len(hints) == 1:
+                        factor = next(iter(hints))
+                        conversion_status = "product_observed"
+                    elif len(candidates) > 1:
+                        conversion_status = "ambiguous_registry"
+                    elif len(hints) > 1:
+                        conversion_status = "ambiguous_product_observed"
+                    else:
+                        conversion_status = "no_conversion_definition"
                 if factor is None:
                     unresolved_pairs[(source_canonical, base_canonical)] += 1
         quantity_base = quantity * factor * multiplier if quantity is not None and factor is not None else None
@@ -202,7 +249,7 @@ def build_inventory_snapshot(session: Session, snapshot_name: str) -> dict:
         conversion_counts[conversion_status] += 1
         posting_counts[posting_status] += 1
 
-    for line in session.scalars(select(StgSaleLine).where(StgSaleLine.snapshot_id == snapshot.id)):
+    for line in sale_lines:
         header = sale_headers.get(sale_header_links.get(line.id))
         add_movement(source_kind="sale_line", source_id=line.id, document_no=line.document_no,
                      product_id=product_links["sale_line"].get(line.id), sku=line.sku,
@@ -212,7 +259,7 @@ def build_inventory_snapshot(session: Session, snapshot_name: str) -> dict:
                      posting_status="posted" if header else "unposted_header_unresolved",
                      details={"header_id": header.id if header else None})
 
-    for line in session.scalars(select(StgPurchaseLine).where(StgPurchaseLine.snapshot_id == snapshot.id)):
+    for line in purchase_lines:
         header = purchase_headers.get(purchase_header_links.get(line.id))
         add_movement(source_kind="purchase_line", source_id=line.id, document_no=line.document_no,
                      product_id=product_links["purchase_line"].get(line.id), sku=line.sku,
@@ -222,10 +269,7 @@ def build_inventory_snapshot(session: Session, snapshot_name: str) -> dict:
                      posting_status="posted" if header else "unposted_header_unresolved",
                      details={"header_id": header.id if header else None, "adjusted_quantity": str(line.adjusted_quantity) if line.adjusted_quantity is not None else None})
 
-    for line in session.scalars(select(StgDocumentLine).where(
-        StgDocumentLine.snapshot_id == snapshot.id,
-        StgDocumentLine.source_entity.in_(("sales_return", "purchase_return", "stock_transfer")),
-    )):
+    for line in document_lines:
         product_id = product_links["document_line"].get(line.id)
         if line.source_entity == "stock_transfer":
             header = transfer_headers.get(transfer_header_links.get(line.id))

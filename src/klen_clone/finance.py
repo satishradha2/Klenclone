@@ -83,6 +83,34 @@ def controlled_settlement_rounding(residual_after_returns: Decimal) -> Decimal:
     return residual_after_returns if abs(residual_after_returns) <= ROUNDING_LIMIT else ZERO
 
 
+def settlement_residual_with_return_due(
+    header_total: Decimal, payment_total: Decimal, due: Decimal, return_due: Decimal
+) -> Decimal:
+    """Reconcile a net sale header without losing the customer-credit liability.
+
+    BizModo reduces a sale header when goods are returned and records any amount
+    owed back to the customer in ``Sell Return Due``.  That credit therefore
+    offsets receipts which exceed the net invoice amount.
+    """
+    return header_total - payment_total - due + return_due
+
+
+def controlled_purchase_return_line_offset(
+    document_kind: str,
+    tax_base_line_gap: Decimal,
+    return_total: Decimal,
+    amount_ex_tax: Decimal,
+    vat: Decimal,
+) -> Decimal:
+    """Restore a purchase line gap only when its VAT-inclusive return proves it."""
+    if document_kind != "purchase" or tax_base_line_gap <= ZERO or return_total <= ZERO:
+        return ZERO
+    if amount_ex_tax <= ZERO:
+        return ZERO
+    expected_return_total = tax_base_line_gap + (tax_base_line_gap * vat / amount_ex_tax)
+    return tax_base_line_gap if abs(return_total - expected_return_total) <= TOLERANCE else ZERO
+
+
 def _candidate(kind: str, row) -> dict:
     return {
         "kind": kind,
@@ -201,6 +229,16 @@ def build_financial_allocations(session: Session, snapshot_name: str) -> dict:
         return_total = rec.return_total or ZERO
         due = Decimal(str((rec.details or {}).get("due") or "0"))
         expected_total, line_semantics = choose_line_semantics(rec.document_kind, header_total, line_total, vat_value, discount_value)
+        if (
+            rec.document_kind == "sale"
+            and tax is not None
+            and tax.amount_with_tax is not None
+            and return_total > ZERO
+        ):
+            return_adjusted_tax_total = tax.amount_with_tax - return_total
+            if abs(header_total - return_adjusted_tax_total) <= TOLERANCE:
+                expected_total = return_adjusted_tax_total
+                line_semantics = "original_tax_gross_less_sales_returns"
         tax_amount_semantics = None
         if rec.document_kind == "sale":
             tax_control_variance = header_total - tax.amount_with_tax if tax and tax.amount_with_tax is not None else None
@@ -213,10 +251,25 @@ def build_financial_allocations(session: Session, snapshot_name: str) -> dict:
                 tax_control_total = alternative_tax_control
                 tax_amount_semantics = "includes_tax"
             tax_control_variance = header_total - tax_control_total if tax_control_total is not None else None
+        tax_base_line_gap = (
+            (tax.amount_ex_tax or ZERO) - line_total
+            if rec.document_kind == "purchase" and tax and tax.amount_ex_tax is not None
+            else ZERO
+        )
+        purchase_return_line_offset = controlled_purchase_return_line_offset(
+            rec.document_kind, tax_base_line_gap, return_total,
+            (tax.amount_ex_tax or ZERO) if tax else ZERO, vat_value,
+        )
+        expected_total += purchase_return_line_offset
+        if purchase_return_line_offset:
+            line_semantics = "return_adjusted_lines_restored_from_tax_control"
         raw_allocation_residual = header_total - expected_total
         rounding_adjustment = controlled_rounding_adjustment(raw_allocation_residual, tax_control_variance)
         allocation_residual = raw_allocation_residual - rounding_adjustment
-        raw_settlement_residual = header_total - payment_total - due
+        source_return_due = Decimal(str((rec.details or {}).get("return_due") or "0"))
+        raw_settlement_residual = settlement_residual_with_return_due(
+            header_total, payment_total, due, source_return_due
+        )
         return_settlement_offset = controlled_return_offset(rec.document_kind, raw_settlement_residual, return_total)
         settlement_before_rounding = raw_settlement_residual + return_settlement_offset
         settlement_rounding_adjustment = controlled_settlement_rounding(settlement_before_rounding)
@@ -247,7 +300,7 @@ def build_financial_allocations(session: Session, snapshot_name: str) -> dict:
             return_total=return_total, tax_control_variance=tax_control_variance,
             allocation_residual=allocation_residual, settlement_residual=settlement_residual,
             tax_link_status=tax_link_status, status=status,
-            details={"tax_evidence_id": tax.id if tax else None, "line_semantics": line_semantics, "tax_amount_semantics": tax_amount_semantics, "tax_base_line_gap": str((tax.amount_ex_tax or ZERO) - line_total) if rec.document_kind == "purchase" and tax and tax.amount_ex_tax is not None else None, "source_line_gap": source_line_gap, "raw_allocation_residual": str(raw_allocation_residual), "rounding_adjustment": str(rounding_adjustment), "raw_settlement_residual": str(raw_settlement_residual), "return_settlement_offset": str(return_settlement_offset), "settlement_rounding_adjustment": str(settlement_rounding_adjustment), "returns_preserved_unallocated": str(return_total - return_settlement_offset)},
+            details={"tax_evidence_id": tax.id if tax else None, "line_semantics": line_semantics, "tax_amount_semantics": tax_amount_semantics, "tax_base_line_gap": str(tax_base_line_gap) if rec.document_kind == "purchase" and tax and tax.amount_ex_tax is not None else None, "purchase_return_line_offset": str(purchase_return_line_offset), "source_line_gap": source_line_gap, "raw_allocation_residual": str(raw_allocation_residual), "rounding_adjustment": str(rounding_adjustment), "source_return_due": str(source_return_due), "raw_settlement_residual": str(raw_settlement_residual), "return_settlement_offset": str(return_settlement_offset), "settlement_rounding_adjustment": str(settlement_rounding_adjustment), "returns_preserved_unallocated": str(return_total - return_settlement_offset)},
         ))
         allocation_status_counts[status] += 1
         if allocation_bad:
@@ -260,7 +313,7 @@ def build_financial_allocations(session: Session, snapshot_name: str) -> dict:
             session.add(ReconciliationException(
                 snapshot_id=snapshot.id, code="SETTLEMENT_RESIDUAL", severity="high",
                 entity_type=rec.document_kind, source_key=rec.document_no,
-                details={"header_id": rec.header_id, "residual": str(settlement_residual), "payment_total": str(payment_total), "due": str(due), "return_total_unallocated": str(return_total - return_settlement_offset)},
+                details={"header_id": rec.header_id, "residual": str(settlement_residual), "payment_total": str(payment_total), "due": str(due), "return_due": str(source_return_due), "return_total_unallocated": str(return_total - return_settlement_offset)},
             ))
 
     session.commit()

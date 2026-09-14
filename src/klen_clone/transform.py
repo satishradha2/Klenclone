@@ -120,7 +120,9 @@ def _parse_purchase_return_snapshot(snapshot: str) -> list[dict]:
         if not cells:
             continue
         if cells[0].isdigit() and len(cells) >= 7:
-            line_no, product, price, quantity_text, subtotal = int(cells[0]), cells[1], cells[2], cells[5], cells[6]
+            line_no, product, price, purchase_quantity_text, quantity_text, subtotal = (
+                int(cells[0]), cells[1], cells[2], cells[3], cells[5], cells[6]
+            )
             sku = None
         elif len(cells) >= 4:
             line_no, product, quantity_text, price, subtotal = len(result) + 1, cells[0], cells[1], cells[2], cells[3]
@@ -131,6 +133,8 @@ def _parse_purchase_return_snapshot(snapshot: str) -> list[dict]:
         else:
             continue
         quantity, unit = quantity_value(quantity_text)
+        if cells[0].isdigit() and not unit:
+            _, unit = quantity_value(purchase_quantity_text)
         result.append({"line_no": line_no, "product_name": clean(product), "sku": sku, "quantity": quantity, "unit": unit, "unit_price": decimal_value(price), "subtotal": decimal_value(subtotal), "raw_columns": cells})
     return result
 

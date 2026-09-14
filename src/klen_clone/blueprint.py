@@ -49,6 +49,23 @@ def location_key(value: str | None) -> str:
     return " ".join((value or "").casefold().split())
 
 
+def gross_cost_purchase_without_input_vat(
+    document_kind: str,
+    tax_link_status: str,
+    header_total: Decimal,
+    line_total: Decimal,
+    allocation_residual: Decimal,
+) -> bool:
+    """Allow a balanced gross-cost journal without claiming unsupported input VAT."""
+    return (
+        document_kind == "purchase"
+        and tax_link_status != "resolved"
+        and header_total > ZERO
+        and abs(header_total - line_total) <= TOLERANCE
+        and abs(allocation_residual) <= TOLERANCE
+    )
+
+
 def build_blueprints(session: Session, snapshot_name: str) -> dict:
     snapshot = session.scalar(select(SourceSnapshot).where(SourceSnapshot.name == snapshot_name))
     if not snapshot:
@@ -140,7 +157,14 @@ def build_blueprints(session: Session, snapshot_name: str) -> dict:
         total = tax_evidence.amount_with_tax if allocation.document_kind == "sale" and tax_evidence and tax_evidence.amount_with_tax is not None else allocation.header_total
         vat = allocation.vat_amount or ZERO
         review = None
-        if allocation.tax_link_status != "resolved":
+        gross_cost_only = gross_cost_purchase_without_input_vat(
+            allocation.document_kind,
+            allocation.tax_link_status,
+            allocation.header_total,
+            allocation.line_total,
+            allocation.allocation_residual,
+        )
+        if allocation.tax_link_status != "resolved" and not gross_cost_only:
             review = "tax evidence is not deterministically linked"
             lines = []
         elif total < ZERO or vat < ZERO or vat > total:
@@ -156,10 +180,15 @@ def build_blueprints(session: Session, snapshot_name: str) -> dict:
         else:
             net = total - vat
             lines = [
-                ("1300", net, ZERO, "Inventory and purchase clearing", {"allocation_id": allocation.id}),
+                ("1300", net, ZERO, "Inventory and purchase clearing", {
+                    "allocation_id": allocation.id,
+                    "tax_treatment": "gross_cost_no_input_vat_claim" if gross_cost_only else "linked_input_vat",
+                }),
                 ("1400", vat, ZERO, "Input VAT", {"tax_evidence": allocation.details.get("tax_evidence_id")}),
                 ("2000", ZERO, total, "Supplier payable", {"allocation_id": allocation.id}),
             ]
+            if gross_cost_only:
+                lines.pop(1)
         add_journal(
             f"{allocation.document_kind}_invoice", str(allocation.header_id), allocation.document_no,
             header.transaction_at if header else None, f"Provisional {allocation.document_kind} invoice journal",

@@ -35,4 +35,21 @@ def test_purchase_return_snapshot_supports_parent_form_rows():
     line = _parse_purchase_return_snapshot(snapshot)[0]
     assert line["product_name"] == "Paper Cup"
     assert line["quantity"] == Decimal("2.00")
+    assert line["unit"] == "Carton"
     assert line["subtotal"] == Decimal("20.00")
+
+
+def test_purchase_return_inherits_purchase_uom_when_return_cell_has_quantity_only():
+    snapshot = '''
+    - row "1 Paper Cup AED 10.00 5.00 Carton 3.00 2.00 AED 20.00":
+      - cell "1"
+      - cell "Paper Cup"
+      - cell "AED 10.00"
+      - cell "5.00 Carton"
+      - cell "3.00 Carton"
+      - cell "2.00"
+      - cell "AED 20.00"
+'''
+    line = _parse_purchase_return_snapshot(snapshot)[0]
+    assert line["quantity"] == Decimal("2.00")
+    assert line["unit"] == "Carton"

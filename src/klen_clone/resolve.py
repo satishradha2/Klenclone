@@ -7,6 +7,7 @@ from decimal import Decimal
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
+from .finance import settlement_residual_with_return_due
 from .models import (
     SourceSnapshot, StgContact, StgDocumentLine, StgDocumentReconciliation,
     StgEntityLink, StgItemTrace, StgPayment, StgProduct, StgPurchase,
@@ -138,8 +139,12 @@ def resolve_snapshot(session: Session, snapshot_name: str) -> dict:
         if target: return_by_header[(returned.direction, target)].append(returned)
 
     product_by_name = defaultdict(list)
+    product_by_name_without_inactive = defaultdict(list)
     for product in products:
-        product_by_name[normalize_name(product.name)].append(product.id)
+        normalized = normalize_name(product.name)
+        product_by_name[normalized].append(product.id)
+        without_inactive = re.sub(r"\s+inactive$", "", normalized).strip()
+        product_by_name_without_inactive[without_inactive].append(product.id)
 
     sku_sources = (
         ("stock_balance", session.scalars(select(StgStockBalance).where(StgStockBalance.snapshot_id == snapshot.id)).all()),
@@ -153,6 +158,9 @@ def resolve_snapshot(session: Session, snapshot_name: str) -> dict:
             if not candidates and kind == "document_line" and row.product_name:
                 candidates = product_by_name.get(normalize_name(row.product_name), [])
                 method = "product_name_exact"
+            if not candidates and kind == "document_line" and row.product_name:
+                candidates = product_by_name_without_inactive.get(normalize_name(row.product_name), [])
+                method = "product_name_exact_ignoring_inactive_suffix"
             target = _add_link(session, snapshot.id, kind, row.id, "product", candidates, method)
             link_counts[f"{kind}_to_product"]["resolved" if target else "ambiguous" if candidates else "unmatched"] += 1
 
@@ -172,15 +180,18 @@ def resolve_snapshot(session: Session, snapshot_name: str) -> dict:
             return_total = sum((row.total_amount or ZERO for row in linked_returns), ZERO)
             header_total = header.total_amount or ZERO
             due = header.amount_due or ZERO
+            return_due = header.return_due or ZERO if kind == "sale" else ZERO
             header_line_variance = header_total - line_total
-            settlement_variance = header_total - payment_total - due
+            settlement_variance = settlement_residual_with_return_due(
+                header_total, payment_total, due, return_due
+            )
             if not lines:
                 status = "missing_lines"
             elif abs(header_line_variance) <= Decimal("0.01") and abs(settlement_variance) <= Decimal("0.01"):
                 status = "balanced"
             else:
                 status = "requires_adjustment_breakdown"
-            session.add(StgDocumentReconciliation(snapshot_id=snapshot.id,document_kind=kind,header_id=header.id,document_no=header.document_no,header_total=header_total,line_total=line_total,payment_total=payment_total,return_total=return_total,header_line_variance=header_line_variance,settlement_variance=settlement_variance,line_count=len(lines),payment_count=len(linked_payments),return_count=len(linked_returns),status=status,details={"due": str(due)}))
+            session.add(StgDocumentReconciliation(snapshot_id=snapshot.id,document_kind=kind,header_id=header.id,document_no=header.document_no,header_total=header_total,line_total=line_total,payment_total=payment_total,return_total=return_total,header_line_variance=header_line_variance,settlement_variance=settlement_variance,line_count=len(lines),payment_count=len(linked_payments),return_count=len(linked_returns),status=status,details={"due": str(due), "return_due": str(return_due)}))
 
     session.commit()
     status_counts = dict(session.execute(select(StgEntityLink.status, func.count()).where(StgEntityLink.snapshot_id == snapshot.id).group_by(StgEntityLink.status)).all())

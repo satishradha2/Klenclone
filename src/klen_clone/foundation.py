@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from .models import (
@@ -20,6 +20,19 @@ from .models import (
 REFERENCE_PATTERN = re.compile(r"^(.*?)(\d+)$")
 OPERATIONAL_MODULES = ("sales", "purchasing", "inventory", "accounting", "crm", "delivery", "reporting", "administration")
 ARCHIVAL_ONLY_MODULES = ("hrm", "payroll")
+
+
+def source_entity_counts_statement(snapshot_id: int):
+    return (
+        select(
+            RawFileManifest.entity_type,
+            func.count(RawRecord.id),
+            func.sum(case((RawRecord.is_presentation_row.is_(False), 1), else_=0)),
+        )
+        .join(RawRecord)
+        .where(RawFileManifest.snapshot_id == snapshot_id)
+        .group_by(RawFileManifest.entity_type)
+    )
 
 
 def parse_reference(value: str | None) -> tuple[str, int, int] | None:
@@ -176,9 +189,7 @@ def build_erp_foundation(session: Session, snapshot_name: str) -> dict:
         {"snapshot_id": snapshot.id, "batch_code": f"{snapshot.name}:foundation"},
         {"manifest_digest": digest, "status": "staged_nonposting", "atomic_source": snapshot.is_atomic, "posting_enabled": False})
     created["migration_batches"] += was_created
-    counts = session.execute(select(RawFileManifest.entity_type, func.count(RawRecord.id),
-        func.sum(func.cast(~RawRecord.is_presentation_row, type_=RawRecord.is_presentation_row.type)))
-        .join(RawRecord).where(RawFileManifest.snapshot_id == snapshot.id).group_by(RawFileManifest.entity_type)).all()
+    counts = session.execute(source_entity_counts_statement(snapshot.id)).all()
     for entity, raw_count, business_count in counts:
         _, was_created = _add_once(session, ErpMigrationBatchEntity, {"batch_id": batch.id, "source_entity": entity},
             {"raw_count": raw_count, "business_count": business_count or 0, "status": "registered"})

@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
-from klen_clone.foundation import ARCHIVAL_ONLY_MODULES, OPERATIONAL_MODULES, _business_control, canonical_content_hash, parse_reference
+from sqlalchemy.dialects import postgresql
+
+from klen_clone.foundation import ARCHIVAL_ONLY_MODULES, OPERATIONAL_MODULES, _business_control, canonical_content_hash, parse_reference, source_entity_counts_statement
 
 
 def test_parse_reference_preserves_prefix_and_width():
@@ -26,3 +28,9 @@ def test_business_control_extracts_named_value_without_guessing():
     ]})
     assert _business_control([record], "tax_number_1") == "12345"
     assert _business_control([record], "tax_number_2") is None
+
+
+def test_source_entity_business_count_is_postgresql_compatible():
+    compiled = str(source_entity_counts_statement(1).compile(dialect=postgresql.dialect()))
+    assert "CASE WHEN" in compiled
+    assert "sum(CAST" not in compiled
