@@ -30,7 +30,7 @@ SHA-256:
 - ZIP members were read back and matched to their source hashes before the temporary archive was promoted to its final local name.
 - Existing output paths cannot be overwritten.
 - A failure removes only the newly created temporary archive.
-- HRM data is packaged as archive-only evidence and remains excluded from the operational ERP.
+- HRM data is included in the operational ERP migration package; payroll data remains excluded.
 - Uploaded-file completeness remains false because the browser does not expose a complete attachment archive.
 
 ## Qualification

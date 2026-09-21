@@ -51,7 +51,7 @@ These differences are displayed as source-quality exceptions and are not correct
 - Permanent posting remains disabled.
 - No payment, allocation, journal or subledger rows were created during deployment.
 - BizModo was not accessed or modified by the report build.
-- HRM and payroll remain excluded.
+- HRM is included in the target ERP; payroll remains excluded.
 
 ## Next enterprise increment
 

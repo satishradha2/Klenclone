@@ -8,7 +8,7 @@ Access method: authenticated browser session using visible list registers only
 
 - The source was accessed read-only. No create, update, delete, import, posting, approval, or configuration action was performed.
 - The source was still active during capture. This checkpoint is therefore **non-atomic** and is **not eligible for final cutover merge**.
-- HRM and payroll remain excluded from the target ERP. Previously preserved HRM evidence remains archive-only.
+- HRM is included in the target ERP and its captured evidence feeds the controlled test workspace. Payroll remains excluded.
 - Username/password-only access cannot guarantee hidden database fields, uploaded files, attachments, or a transaction-consistent point-in-time copy.
 
 ## Verified capture

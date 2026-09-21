@@ -19,7 +19,7 @@ Every module response contains six aggregate KPIs, three reconciled breakdowns a
 - `posting_enabled = false`
 - `confidential_rows_exposed = false`
 
-Unknown modules, including `hrm`, return HTTP `404`. HRM and payroll evidence remains preserved in the migration dataset but has no target operational workspace.
+At this historical checkpoint, unknown modules including `hrm` returned HTTP `404`. HRM has since been implemented as a separately authorized operational workspace; payroll remains excluded.
 
 ## Verified cloned-data examples
 

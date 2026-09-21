@@ -36,6 +36,9 @@ REQUIRED_BASELINE_FILES = {
     "tax_output_2026.csv": "output_vat",
     "trial_balance_2026.xlsx": "trial_balance",
     "users.csv": "users",
+    "hrm_attendance_2026.csv": "hrm_attendance",
+    "hrm_shifts.csv": "hrm_shifts",
+    "hrm_sales_targets.csv": "hrm_sales_targets",
     "configuration_inventories.json": "configuration",
     "business_settings_redacted.json": "configuration",
     "sales_return_details.json": "return_details",
@@ -57,7 +60,7 @@ CUTOVER_EXPORT_FAMILIES = [
     {"family": "inventory", "datasets": ["all-location stock", "stock transfers", "stock-transfer details", "item traceability"]},
     {"family": "finance", "datasets": ["payment accounts", "cash flow", "input VAT", "output VAT", "trial balance", "profit by product"]},
     {"family": "configuration_security", "datasets": ["business settings", "users", "roles and permissions", "CRM configuration"]},
-    {"family": "hrm_archive_only", "datasets": ["attendance", "shifts", "sales targets"], "target_operational": False},
+    {"family": "hrm", "datasets": ["employees", "attendance", "shifts", "leave controls", "sales targets"], "target_operational": True, "payroll_included": False},
     {"family": "uploaded_files", "datasets": ["purchase attachments", "sales attachments", "contact documents and notes"], "browser_exportable": False},
 ]
 
@@ -179,7 +182,7 @@ def build_cutover_readiness(
         "limitations": [
             "Username/password access cannot create an atomic database snapshot.",
             "Browser exports cannot prove completeness for uploaded files that have no exposed download link.",
-            "HRM is excluded from the operational ERP but remains listed for archive-only preservation.",
+            "HRM is included in the target ERP and requires a fresh full employee, attendance, shift and leave-control capture; payroll remains excluded.",
         ],
     }
 

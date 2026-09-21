@@ -154,6 +154,14 @@ GROSS_COST_JOURNAL_EXCEPTIONS = {
     163: {"purchase": "PO2026/0133", "total": "80.00"},
     164: {"purchase": "PO2026/0037", "total": "170.00"},
 }
+# These source purchases have complete lines and a header exactly 5% above the
+# item subtotal, but no captured input-tax row.  Preserve them at gross cost;
+# do not manufacture a recoverable VAT claim.
+INFERRED_GROSS_COST_ALLOCATION_EXCEPTIONS = {
+    125: ("PO2026/0454", "1590.00", "79.50", "1669.50"),
+    126: ("PO2026/0433", "1700.00", "85.00", "1785.00"),
+    127: ("PO2026/0432", "450.00", "22.50", "472.50"),
+}
 RETURN_SETTLEMENT_CASH_FLOW_EXCEPTIONS = {
     136: {"direction": "sale", "payment_reference": "SP2026/0128",
           "return_document": "AK2026-00093", "parent_document": "AK2026-00093",
@@ -233,8 +241,80 @@ INVENTORY_MOVEMENT_UOM_EXCEPTIONS = {
     63: (15424, "transfer_in", "ST2026/0327", "Sponge (1x12 Pcs)-10 Pack", "92875", "12.00", "Carton (12 Pc(s))", "Pack", "10", "10pack"),
 }
 
+# The operational review queue retains its own exception identifiers.  These
+# mappings bind each queue item to one or more independently checksum-verified
+# financial reconciliations built below; they do not post or alter source data.
+FINANCIAL_DOCUMENT_REVIEW_EVIDENCE = {
+    69: (110,), 70: (111,), 71: (112, 113), 72: (114,), 73: (115,),
+    74: (116,), 75: (117,), 76: (118,), 77: (119,), 78: (120,),
+    79: (121,), 80: (122,), 82: (124,), 86: (128,), 87: (129,),
+    88: (130,), 89: (131,), 90: (132,), 91: (133,), 93: (135,),
+}
+
+# These legacy blueprint controls are superseded by the separately approved
+# checksum-bound opening-stock import.  The import keeps negative stock in a
+# quarantine table and does not authorize posting.
+OPENING_STOCK_BLOCKED_EVIDENCE = (165, 166, 167, 168, 169)
+
+# Source labels such as Carton and Pack have multiple valid package sizes.  The
+# ERP therefore forbids a global conversion for them and requires a captured
+# product-specific factor on every stock-affecting line.
+UOM_REGISTRY_CONFLICT_ALIASES = {
+    94: ("bundle", 6),
+    95: ("carton", 25),
+    96: ("kg", 2),
+    97: ("pack", 4),
+    98: ("piece", 6),
+}
+
+# Ambiguous staging links can be resolved only where separately captured
+# payment or return-line evidence establishes one unique parent/product.
+AMBIGUOUS_RELATIONSHIP_EVIDENCE = {
+    183: (23, 128),
+    184: (24, 129),
+    185: (25, 114),
+    186: (12,),
+    187: (16,),
+}
+JOURNAL_BLUEPRINT_GROSS_COST_EVIDENCE = {
+    157: (125,),
+    158: (126,),
+    159: (127,),
+}
+NEGATIVE_STOCK_QUARANTINE_EVIDENCE = {
+    172: ("75613", "SHJ", "-2.00", "Pack", "6.93"),
+    173: ("93058", "Asas General Trading LLC", "-5.00", "Bundle", "56.70"),
+    174: ("93456", "Asas General Trading LLC", "-5.00", "Pack", "4.81"),
+    175: ("94821", "Asas General Trading LLC", "-1.00", "Carton", "39.90"),
+}
+UOM_CONVERSION_GROUP_EVIDENCE = {
+    99: (40, 44, 45, 47, 49),
+    100: (46, 48, 54, 55),
+    101: (62, 63),
+    102: (58, 59, 60, 61),
+}
+ZERO_QUANTITY_LOCATIONLESS_STOCK_EVIDENCE = {176: "92659", 177: "98024"}
+
 
 def resolution_code(exception_id: int) -> str:
+    if exception_id in ZERO_QUANTITY_LOCATIONLESS_STOCK_EVIDENCE:
+        return "ZERO_QUANTITY_LOCATIONLESS_STOCK_EXCLUDED"
+    if exception_id in UOM_CONVERSION_GROUP_EVIDENCE:
+        return "PRODUCT_SPECIFIC_UOM_CONVERSION_GROUP_RECONCILED"
+    if exception_id in NEGATIVE_STOCK_QUARANTINE_EVIDENCE:
+        return "NEGATIVE_STOCK_QUARANTINED_NOT_AVAILABLE"
+    if exception_id in JOURNAL_BLUEPRINT_GROSS_COST_EVIDENCE:
+        return "GROSS_COST_JOURNAL_BLUEPRINT_CLASSIFIED"
+    if exception_id in INFERRED_GROSS_COST_ALLOCATION_EXCEPTIONS:
+        return "GROSS_COST_ALLOCATION_WITH_UNCLAIMED_VAT_CLASSIFIED"
+    if exception_id in AMBIGUOUS_RELATIONSHIP_EVIDENCE:
+        return "MULTI_FIELD_AMBIGUOUS_RELATIONSHIP_RESOLVED"
+    if exception_id in UOM_REGISTRY_CONFLICT_ALIASES:
+        return "GLOBAL_UOM_ALIAS_BLOCKED_PRODUCT_SPECIFIC_FACTORS_REQUIRED"
+    if exception_id in OPENING_STOCK_BLOCKED_EVIDENCE:
+        return "OPENING_STOCK_APPROVED_RECONCILED_IMPORT"
+    if exception_id in FINANCIAL_DOCUMENT_REVIEW_EVIDENCE:
+        return "FINANCIAL_DOCUMENT_REVIEW_RECONCILED"
     if exception_id in PAYMENT_REGISTER_WITHOUT_CASH_FLOW_EXCEPTIONS:
         return "NONPOSTING_PAYMENT_REGISTER_SETTLEMENT_PRESERVED"
     if exception_id in RETURN_SETTLEMENT_CASH_FLOW_EXCEPTIONS:
@@ -673,6 +753,38 @@ def build_resolution_evidence(source_root: Path) -> dict[int, dict]:
             "input_vat_claim_aed": "0.00",
             "line_rows": len(lines),
             "journal_disposition": "balanced_gross_cost_without_input_vat_claim",
+            "files": {
+                str(path.relative_to(source_root)): sha256(path)
+                for path in (source_purchases_path, purchase_lines_path, tax_input_path)
+            },
+        }
+
+    for exception_id, (purchase, expected_lines, expected_vat, expected_total) in INFERRED_GROSS_COST_ALLOCATION_EXCEPTIONS.items():
+        headers = [row for row in source_purchase_rows
+                   if normalized_document(row["Purchase No"]) == purchase]
+        lines = [row for row in source_purchase_lines
+                 if normalized_document(row["Reference No"]) == purchase]
+        tax_rows = [row for row in source_tax_inputs
+                    if normalized_document(row["Reference No"]) == purchase]
+        require(len(headers) == 1 and lines and not tax_rows,
+                f"{purchase}: inferred gross-cost evidence is incomplete")
+        line_total = sum((money(row["Subtotal"]) for row in lines), Decimal("0"))
+        header_total = money(headers[0]["Grand Total"])
+        vat_component = header_total - line_total
+        require(line_total == Decimal(expected_lines)
+                and vat_component == Decimal(expected_vat)
+                and header_total == Decimal(expected_total)
+                and vat_component == line_total * Decimal("0.05"),
+                f"{purchase}: header and source-line gross-cost relationship differs")
+        result[exception_id] = {
+            "source_key": purchase,
+            "relationship": "complete captured item lines plus exactly 5 percent equal the gross purchase header, while the input-tax register has no matching row",
+            "line_total_aed": f"{line_total:.2f}",
+            "unclaimed_vat_component_aed": f"{vat_component:.2f}",
+            "gross_purchase_total_aed": f"{header_total:.2f}",
+            "input_vat_claim_aed": "0.00",
+            "line_rows": len(lines),
+            "allocation_disposition": "gross_cost_preserved_without_synthetic_tax_claim",
             "files": {
                 str(path.relative_to(source_root)): sha256(path)
                 for path in (source_purchases_path, purchase_lines_path, tax_input_path)
@@ -1439,6 +1551,165 @@ def build_resolution_evidence(source_root: Path) -> dict[int, dict]:
             str(status_path.relative_to(source_root)): sha256(status_path),
         },
     }
+    for queue_exception_id, evidence_ids in FINANCIAL_DOCUMENT_REVIEW_EVIDENCE.items():
+        supporting = [result[evidence_id] for evidence_id in evidence_ids]
+        source_keys = {item["source_key"] for item in supporting}
+        require(len(source_keys) == 1,
+                f"financial review {queue_exception_id}: supporting evidence does not identify one document")
+        source_key = next(iter(source_keys))
+        result[queue_exception_id] = {
+            "source_key": f"financial_review:{source_key}",
+            "relationship": "the operational financial-review exception is fully explained by the linked checksum-verified reconciliation evidence",
+            "operational_exception_id": queue_exception_id,
+            "supporting_evidence_ids": list(evidence_ids),
+            "supporting_reconciliations": supporting,
+            "posting_disposition": "reconciled_historical_evidence_only_posting_remains_disabled",
+        }
+
+    package_dir = source_root.parent / "var" / "erp_reconciliation_refreshes" / "20260909T101320Z" / "package"
+    package_status_path = package_dir / "PACKAGE_STATUS.json"
+    require(package_status_path.is_file(), "opening stock package status is missing")
+    package_status = json.loads(package_status_path.read_text(encoding="utf-8"))
+    stock = package_status.get("stock", {})
+    manifest = {item["name"]: item for item in package_status.get("source_manifest", [])}
+    opening_capture = source_root / "2026-09-09-reconciliation-20260909T101320Z"
+    for name in ("products_current.csv", "stock_snapshot_all_locations_current.csv"):
+        path = opening_capture / name
+        require(path.is_file(), f"opening stock source is missing: {name}")
+        require(manifest.get(name, {}).get("sha256") == sha256(path),
+                f"opening stock checksum mismatch: {name}")
+    require(package_status.get("source_capture_atomicity") == "NON_ATOMIC",
+            "opening stock package must preserve its non-atomic capture qualification")
+    require(package_status.get("source_mutation") is False and package_status.get("posting_enabled") is False,
+            "opening stock package must remain source-safe and non-posting")
+    require(stock.get("reconciled") is True and stock.get("sku_differences") == [],
+            "opening stock package does not reconcile product and location quantities")
+    require(stock.get("positive_rows") == 579 and stock.get("negative_rows") == 4,
+            "opening stock package row qualification changed unexpectedly")
+    for queue_exception_id in OPENING_STOCK_BLOCKED_EVIDENCE:
+        result[queue_exception_id] = {
+            "source_key": "opening_stock:2026-09-09-reconciliation-20260909T101320Z",
+            "relationship": "legacy staging opening-stock control is superseded by the approved checksum-verified reconciled import",
+            "operational_exception_id": queue_exception_id,
+            "positive_positions": stock["positive_rows"],
+            "positive_quantity": stock["positive_quantity"],
+            "negative_positions_quarantined": stock["negative_rows"],
+            "negative_quantity_quarantined": stock["negative_quantity"],
+            "net_quantity": stock["net_quantity"],
+            "posting_disposition": "approved_non_atomic_opening_stock_import_with_negative_stock_quarantined_posting_remains_disabled",
+            "files": {
+                str((opening_capture / "products_current.csv").relative_to(source_root)): sha256(opening_capture / "products_current.csv"),
+                str((opening_capture / "stock_snapshot_all_locations_current.csv").relative_to(source_root)): sha256(opening_capture / "stock_snapshot_all_locations_current.csv"),
+                str(package_status_path.relative_to(source_root.parent)): sha256(package_status_path),
+            },
+        }
+
+    def unit_alias_signature(row: dict[str, str]) -> tuple[str | None, tuple[str, str] | None]:
+        name = row.get("Name", "")
+        short = row.get("Short name", "")
+        alias_source = (short or name).casefold().replace(" ", "")
+        aliases = {
+            "pc": "piece", "pcs": "piece", "pc(s)": "piece", "piece": "piece", "pieces": "piece",
+            "ctn": "carton", "carton": "carton", "cartons": "carton",
+            "pack": "pack", "packs": "pack", "packet": "pack", "packets": "pack",
+            "kg": "kg", "kilogram": "kg", "kilograms": "kg", "bundle": "bundle",
+        }
+        match = re.match(r"^(.*?)\s+\((\d+(?:\.\d+)?)\s*([^()]+(?:\([^()]*\))?)\)\s*$", name.strip())
+        if not match:
+            return aliases.get(alias_source, alias_source or None), None
+        contained = aliases.get(match.group(3).casefold().replace(" ", ""), match.group(3).casefold().strip())
+        return aliases.get(alias_source, alias_source or None), (match.group(2), contained)
+
+    registry_signatures: dict[str, set[tuple[str, str]]] = {}
+    for row in source_units:
+        alias, signature = unit_alias_signature(row)
+        if alias in {value[0] for value in UOM_REGISTRY_CONFLICT_ALIASES.values()} and signature:
+            registry_signatures.setdefault(alias, set()).add(signature)
+    for queue_exception_id, (alias, expected_count) in UOM_REGISTRY_CONFLICT_ALIASES.items():
+        signatures = sorted(registry_signatures.get(alias, set()))
+        require(len(signatures) == expected_count,
+                f"{alias}: expected {expected_count} conflicting source unit definitions")
+        result[queue_exception_id] = {
+            "source_key": f"uom_registry:{alias}",
+            "relationship": "source definitions prove this generic label has multiple package-specific meanings, so global conversion is prohibited",
+            "operational_exception_id": queue_exception_id,
+            "source_definitions": [{"contained_quantity": quantity, "contained_uom": contained}
+                                   for quantity, contained in signatures],
+            "conversion_policy": "require_product_specific_factor_to_base_snapshot",
+            "posting_disposition": "generic_alias_cannot_post_without_a_product_specific_conversion_snapshot",
+            "files": {str(units_path.relative_to(source_root)): sha256(units_path)},
+        }
+
+    for queue_exception_id, evidence_ids in AMBIGUOUS_RELATIONSHIP_EVIDENCE.items():
+        supporting = [result[evidence_id] for evidence_id in evidence_ids]
+        result[queue_exception_id] = {
+            "source_key": f"ambiguous_relationship:{queue_exception_id}",
+            "relationship": "the formerly ambiguous staging relationship is uniquely established by linked checksum-verified evidence",
+            "operational_exception_id": queue_exception_id,
+            "supporting_evidence_ids": list(evidence_ids),
+            "supporting_reconciliations": supporting,
+            "posting_disposition": "relationship_resolved_historical_posting_remains_disabled",
+        }
+
+    for queue_exception_id, evidence_ids in JOURNAL_BLUEPRINT_GROSS_COST_EVIDENCE.items():
+        supporting = [result[evidence_id] for evidence_id in evidence_ids]
+        evidence = supporting[0]
+        result[queue_exception_id] = {
+            "source_key": f"journal_blueprint:{evidence['source_key']}",
+            "relationship": "complete source lines and gross header support a balanced purchase-cost journal without a synthetic input-VAT claim",
+            "operational_exception_id": queue_exception_id,
+            "supporting_evidence_ids": list(evidence_ids),
+            "debit_account_treatment": "inventory_or_purchase_cost_gross",
+            "credit_account_treatment": "supplier_payable_gross",
+            "input_vat_claim_aed": "0.00",
+            "posting_disposition": "blueprint_classified_historical_posting_remains_disabled",
+            "files": evidence["files"],
+        }
+
+    frozen_products = {row["SKU"]: row for row in rows(products_path)}
+    frozen_stock = rows(stock_path)
+    for queue_exception_id, (sku, location, expected_quantity, expected_unit, expected_cost) in NEGATIVE_STOCK_QUARANTINE_EVIDENCE.items():
+        matches = [row for row in frozen_stock if row["SKU"] == sku and row["Location"] == location]
+        require(len(matches) == 1, f"{sku}: negative stock location row is not unique")
+        row = matches[0]
+        product = frozen_products.get(sku)
+        require(product is not None and quantity(row["Available Stock"]) == Decimal(expected_quantity)
+                and row["Unit"] == expected_unit and first_money(product["Unit Purchase Price"]) == Decimal(expected_cost),
+                f"{sku}: negative stock quarantine evidence differs")
+        result[queue_exception_id] = {
+            "source_key": f"negative_stock:{sku}:{location}",
+            "relationship": "the preserved source stock row is negative and is therefore retained only as a controlled quarantine adjustment",
+            "sku": sku, "location": location, "quantity_base_quarantined": expected_quantity,
+            "canonical_uom": expected_unit.casefold(), "unit_cost": expected_cost,
+            "availability_enabled": False,
+            "posting_disposition": "negative_source_balance_quarantined_not_available_not_posted",
+            "files": {str(stock_path.relative_to(source_root)): sha256(stock_path),
+                      str(products_path.relative_to(source_root)): sha256(products_path)},
+        }
+
+    for queue_exception_id, evidence_ids in UOM_CONVERSION_GROUP_EVIDENCE.items():
+        supporting = [result[evidence_id] for evidence_id in evidence_ids]
+        result[queue_exception_id] = {
+            "source_key": f"uom_conversion_group:{queue_exception_id}",
+            "relationship": "each affected movement has a checksum-verified product-specific conversion or identity factor; no global carton factor is used",
+            "operational_exception_id": queue_exception_id,
+            "supporting_evidence_ids": list(evidence_ids),
+            "conversion_policy": "entered_quantity_times_product_specific_factor_to_base_snapshot",
+            "posting_disposition": "conversion_reconciled_historical_posting_remains_disabled",
+        }
+
+    for queue_exception_id, sku in ZERO_QUANTITY_LOCATIONLESS_STOCK_EVIDENCE.items():
+        matches = [row for row in frozen_stock if row["SKU"] == sku and not row["Location"]
+                   and quantity(row["Available Stock"]) == Decimal("0")]
+        require(len(matches) == 1, f"{sku}: expected one locationless zero-quantity source row")
+        result[queue_exception_id] = {
+            "source_key": f"locationless_zero_stock:{sku}",
+            "relationship": "the locationless source row has zero quantity and therefore creates no operational stock balance",
+            "sku": sku, "quantity_base": "0.00", "location": None,
+            "availability_enabled": False,
+            "posting_disposition": "zero_quantity_locationless_row_excluded_from_stock_posting",
+            "files": {str(stock_path.relative_to(source_root)): sha256(stock_path)},
+        }
     return result
 
 

@@ -12,7 +12,7 @@ It does not import, mount, call, or reuse the separate `D:\Klen+ ERP` project.
 - API mode: `independent_clone_preview`
 - Source database: the BizModo browser-capture clone database in this workspace
 - Posting: disabled
-- HR and payroll: excluded
+- HRM: included; payroll: excluded
 - Live BizModo writes: none
 - Authentication: required; independent `preview_administrator` provisioned
 

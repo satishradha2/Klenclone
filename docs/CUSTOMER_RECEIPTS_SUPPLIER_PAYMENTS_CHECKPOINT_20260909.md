@@ -43,7 +43,7 @@ The API also produces invoice/opening-balance subledger allocation plans, determ
 - Permanent posting is database-constrained off.
 - No payment, allocation, claim, journal or subledger rows are created during deployment.
 - Operational schema revision is `0013`.
-- HRM and payroll remain excluded.
+- HRM is included in the target ERP; payroll remains excluded.
 
 ## Verification
 

@@ -112,6 +112,30 @@ class OperationalPurchaseDebitNote(OperationalBase):
     purchase_return: Mapped[OperationalPurchaseReturn] = relationship(back_populates="debit_note")
 
 
+class OperationalPurchaseReturnPostingRehearsal(OperationalBase):
+    __tablename__ = "operational_purchase_return_posting_rehearsals"
+    __table_args__ = (
+        UniqueConstraint("purchase_return_id", "return_revision", name="uq_purchase_return_rehearsal_revision"),
+        CheckConstraint("status = 'balanced_non_posting'", name="ck_purchase_return_rehearsal_status"),
+        CheckConstraint("posting_enabled = false", name="ck_purchase_return_rehearsal_no_posting"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rehearsal_key: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
+    purchase_return_id: Mapped[int] = mapped_column(ForeignKey("operational_purchase_returns.id"), nullable=False, index=True)
+    return_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    original_supplier_invoice_id: Mapped[int] = mapped_column(ForeignKey("operational_supplier_invoices.id"), nullable=False, index=True)
+    original_invoice_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    period_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    posting_fingerprint: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    journal_json: Mapped[str] = mapped_column(Text, nullable=False)
+    movements_json: Mapped[str] = mapped_column(Text, nullable=False)
+    reversal_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="balanced_non_posting")
+    posting_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    generated_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class OperationalPurchaseReturnWorkflowEvent(OperationalBase):
     __tablename__ = "operational_purchase_return_workflow_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -198,21 +222,152 @@ def transition_purchase_return(session: Session, document: OperationalPurchaseRe
     prior=document.status; document.status=target; document.revision+=1; document.state_changed_at=utc_now(); document.state_changed_by=actor; session.add(OperationalPurchaseReturnWorkflowEvent(event_key=str(uuid.uuid4()),purchase_return_id=document.id,from_status=prior,to_status=target,actor=actor,note=note)); session.add(OperationalAuditEvent(event_key=str(uuid.uuid4()),event_type=f"purchase_return.{action}",actor=actor,resource_key=document.return_key,detail=f"{prior} to {target}; revision {document.revision}; posting disabled")); session.commit(); return document
 
 
+def _posted_supplier_invoice(session: Session, document: OperationalPurchaseReturn):
+    from .goods_receipts import OperationalGoodsReceipt
+    from .procurement import OperationalPurchaseOrder
+    from .procurement_matching import OperationalSupplierInvoice, OperationalSupplierInvoiceLine
+
+    if document.source_reference_type == "purchase_invoice":
+        candidates = list(session.scalars(select(OperationalSupplierInvoice).where(
+            OperationalSupplierInvoice.supplier_code == document.supplier_code,
+            OperationalSupplierInvoice.status == "posted",
+            (OperationalSupplierInvoice.invoice_key == document.source_reference_key)
+            | (OperationalSupplierInvoice.supplier_invoice_no == document.source_reference_key))))
+    else:
+        receipt = session.scalar(select(OperationalGoodsReceipt).where(
+            OperationalGoodsReceipt.supplier_code == document.supplier_code,
+            (OperationalGoodsReceipt.receipt_key == document.source_reference_key)
+            | (OperationalGoodsReceipt.receipt_no == document.source_reference_key)))
+        if receipt is None or receipt.status not in {"accepted", "posted"} or not receipt.purchase_reference:
+            raise ValueError("The purchase return must link to an accepted goods receipt with a purchase-order reference")
+        purchase_order = session.scalar(select(OperationalPurchaseOrder).where(
+            OperationalPurchaseOrder.purchase_order_no == receipt.purchase_reference,
+            OperationalPurchaseOrder.supplier_code == document.supplier_code))
+        candidates = ([] if purchase_order is None else list(session.scalars(select(OperationalSupplierInvoice).where(
+            OperationalSupplierInvoice.purchase_order_id == purchase_order.id,
+            OperationalSupplierInvoice.supplier_code == document.supplier_code,
+            OperationalSupplierInvoice.status == "posted"))))
+    if len(candidates) != 1:
+        raise ValueError("Exactly one posted supplier invoice must be linked before purchase-return posting")
+    invoice = candidates[0]
+    invoice_lines = {row.sku: row for row in session.scalars(select(OperationalSupplierInvoiceLine).where(
+        OperationalSupplierInvoiceLine.invoice_id == invoice.id))}
+    if any(line.sku not in invoice_lines or line.supplier_return_quantity > invoice_lines[line.sku].quantity
+           for line in document.lines):
+        raise ValueError("Purchase-return supplier quantities must be covered by the posted supplier invoice")
+    return invoice
+
+
+def _purchase_return_rehearsal_payload(rehearsal: OperationalPurchaseReturnPostingRehearsal,
+                                       document: OperationalPurchaseReturn, invoice,
+                                       *, idempotent_replay: bool = False) -> dict:
+    journal = json.loads(rehearsal.journal_json)
+    movements = json.loads(rehearsal.movements_json)
+    for line in journal:
+        line["debit"], line["credit"] = Decimal(str(line["debit"])), Decimal(str(line["credit"]))
+    for movement in movements:
+        for field in ("quantity_base", "unit_cost", "value_delta"):
+            movement[field] = Decimal(str(movement[field]))
+    supplier_cost = sum(((line.supplier_return_quantity * line.factor_to_base_snapshot * line.unit_cost_snapshot)
+                         .quantize(MONEY, rounding=ROUND_HALF_UP) for line in document.lines), Decimal("0"))
+    writeoff_cost = sum(((line.internal_writeoff_quantity * line.factor_to_base_snapshot * line.unit_cost_snapshot)
+                         .quantize(MONEY, rounding=ROUND_HALF_UP) for line in document.lines), Decimal("0"))
+    debit = sum((Decimal(str(line["debit"])) for line in journal), Decimal("0"))
+    credit = sum((Decimal(str(line["credit"])) for line in journal), Decimal("0"))
+    return {"rehearsal_key": rehearsal.rehearsal_key, "return_key": document.return_key,
+        "return_no": document.return_no, "debit_note_no": document.debit_note.debit_note_no,
+        "invoice_key": invoice.invoice_key, "supplier_invoice_no": invoice.supplier_invoice_no,
+        "period_key": rehearsal.period_key, "status": rehearsal.status, "journal": journal,
+        "movements": movements, "reversal_plan": json.loads(rehearsal.reversal_json),
+        "supplier_return_cost": supplier_cost, "writeoff_cost": writeoff_cost,
+        "purchase_return_variance": document.subtotal - supplier_cost,
+        "debit": debit, "credit": credit, "posting_fingerprint": rehearsal.posting_fingerprint,
+        "idempotency_key": f"purchase-return:{document.return_key}:{document.revision}:{rehearsal.posting_fingerprint[:20]}",
+        "idempotent_replay": idempotent_replay, "posting_enabled": False}
+
+
 def rehearse_purchase_return_posting(session: Session, document: OperationalPurchaseReturn, *, actor: str) -> dict:
-    if document.status!="approved" or not document.debit_note: raise ValueError("Only an approved purchase return with a debit note can be rehearsed")
-    period=session.scalar(select(OperationalFiscalPeriod).where(OperationalFiscalPeriod.starts_on<=document.return_date,OperationalFiscalPeriod.ends_on>=document.return_date,OperationalFiscalPeriod.status=="open",OperationalFiscalPeriod.rehearsal_enabled.is_(True)))
-    if not period: raise ValueError("Return date is not in an open rehearsal-enabled fiscal period")
-    reservations={r.purchase_return_line_id:r.quantity_base for r in session.scalars(select(OperationalPurchaseReturnReservation).where(OperationalPurchaseReturnReservation.purchase_return_id==document.id,OperationalPurchaseReturnReservation.status=="active"))}
-    if any(reservations.get(line.id)!=line.quantity_base for line in document.lines): raise ValueError("Active reservations do not fully cover the purchase return")
-    supplier_cost=sum(((x.supplier_return_quantity*x.factor_to_base_snapshot*x.unit_cost_snapshot).quantize(MONEY,rounding=ROUND_HALF_UP) for x in document.lines),Decimal("0")); writeoff_cost=sum(((x.internal_writeoff_quantity*x.factor_to_base_snapshot*x.unit_cost_snapshot).quantize(MONEY,rounding=ROUND_HALF_UP) for x in document.lines),Decimal("0")); variance=document.subtotal-supplier_cost
-    journal=[{"account":"Accounts Payable","debit":document.total_amount,"credit":Decimal("0")},{"account":"Input VAT","debit":Decimal("0"),"credit":document.tax_amount},{"account":"Inventory","debit":Decimal("0"),"credit":supplier_cost+writeoff_cost},{"account":"Inventory Write-off","debit":writeoff_cost,"credit":Decimal("0")}]
-    if variance>0: journal.append({"account":"Purchase Return Variance","debit":Decimal("0"),"credit":variance})
-    elif variance<0: journal.append({"account":"Purchase Return Variance","debit":-variance,"credit":Decimal("0")})
-    debit=sum((x["debit"] for x in journal),Decimal("0")); credit=sum((x["credit"] for x in journal),Decimal("0"))
-    if debit!=credit: raise RuntimeError("Purchase return posting rehearsal is not balanced")
-    movements=[{"line_no":x.line_no,"location":document.location_code,"sku":x.sku,"quantity_base":-x.quantity_base,"canonical_uom":x.canonical_uom,"unit_cost":x.unit_cost_snapshot,"value_delta":-(x.quantity_base*x.unit_cost_snapshot).quantize(MONEY,rounding=ROUND_HALF_UP)} for x in document.lines]
-    source=json.dumps({"return_key":document.return_key,"revision":document.revision,"journal":journal,"movements":movements},default=str,sort_keys=True,separators=(",",":")); fingerprint=hashlib.sha256(source.encode()).hexdigest(); session.add(OperationalAuditEvent(event_key=str(uuid.uuid4()),event_type="purchase_return.posting_rehearsed",actor=actor,resource_key=document.return_key,detail=f"AED {debit}; {len(movements)} outgoing movements; fingerprint {fingerprint}; no posting")); session.commit()
-    return {"return_key":document.return_key,"return_no":document.return_no,"debit_note_no":document.debit_note.debit_note_no,"posting_enabled":False,"period_key":period.period_key,"journal":journal,"movements":movements,"supplier_return_cost":supplier_cost,"writeoff_cost":writeoff_cost,"purchase_return_variance":variance,"debit":debit,"credit":credit,"posting_fingerprint":fingerprint,"idempotency_key":f"purchase-return:{document.return_key}:{document.revision}:{fingerprint[:20]}"}
+    if document.status != "approved" or not document.debit_note:
+        raise ValueError("Only an approved purchase return with a debit note can be rehearsed")
+    invoice = _posted_supplier_invoice(session, document)
+    period = session.scalar(select(OperationalFiscalPeriod).where(
+        OperationalFiscalPeriod.starts_on <= document.return_date,
+        OperationalFiscalPeriod.ends_on >= document.return_date,
+        OperationalFiscalPeriod.status == "open", OperationalFiscalPeriod.rehearsal_enabled.is_(True)))
+    if not period:
+        raise ValueError("Return date is not in an open rehearsal-enabled fiscal period")
+    reservations = {row.purchase_return_line_id: row.quantity_base for row in session.scalars(select(
+        OperationalPurchaseReturnReservation).where(
+            OperationalPurchaseReturnReservation.purchase_return_id == document.id,
+            OperationalPurchaseReturnReservation.status == "active"))}
+    if any(reservations.get(line.id) != line.quantity_base for line in document.lines):
+        raise ValueError("Active reservations do not fully cover the purchase return")
+    existing = session.scalar(select(OperationalPurchaseReturnPostingRehearsal).where(
+        OperationalPurchaseReturnPostingRehearsal.purchase_return_id == document.id,
+        OperationalPurchaseReturnPostingRehearsal.return_revision == document.revision))
+    if existing:
+        if (existing.original_supplier_invoice_id != invoice.id
+                or existing.original_invoice_revision != invoice.revision):
+            raise ValueError("The linked supplier invoice changed after the purchase-return rehearsal")
+        return _purchase_return_rehearsal_payload(existing, document, invoice, idempotent_replay=True)
+    from .procurement_matching import OperationalSupplierAdjustment, OperationalSupplierAdjustmentLine
+    supplied_skus = [line.sku for line in document.lines if line.supplier_return_quantity > 0]
+    overlapping_adjustment = session.scalar(select(OperationalSupplierAdjustmentLine.id).join(
+        OperationalSupplierAdjustment,
+        OperationalSupplierAdjustment.id == OperationalSupplierAdjustmentLine.adjustment_id).where(
+            OperationalSupplierAdjustment.supplier_invoice_id == invoice.id,
+            OperationalSupplierAdjustment.adjustment_type == "credit_note",
+            OperationalSupplierAdjustment.status.in_(("submitted", "approved", "posted")),
+            OperationalSupplierAdjustmentLine.sku.in_(supplied_skus))) if supplied_skus else None
+    if overlapping_adjustment:
+        raise ValueError("A supplier credit note already controls an item on this purchase return")
+    supplier_cost = sum(((line.supplier_return_quantity * line.factor_to_base_snapshot * line.unit_cost_snapshot)
+                         .quantize(MONEY, rounding=ROUND_HALF_UP) for line in document.lines), Decimal("0"))
+    writeoff_cost = sum(((line.internal_writeoff_quantity * line.factor_to_base_snapshot * line.unit_cost_snapshot)
+                         .quantize(MONEY, rounding=ROUND_HALF_UP) for line in document.lines), Decimal("0"))
+    variance = document.subtotal - supplier_cost
+    journal = [
+        {"account_code": "2100", "account": "Trade payables", "debit": document.total_amount, "credit": Decimal("0")},
+        {"account_code": "1320", "account": "Input VAT recoverable", "debit": Decimal("0"), "credit": document.tax_amount},
+        {"account_code": "1300", "account": "Inventory", "debit": Decimal("0"), "credit": supplier_cost + writeoff_cost},
+        {"account_code": "5120", "account": "Inventory write-off", "debit": writeoff_cost, "credit": Decimal("0")},
+    ]
+    if variance > 0:
+        journal.append({"account_code": "5110", "account": "Purchase price variance", "debit": Decimal("0"), "credit": variance})
+    elif variance < 0:
+        journal.append({"account_code": "5110", "account": "Purchase price variance", "debit": -variance, "credit": Decimal("0")})
+    debit = sum((line["debit"] for line in journal), Decimal("0"))
+    credit = sum((line["credit"] for line in journal), Decimal("0"))
+    if debit != credit:
+        raise RuntimeError("Purchase return posting rehearsal is not balanced")
+    movements = [{"line_no": line.line_no, "location": document.location_code, "sku": line.sku,
+        "quantity_base": -line.quantity_base, "canonical_uom": line.canonical_uom,
+        "unit_cost": line.unit_cost_snapshot,
+        "value_delta": -(line.quantity_base * line.unit_cost_snapshot).quantize(MONEY, rounding=ROUND_HALF_UP)}
+        for line in document.lines]
+    reversal = {"journal": [{**line, "debit": line["credit"], "credit": line["debit"]}
+        for line in reversed(journal)], "movements": [{**line, "quantity_base": -line["quantity_base"],
+        "value_delta": -line["value_delta"]} for line in reversed(movements)]}
+    source = json.dumps({"return_key": document.return_key, "revision": document.revision,
+        "invoice_key": invoice.invoice_key, "invoice_revision": invoice.revision,
+        "period_key": period.period_key, "journal": journal, "movements": movements,
+        "reversal": reversal}, default=str, sort_keys=True, separators=(",", ":"))
+    fingerprint = hashlib.sha256(source.encode()).hexdigest()
+    rehearsal = OperationalPurchaseReturnPostingRehearsal(rehearsal_key=str(uuid.uuid4()),
+        purchase_return_id=document.id, return_revision=document.revision,
+        original_supplier_invoice_id=invoice.id, original_invoice_revision=invoice.revision,
+        period_key=period.period_key, posting_fingerprint=fingerprint,
+        journal_json=json.dumps(journal, default=str, sort_keys=True),
+        movements_json=json.dumps(movements, default=str, sort_keys=True),
+        reversal_json=json.dumps(reversal, default=str, sort_keys=True),
+        status="balanced_non_posting", posting_enabled=False, generated_by=actor)
+    session.add(rehearsal)
+    session.add(OperationalAuditEvent(event_key=str(uuid.uuid4()),
+        event_type="purchase_return.posting_rehearsed", actor=actor,
+        resource_key=document.return_key,
+        detail=f"AED {debit}; invoice {invoice.supplier_invoice_no}; {len(movements)} outgoing movements; fingerprint {fingerprint}; no posting"))
+    session.commit()
+    return _purchase_return_rehearsal_payload(rehearsal, document, invoice)
 
 
 def purchase_return_control_counts(session: Session) -> dict:

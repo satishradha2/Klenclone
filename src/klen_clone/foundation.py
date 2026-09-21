@@ -18,8 +18,8 @@ from .models import (
 
 
 REFERENCE_PATTERN = re.compile(r"^(.*?)(\d+)$")
-OPERATIONAL_MODULES = ("sales", "purchasing", "inventory", "accounting", "crm", "delivery", "reporting", "administration")
-ARCHIVAL_ONLY_MODULES = ("hrm", "payroll")
+OPERATIONAL_MODULES = ("sales", "purchasing", "inventory", "accounting", "crm", "delivery", "reporting", "administration", "hrm")
+ARCHIVAL_ONLY_MODULES = ("payroll",)
 
 
 def source_entity_counts_statement(snapshot_id: int):
@@ -199,7 +199,7 @@ def build_erp_foundation(session: Session, snapshot_name: str) -> dict:
         {"snapshot_id": snapshot.id, "event_key": f"foundation:{digest}"},
         {"event_type": "erp_foundation_registered", "actor_type": "migration_service",
          "details": {"batch_code": batch.batch_code, "manifest_digest": digest, "posting_enabled": False,
-                     "source_mutated": False, "hrm_payroll_mode": "archival_only"}})
+                     "source_mutated": False, "hrm_mode": "operational_controlled", "payroll_mode": "archival_only"}})
     created["audit_events"] += was_created
     session.commit()
 

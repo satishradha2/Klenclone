@@ -99,8 +99,53 @@ class OperationalPaymentWorkflowEvent(OperationalBase):
     note: Mapped[str | None] = mapped_column(Text)
 
 
+class OperationalPaymentPostingRehearsal(OperationalBase):
+    __tablename__ = "operational_payment_posting_rehearsals"
+    __table_args__ = (
+        UniqueConstraint("payment_id", "payment_revision", name="uq_payment_rehearsal_revision"),
+        CheckConstraint("status = 'verified'", name="ck_payment_rehearsal_status"),
+        CheckConstraint("posting_enabled = false", name="ck_payment_rehearsal_no_posting"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rehearsal_key: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("operational_payments.id"), nullable=False, index=True)
+    payment_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    period_key: Mapped[str] = mapped_column(String(20), nullable=False)
+    posting_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    journal_json: Mapped[str] = mapped_column(Text, nullable=False)
+    subledger_json: Mapped[str] = mapped_column(Text, nullable=False)
+    reversal_json: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="verified")
+    posting_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    generated_by: Mapped[str] = mapped_column(String(200), nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 def _money(value) -> Decimal:
     return Decimal(str(value)).quantize(MONEY, rounding=ROUND_HALF_UP)
+
+
+def payment_rehearsal_payload(row: OperationalPaymentPostingRehearsal,
+                              payment: OperationalPayment, *, idempotent_replay: bool = False) -> dict:
+    journal = json.loads(row.journal_json)
+    subledger = json.loads(row.subledger_json)
+    reversal = json.loads(row.reversal_json)
+    for line in journal + reversal["journal"]:
+        line["debit"] = _money(line["debit"]); line["credit"] = _money(line["credit"])
+    for line in subledger:
+        line["amount"] = _money(line["amount"])
+    for line in reversal["subledger"]:
+        line["amount"] = _money(line["amount"])
+    debit = sum((line["debit"] for line in journal), Decimal("0.00"))
+    credit = sum((line["credit"] for line in journal), Decimal("0.00"))
+    return {"rehearsal_key": row.rehearsal_key, "payment_key": payment.payment_key,
+            "payment_no": payment.payment_no, "payment_type": payment.payment_type,
+            "payment_revision": row.payment_revision, "posting_enabled": False,
+            "posting_performed": False, "period_key": row.period_key,
+            "journal": journal, "subledger": subledger, "reversal": reversal,
+            "debit": debit, "credit": credit, "posting_fingerprint": row.posting_fingerprint,
+            "idempotency_key": f"payment:{payment.payment_key}:{row.payment_revision}:{row.posting_fingerprint[:20]}",
+            "idempotent_replay": idempotent_replay}
 
 
 def _normalise_allocations(lines: list[dict], amount: Decimal) -> tuple[list[dict], Decimal]:
@@ -202,6 +247,68 @@ def list_payments(session: Session, *, allowed_locations: tuple[str, ...] = ("*"
     return list(session.scalars(query.order_by(OperationalPayment.created_at.desc()).limit(limit)))
 
 
+def customer_invoice_settlement(session: Session, invoice) -> dict:
+    """Calculate settlement from active receipt claims without mutating the invoice."""
+    rows = session.execute(select(
+        OperationalPayment.status,
+        func.coalesce(func.sum(OperationalPaymentAllocationClaim.amount), 0),
+    ).join(
+        OperationalPayment, OperationalPayment.id == OperationalPaymentAllocationClaim.payment_id,
+    ).where(
+        OperationalPayment.payment_type == "customer_receipt",
+        OperationalPayment.party_code == invoice.customer_code,
+        OperationalPaymentAllocationClaim.source_type == "invoice",
+        OperationalPaymentAllocationClaim.source_reference_key == invoice.invoice_no,
+        OperationalPaymentAllocationClaim.status == "active",
+        OperationalPayment.status.in_(("submitted", "approved")),
+    ).group_by(OperationalPayment.status)).all()
+    by_status = {status: _money(amount) for status, amount in rows}
+    total = _money(invoice.total_amount)
+    paid = min(total, by_status.get("approved", Decimal("0.00")))
+    pending = min(max(Decimal("0.00"), total - paid),
+                  by_status.get("submitted", Decimal("0.00")))
+    outstanding = max(Decimal("0.00"), total - paid)
+    available = max(Decimal("0.00"), outstanding - pending)
+    status = "paid" if outstanding == 0 else ("partially_paid" if paid > 0 else "unpaid")
+    return {
+        "settlement_status": status,
+        "paid_amount": _money(paid),
+        "pending_allocation_amount": _money(pending),
+        "outstanding_amount": _money(outstanding),
+        "available_outstanding": _money(available),
+    }
+
+
+def customer_invoice_open_items(session: Session, party_code: str) -> list[dict]:
+    """Return approved target-ERP invoices less active receipt-allocation claims."""
+    from .customer_invoices import OperationalCustomerInvoice
+
+    invoices = session.scalars(select(OperationalCustomerInvoice).where(
+        OperationalCustomerInvoice.customer_code == party_code,
+        OperationalCustomerInvoice.status == "approved",
+    ).order_by(OperationalCustomerInvoice.invoice_date.desc(),
+               OperationalCustomerInvoice.invoice_no.desc())).all()
+    items = []
+    for invoice in invoices:
+        settlement = customer_invoice_settlement(session, invoice)
+        outstanding = _money(invoice.total_amount)
+        claimed = _money(settlement["paid_amount"] + settlement["pending_allocation_amount"])
+        available = settlement["available_outstanding"]
+        if available > 0:
+            items.append({
+                "source_type": "invoice",
+                "source_reference_key": invoice.invoice_no,
+                "source_document_date": invoice.invoice_date,
+                "source_outstanding": outstanding,
+                "reserved_amount": claimed,
+                "available_outstanding": available,
+                "source_origin": "target_erp",
+                "delivery_note_no": invoice.delivery_note_no_snapshot,
+                "pod_reference": invoice.pod_reference_snapshot,
+            })
+    return items
+
+
 def _claim_allocations(session: Session, payment: OperationalPayment) -> None:
     # All migration-era invoice allocations share the party's approved opening
     # control balance. This prevents invoice detail and the opening-balance row
@@ -210,10 +317,26 @@ def _claim_allocations(session: Session, payment: OperationalPayment) -> None:
         OperationalPayment.party_code == payment.party_code,
         OperationalPayment.payment_type == payment.payment_type
     ).order_by(OperationalPaymentAllocation.id).with_for_update()).all()
+    for line in sorted(payment.allocations, key=lambda row: (row.source_type, row.source_reference_key)):
+        claimed = session.scalar(select(func.coalesce(func.sum(OperationalPaymentAllocationClaim.amount), 0)).where(
+            OperationalPaymentAllocationClaim.party_code == payment.party_code,
+            OperationalPaymentAllocationClaim.source_type == line.source_type,
+            OperationalPaymentAllocationClaim.source_reference_key == line.source_reference_key,
+            OperationalPaymentAllocationClaim.status == "active")) or Decimal("0")
+        if claimed + line.allocation_amount > line.source_outstanding_snapshot:
+            remaining = max(Decimal("0"), line.source_outstanding_snapshot - claimed)
+            raise ValueError(f"Allocation exceeds remaining outstanding for {line.source_reference_key}: AED {remaining}")
     balance_type = "receivable" if payment.payment_type == "customer_receipt" else "payable"
     control_total = session.scalar(select(func.coalesce(func.sum(OperationalOpeningPartyBalance.amount), 0)).where(
         OperationalOpeningPartyBalance.party_code == payment.party_code,
         OperationalOpeningPartyBalance.balance_type == balance_type)) or Decimal("0")
+    if payment.payment_type == "customer_receipt":
+        from .customer_invoices import OperationalCustomerInvoice
+        new_erp_receivables = session.scalar(select(func.coalesce(
+            func.sum(OperationalCustomerInvoice.total_amount), 0)).where(
+                OperationalCustomerInvoice.customer_code == payment.party_code,
+                OperationalCustomerInvoice.status == "approved")) or Decimal("0")
+        control_total += new_erp_receivables
     if control_total > 0:
         party_claimed = session.scalar(select(func.coalesce(func.sum(OperationalPaymentAllocationClaim.amount), 0)).join(
             OperationalPayment, OperationalPayment.id == OperationalPaymentAllocationClaim.payment_id).where(
@@ -296,6 +419,11 @@ def rehearse_payment_posting(session: Session, payment: OperationalPayment, *, a
         OperationalPaymentAllocationClaim.status == "active")) or Decimal("0")
     if _money(claim_total) != payment.allocated_amount:
         raise ValueError("Active allocation claims do not match the approved payment")
+    existing = session.scalar(select(OperationalPaymentPostingRehearsal).where(
+        OperationalPaymentPostingRehearsal.payment_id == payment.id,
+        OperationalPaymentPostingRehearsal.payment_revision == payment.revision))
+    if existing:
+        return payment_rehearsal_payload(existing, payment, idempotent_replay=True)
     cash = payment.cash_bank_account_code
     if payment.payment_type == "customer_receipt":
         journal = [{"account": cash, "debit": payment.amount, "credit": Decimal("0")},
@@ -325,14 +453,24 @@ def rehearse_payment_posting(session: Session, payment: OperationalPayment, *, a
     source = json.dumps({"payment_key": payment.payment_key, "revision": payment.revision,
                          "journal": journal, "subledger": subledger}, default=str, sort_keys=True, separators=(",", ":"))
     fingerprint = hashlib.sha256(source.encode()).hexdigest()
+    reversal = {"journal": [{**line, "debit": line["credit"], "credit": line["debit"]}
+                            for line in reversed(journal)],
+                "subledger": [{**line, "amount": -line["amount"]}
+                              for line in reversed(subledger)]}
+    rehearsal = OperationalPaymentPostingRehearsal(
+        rehearsal_key=str(uuid.uuid4()), payment_id=payment.id,
+        payment_revision=payment.revision, period_key=period.period_key,
+        posting_fingerprint=fingerprint,
+        journal_json=json.dumps(journal, default=str, sort_keys=True),
+        subledger_json=json.dumps(subledger, default=str, sort_keys=True),
+        reversal_json=json.dumps(reversal, default=str, sort_keys=True),
+        status="verified", posting_enabled=False, generated_by=actor)
+    session.add(rehearsal)
     session.add(OperationalAuditEvent(event_key=str(uuid.uuid4()), event_type="payment.posting_rehearsed", actor=actor,
                 resource_key=payment.payment_key,
                 detail=f"AED {debit}; {len(subledger)} subledger entries; fingerprint {fingerprint}; no posting"))
     session.commit()
-    return {"payment_key": payment.payment_key, "payment_no": payment.payment_no, "payment_type": payment.payment_type,
-            "posting_enabled": False, "period_key": period.period_key, "journal": journal, "subledger": subledger,
-            "debit": debit, "credit": credit, "posting_fingerprint": fingerprint,
-            "idempotency_key": f"payment:{payment.payment_key}:{payment.revision}:{fingerprint[:20]}"}
+    return payment_rehearsal_payload(rehearsal, payment)
 
 
 def payment_control_counts(session: Session) -> dict:
@@ -340,4 +478,5 @@ def payment_control_counts(session: Session) -> dict:
             "customer_receipts": session.scalar(select(func.count(OperationalPayment.id)).where(OperationalPayment.payment_type == "customer_receipt")) or 0,
             "supplier_payments": session.scalar(select(func.count(OperationalPayment.id)).where(OperationalPayment.payment_type == "supplier_payment")) or 0,
             "active_claims": session.scalar(select(func.count(OperationalPaymentAllocationClaim.id)).where(OperationalPaymentAllocationClaim.status == "active")) or 0,
+            "rehearsals": session.scalar(select(func.count(OperationalPaymentPostingRehearsal.id))) or 0,
             "posted": session.scalar(select(func.count(OperationalPayment.id)).where(OperationalPayment.status == "posted")) or 0}

@@ -33,8 +33,8 @@ Six roles have captured permission matrices. The Admin role is referenced by sou
 - Every target assignment remains `target_granted=false`.
 - The source matrix exposes 214 distinct permission codes.
 - 202 operational permissions are `draft_disabled` pending least-privilege review.
-- Twelve HRM/payroll permissions are `archival_only` and cannot be granted operationally.
-- None of the 12 excluded HRM/payroll permissions was checked in the six captured matrices.
+- HRM permissions are mapped into governed operational roles; payroll permissions remain excluded and cannot be granted operationally.
+- The captured HRM permissions were not checked in the six source matrices and require governed target-role assignment. Payroll permissions remain excluded.
 
 ## Location scope and approvals
 

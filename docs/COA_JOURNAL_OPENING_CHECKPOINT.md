@@ -69,4 +69,4 @@ Nothing in this phase posts to BizModo or to a production ERP. Activation requir
 - a frozen final export and rerun of all reconciliation stages;
 - balanced and approved GL, AR, AP, VAT and inventory opening schedules.
 
-The next implementation phase is the target ERP foundation: organization/location masters, immutable source-key registry, fiscal periods, document numbering, approvals, audit logging and migration-batch controls. HRM and payroll remain excluded from operational modules.
+The next implementation phase is the target ERP foundation: organization/location masters, immutable source-key registry, fiscal periods, document numbering, approvals, audit logging and migration-batch controls. HRM is included as an operational module; payroll remains excluded.

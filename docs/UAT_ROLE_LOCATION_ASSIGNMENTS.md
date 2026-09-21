@@ -18,4 +18,4 @@ These are governance design aliases, not sign-in accounts or representations of 
 | `synthetic.uat.reader` | Automated validation only | Synthetic UAT Reader | One isolated validation location | Customers, suppliers, products/UOM, sales, purchases, inventory, accounting summary | System test | 2026-09-09 | Yes, isolated copy only | On service stop |
 | _unassigned_ |  |  |  |  |  |  | No |  |
 
-Production or business-user provisioning remains blocked until the named person, exact role, allowed locations, and approver are recorded above. HRM and payroll access are out of scope.
+Production or business-user provisioning remains blocked until the named person, exact role, allowed locations, and approver are recorded above. Complete HRM is in scope through separately authorized HR manager, HR officer, and employee-self-service roles; payroll remains excluded.

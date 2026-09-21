@@ -11,6 +11,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from .data_governance import OperationalPromotionBatch, OperationalSourceLineage
 from .delta_overlay import DeltaOverlay
+from .inventory import canonical_uom
 from .models import ErpLocation, ErpParty, ErpProductMaster, ErpProductUom, RawFileManifest, SourceSnapshot
 from .operational import OperationalAuditEvent, OperationalBase, utc_now
 
@@ -125,14 +126,19 @@ def promote_operational_masters(clone: Session, operational: Session, snapshot: 
         products[row.sku] = {"sku": row.sku, "name": row.name, "product_type": row.product_type,
             "category_name": row.category_name, "brand_name": row.brand_name,
             "base_uom": (uom.source_base_uom if uom else None) or "piece",
-            "canonical_base_uom": (uom.canonical_base_uom if uom else None) or "piece",
+            "canonical_base_uom": canonical_uom(
+                (uom.canonical_base_uom if uom else None)
+                or (uom.source_base_uom if uom else None)
+                or "piece"
+            ) or "piece",
             "factor_to_base": (uom.factor_to_base_snapshot if uom else 1),
             "purchase_price": row.purchase_price_evidence or 0, "selling_price": row.selling_price_evidence or 0}
     if overlay:
         for row in overlay.product_records():
             products[row["sku"]] = {"sku": row["sku"], "name": row["name"],
                 "product_type": None, "category_name": row["category_name"], "brand_name": row["brand_name"],
-                "base_uom": row["base_uom"] or "piece", "canonical_base_uom": (row["base_uom"] or "piece").casefold(),
+                "base_uom": row["base_uom"] or "piece",
+                "canonical_base_uom": canonical_uom(row["base_uom"] or "piece") or "piece",
                 "factor_to_base": 1, "purchase_price": row["purchase_price_evidence"],
                 "selling_price": row["selling_price_evidence"]}
 

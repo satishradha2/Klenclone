@@ -38,7 +38,7 @@ BizModo continues to expose duplicate source references `PO2026/0339` and `AK202
 - A later quick sales refresh again returned an impossible zero, so it is retained as a source-report defect rather than interpreted as activity or deletion. The earlier completed opening/closing pair remains the accepted zero-drift control.
 - Browser register tables do not guarantee hidden database fields, deleted records, transaction lines or uploaded documents.
 - The delta files are staging inputs only. No operational or canonical business table was modified.
-- HRM/payroll remains excluded.
+- HRM is included; payroll remains excluded.
 - Production merge and posting remain disabled.
 
 ## Next gate

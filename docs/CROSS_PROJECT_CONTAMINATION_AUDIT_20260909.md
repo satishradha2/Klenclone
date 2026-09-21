@@ -97,7 +97,9 @@ Live BizModo, the separate project's production environment, and unrelated KLEN+
 ## Independent clone follow-up
 
 After recovery, a separate read-only Asas ERP preview was created inside this
-workspace and assigned port `18082`. It reads only the clone database, excludes
-HR/payroll, rejects mutation requests, and has no dependency on `D:\Klen+ ERP`.
+workspace and assigned port `18082`. At this historical checkpoint it read only
+the clone database and excluded HR/payroll. HRM has since been added as a
+separately authorized target-ERP workspace while payroll remains excluded. It
+has no dependency on `D:\Klen+ ERP`.
 Its baseline and remaining production gates are recorded in
 `docs/INDEPENDENT_ERP_PREVIEW_CHECKPOINT_20260909.md`.

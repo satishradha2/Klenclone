@@ -24,8 +24,8 @@ from .models import (
 )
 
 REFERENCE_ENTITIES = {"brand", "category", "industry", "expense_category", "zone"}
-OPERATIONAL_PENDING_ENTITIES = {"contact_login", "sales_quotation", "sales_draft", "shipment", "sales_target"}
-ARCHIVAL_ONLY_ENTITIES = {"attendance", "shift"}
+OPERATIONAL_PENDING_ENTITIES = {"contact_login", "sales_quotation", "sales_draft", "shipment", "sales_target", "attendance", "shift"}
+ARCHIVAL_ONLY_ENTITIES = set()
 CONTROL_EVIDENCE_ENTITIES = {"pos_sale", "profit_by_product", "item_trace", "business_setting", "configuration_inventory", "cash_flow_boundary"}
 KNOWN_STRUCTURED_UNMAPPED_ENTITIES = {"stock_transfer_detail"}
 
@@ -169,7 +169,7 @@ def build_coverage_closure(session: Session, snapshot_name: str) -> dict:
             action = "Retain as report/configuration evidence; do not double-post."
         elif entity in ARCHIVAL_ONLY_ENTITIES:
             evidence_class, status = residual_class(entity)
-            action = "Preserve in archive; HRM/payroll operation is excluded."
+            action = "Preserve payroll-only evidence in archive; HRM is promoted through its controlled workflow."
         elif mapped:
             evidence_class, status, action = "structured", "structured_linked", None
         elif entity in OPERATIONAL_PENDING_ENTITIES:

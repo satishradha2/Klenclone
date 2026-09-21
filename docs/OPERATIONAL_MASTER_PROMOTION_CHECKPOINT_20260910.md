@@ -33,7 +33,7 @@ Replaying the promotion command returns `idempotent_replay: true`; it does not d
 ## Safety state
 
 - BizModo remains read-only and independent from this application.
-- HR and payroll remain excluded.
+- HRM is included; payroll remains excluded.
 - Permanent transaction posting remains disabled.
 - The runtime is local staging, not a production deployment.
 

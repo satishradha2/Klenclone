@@ -9,7 +9,8 @@ from klen_clone.operational import (OperationalAuditEvent, OperationalFiscalPeri
     OperationalOpeningBalanceBatch, OperationalOpeningPartyBalance,
     initialize_operational_database, make_operational_engine)
 from klen_clone.payments import (
-    OperationalPaymentAllocationClaim, OperationalPaymentWorkflowEvent,
+    OperationalPaymentAllocationClaim, OperationalPaymentPostingRehearsal,
+    OperationalPaymentWorkflowEvent,
     create_payment, payment_control_counts, rehearse_payment_posting,
     replace_payment, transition_payment,
 )
@@ -57,8 +58,12 @@ def test_customer_receipt_allocation_and_advance_rehearsal(tmp_path):
     assert plan["debit"] == plan["credit"] == Decimal("75.00")
     assert {row["account"] for row in plan["journal"]} == {"Bank - AED", "Accounts Receivable", "Customer Advances"}
     assert len(plan["subledger"]) == 2
+    replay = rehearse_payment_posting(session, payment, actor="approver")
+    assert replay["idempotent_replay"] is True
+    assert replay["posting_fingerprint"] == plan["posting_fingerprint"]
+    assert session.scalar(select(func.count(OperationalPaymentPostingRehearsal.id))) == 1
     assert payment_control_counts(session) == {"payments": 1, "customer_receipts": 1,
-        "supplier_payments": 0, "active_claims": 1, "posted": 0}
+        "supplier_payments": 0, "active_claims": 1, "rehearsals": 1, "posted": 0}
     assert session.scalar(select(func.count(OperationalPaymentWorkflowEvent.id))) == 2
     assert session.scalar(select(func.count(OperationalAuditEvent.id))) == 4
 

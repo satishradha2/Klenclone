@@ -17,13 +17,15 @@ All extracted files are immutable source evidence. Cleaning, normalization, corr
 - Expenses, payment accounts, accounting, and reports
 - Delivery, field force, routing, and zones
 - CRM
-- HRM and payroll source-data preservation only; excluded from the target operational ERP
+- HRM included in the target ERP; payroll excluded
 - Settings, roles, permissions, notifications, and integrations
 
 Raw exports are excluded from source control because they contain confidential company and personal data.
 
 ## Current artifacts
 
+- `docs/ERP_COMPLETION_AUDIT_CHECKPOINT_20260921.md` — current route-backed staging coverage and the explicit remaining capability register; prevents permissions or source evidence from being misreported as implemented modules.
+- `docs/COMPLETE_HRM_LIFECYCLE_CHECKPOINT_20260921.md` — recruitment, candidate pipeline, employee documents and expiry, onboarding, performance, training, disciplinary, separation and end-of-service controls with payroll excluded.
 - `docs/SOURCE_SYSTEM_INVENTORY.md` — module and record inventory.
 - `docs/EXPORT_MANIFEST.md` — immutable evidence manifest and hashes.
 - `docs/DATA_RECONCILIATION.md` — counts, balances, variances and cutover gates.
@@ -36,6 +38,21 @@ Raw exports are excluded from source control because they contain confidential c
 - `docs/FINANCIAL_ALLOCATION_CHECKPOINT.md` — VAT, discount, rounding, return, payment and due allocation controls.
 - `docs/ACCOUNTING_LEDGER_CHECKPOINT.md` — cash-flow ledger, payment links, VAT, AR/AP and trial-balance controls.
 - `docs/COA_JOURNAL_OPENING_CHECKPOINT.md` — provisional chart of accounts, balanced journal blueprints and inventory-opening controls.
+- `docs/FINANCE_RECONCILIATION_WORKFLOW_CHECKPOINT_20260915.md` — maker/approver review plans for test-data trial-balance and opening AR/AP variances without clearing source exceptions or enabling posting.
+- `docs/GENERAL_LEDGER_TEST_WORKSPACE_CHECKPOINT_20260915.md` — balanced manual journal plans, approval workflow, account drill-down and projected financial statements with posting disabled.
+- `docs/HRM_TEST_WORKSPACE_CHECKPOINT_20260915.md` — privacy-controlled employee, attendance and shift test-data workspace with payroll explicitly excluded.
+- `docs/ENTERPRISE_PROCUREMENT_CHECKPOINT_20260915.md` — location-scoped requisition, RFQ, supplier-quotation comparison, award and purchase-order approval controls with posting disabled.
+- `docs/PROCUREMENT_THREE_WAY_MATCH_CHECKPOINT_20260915.md` — approved PO receipt binding and supplier-invoice three-way matching with exception blocking and no AP/ledger posting.
+- `docs/PROCUREMENT_TOLERANCE_ADJUSTMENT_CHECKPOINT_20260915.md` — independently governed match tolerances and supplier credit/debit notes linked to approved invoices, with posting disabled.
+- `docs/SUPPLIER_TAX_AND_POSTING_REHEARSAL_CHECKPOINT_20260915.md` — UAE supplier tax-document validation plus balanced, idempotent GRNI/Input VAT/AP and reversal rehearsals with no posting.
+- `docs/SUPPLIER_INVOICE_ATOMIC_POSTING_CHECKPOINT_20260919.md` — activation-gated atomic AP/Input VAT/GRNI posting, payable subledger creation, idempotency and dependency-safe exact reversal.
+- `docs/SUPPLIER_ADJUSTMENT_ATOMIC_POSTING_CHECKPOINT_20260919.md` — supplier credit/debit-note accounting treatments, duplicate purchase-return protection, atomic payable/VAT posting and dependency-safe reversal.
+- `docs/PURCHASE_RETURN_ATOMIC_POSTING_CHECKPOINT_20260919.md` — posted-invoice-linked purchase returns, persisted rehearsal evidence, atomic stock/AP/VAT/subledger posting and exact reversal controls.
+- `docs/SALES_RETURN_ATOMIC_POSTING_CHECKPOINT_20260919.md` — immutable original-invoice evidence, cumulative credit caps, atomic AR/Output VAT/inventory/subledger posting and dependency-safe exact reversal.
+- `docs/SALES_INVOICE_ATOMIC_POSTING_CHECKPOINT_20260919.md` — reservation-backed sales-invoice rehearsal, atomic AR/Output VAT/COGS/inventory posting, idempotency and dependency-safe exact reversal.
+- `docs/CUSTOMER_RECEIPT_ALLOCATION_CHECKPOINT_20260919.md` — approved POD-backed invoice collection, controlled allocation claim, independent approval, balanced cash/AR rehearsal and exact reversal.
+- `docs/CUSTOMER_STATEMENT_SETTLEMENT_CHECKPOINT_20260919.md` — calculated invoice settlement states and customer statements combining authoritative opening controls with approved target-ERP activity.
+- `docs/EXPENSE_PETTY_CASH_CHECKPOINT_20260921.md` — receipt-backed expenses, UAE VAT evidence, reimbursements, petty-cash advances and balanced non-posting rehearsals.
 - `docs/ERP_FOUNDATION_CHECKPOINT.md` — locked target organization, locations, numbering evidence, source-key registry, approvals and migration batch.
 - `docs/CANONICAL_MASTER_CHECKPOINT.md` — source-linked party, product, UOM, tax and opening-balance approval masters.
 - `docs/CANONICAL_TRANSACTION_CHECKPOINT.md` — non-posting documents, lines, payments, inventory movements and exception queue.
@@ -56,6 +73,8 @@ Raw exports are excluded from source control because they contain confidential c
 - `docs/CUTOVER_CAPTURE_REHEARSAL_CHECKPOINT.md` — verified non-atomic package rehearsal for all preserved evidence.
 - `docs/SOURCE_ACTIVITY_WATERMARK_CHECKPOINT.md` — read-only pre-freeze counts and fail-closed activity comparison.
 - `docs/INVENTORY_OPERATIONS_FOUNDATION_CHECKPOINT_20260909.md` — controlled transfer/adjustment documents, reservations, approval and posting rehearsal.
+- `docs/USERS_ROLES_APPROVAL_MATRIX_CHECKPOINT_20260915.md` — operational user profiles, multi-role scoped assignments, effective permissions and maker/approver controls.
+- `docs/FINANCE_APPROVAL_QUEUE_CHECKPOINT_20260915.md` — revision-controlled chart-account and mapping approval workflow with independent decisions.
 - `docs/ERP_MASTER_IMPORT_REHEARSAL_CHECKPOINT.md` — incremental master-data package, isolated ERP validation and non-posting staging placement.
 - `source_exports/2026-09-08/DETAIL_HASHES.sha256` — hash ledger for browser-only detail evidence.
 
@@ -195,7 +214,7 @@ validated against cloned party, product and location masters. They are expressly
 non-posting: no inventory, accounting, tax, payment, or source-system record is
 created. See `docs/OPERATIONAL_DRAFT_FOUNDATION_CHECKPOINT_20260909.md`.
 
-Operational schema versions `0001` through `0015` are checksum-recorded.
+Operational schema versions `0001` through `0020` are checksum-recorded.
 Drafts use database row locks plus optimistic revision checks, immutable workflow
 events, controlled submit/cancel/approve transitions, and per-line base-quantity
 snapshots. Product, party and location selectors and printable review are active.
@@ -251,7 +270,13 @@ The Sales, Purchasing, Inventory, Accounting, CRM, Delivery and Reports navigati
 
 The standalone Asas ERP preview is implemented entirely in this repository and reads the cloned canonical BizModo tables. It does not import or reuse the separate `D:\Klen+ ERP` application.
 
-When the clone Docker stack is running, open `http://127.0.0.1:18082/`. The preview provides live overview, sales, purchasing, inventory, products, customers, suppliers, accounting and reports workspaces. HR and payroll are excluded. The service binds only to loopback and rejects every mutating HTTP method until authentication, transactional ledgers and cutover controls are completed.
+When the clone Docker stack is running, open `http://127.0.0.1:18082/`. The preview provides live overview, sales, sales-order, delivery-fulfilment, customer-invoice, customer-credit and collections, bank and cash reconciliation, expense and petty-cash control, fixed-assets, enterprise procurement, purchasing, inventory, products, customers, suppliers, accounting, HRM, financial statements, audit and compliance, and reports workspaces. HRM is included and payroll is excluded. The sales-order workspace governs customer quotation revision, independent approval, customer acceptance and immutable conversion to a confirmed order. Delivery fulfilment then controls stock allocation, picking, dispatch/delivery-note stock issue and proof of delivery; only a delivered order with POD is invoice-eligible. Customer invoicing copies that delivered order snapshot, prevents duplicate/excess invoicing, applies independent approval, and rehearses receivables/revenue/VAT without issuing stock a second time or permanently posting accounting. Credit control adds maker-checker limits and terms, exposure plus open-order commitments, customer holds, target-ERP overdue monitoring, collection actions, promise-to-pay tracking, independently approved one-time blocked-order overrides, and sequential dunning escalation; configured holds and limit breaches block ordinary order conversion. Bank and cash management adds independently approved account masters, duplicate-protected balanced statement import, approved receipt/payment matching, documented exceptions, reconciliation approval, and fingerprinted non-posting adjustment rehearsal. Expense control adds receipt-backed claims, UAE VAT evidence, reimbursements, approved-account settlement and petty-cash advance lifecycle controls. Fixed-assets control adds maker-checker capitalization, straight-line depreciation schedules, controlled disposal approval, and fingerprinted non-posting accounting rehearsals. Close-to-report freezes approved financial statements with controlled PDF and Excel exports. Audit and compliance then hash-chains the consolidated operational audit trail, checks approved VAT/report fingerprints and posting/filing locks, and releases statutory evidence workbooks and manifests only after independent approval. The procurement workspace governs purchase requisition, RFQ, supplier quotation comparison, award and purchase-order approval. The service binds only to loopback; authenticated operational changes remain isolated from BizModo, while accounting posting, statutory filing and production activation stay disabled until their cutover controls are completed. See `docs/SALES_QUOTATION_ORDER_CHECKPOINT_20260919.md`, `docs/DELIVERY_FULFILLMENT_CHECKPOINT_20260919.md`, `docs/CUSTOMER_INVOICE_CHECKPOINT_20260919.md`, `docs/CUSTOMER_CREDIT_COLLECTIONS_CHECKPOINT_20260919.md`, `docs/CREDIT_OVERRIDE_DUNNING_CHECKPOINT_20260919.md`, `docs/BANK_CASH_RECONCILIATION_CHECKPOINT_20260919.md`, `docs/EXPENSE_PETTY_CASH_CHECKPOINT_20260921.md`, `docs/FIXED_ASSETS_CHECKPOINT_20260921.md`, `docs/CLOSE_TO_REPORT_CHECKPOINT_20260921.md`, and `docs/AUDIT_COMPLIANCE_CHECKPOINT_20260921.md`.
+
+The UAE VAT control centre adds source-backed output/input tax reconciliation, independently approved reverse-charge and correction adjustments, frozen period evidence, and balanced non-filing return rehearsals. The month-end close centre adds governed close checklists, approved accrual/prepayment/FX/inventory adjustments, frozen period snapshots and balanced lock rehearsals. Close-to-report adds fingerprinted trial balance, profit and loss, balance sheet, cash flow, retained earnings, comparisons, drill-down references, and approval-gated PDF/Excel exports. See `docs/UAE_VAT_CONTROL_CHECKPOINT_20260921.md`, `docs/MONTH_END_CLOSE_CHECKPOINT_20260921.md`, and `docs/CLOSE_TO_REPORT_CHECKPOINT_20260921.md`.
+
+## Controlled cutover reset rehearsal
+
+The authenticated **Cutover rehearsal** workspace snapshots all target operational table counts, calculates a foreign-key-safe child-first purge order, records final-source and rollback blockers, and produces approval-controlled Excel and JSON plans. It has no purge or import execution endpoint. Approval confirms the rehearsal plan only; all test data remains untouched until a later separately authorized final cutover. See `docs/CUTOVER_RESET_REHEARSAL_CHECKPOINT_20260921.md`.
 
 ## Isolated container preview
 

@@ -51,7 +51,7 @@ Residual workflow promotion uses `erp_portal_identity`, `erp_sales_workflow_docu
 - Store entered quantity, entered UOM, conversion snapshot and base quantity separately.
 - Use decimal types for money, tax, cost and quantity; never binary floating point.
 - Attachments require original filename, MIME type, byte length, content hash, storage object key and links to every related transaction/payment.
-- HRM/payroll data is preserved in staging and archival exports even if excluded from the first ERP release.
+- HRM data is preserved in staging and promoted through governed operational workflows; payroll data remains excluded from the ERP.
 
 ## Reconciliation gates
 

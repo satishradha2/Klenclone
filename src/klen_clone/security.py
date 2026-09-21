@@ -15,7 +15,8 @@ from .models import (
     RawFileManifest, RawRecord, SourceSnapshot,
 )
 
-HR_PAYROLL_TERMS = ("payroll", "attendance", "leave", "salary", "shift", "employee")
+PAYROLL_TERMS = ("payroll", "salary", "wage")
+HRM_TERMS = ("attendance", "leave", "shift", "employee", "human resource")
 
 
 def role_code(name: str) -> str:
@@ -24,8 +25,10 @@ def role_code(name: str) -> str:
 
 def permission_module(code: str, label: str | None = None) -> str:
     text = f"{code} {label or ''}".casefold()
-    if any(term in text for term in HR_PAYROLL_TERMS):
-        return "hrm_payroll"
+    if any(term in text for term in PAYROLL_TERMS):
+        return "payroll"
+    if any(term in text for term in HRM_TERMS):
+        return "hrm"
     prefix = re.split(r"[._]", code.casefold(), maxsplit=1)[0]
     return prefix or "other"
 
@@ -87,7 +90,7 @@ def build_security_controls(session: Session, snapshot_name: str) -> dict:
     for code in sorted(permission_catalog, key=str.casefold):
         item = permission_catalog[code]
         module = permission_module(code, item["label"])
-        mode = "archival_only" if module == "hrm_payroll" else "draft_disabled"
+        mode = "archival_only" if module == "payroll" else "draft_disabled"
         key = (snapshot.id, code)
         permission, was_created = _ensure(session, ErpSecurityPermission, permissions, key, permission_fields,
             {"label": item["label"], "module_code": module, "mode": mode,
@@ -111,7 +114,7 @@ def build_security_controls(session: Session, snapshot_name: str) -> dict:
                 continue
             key = (role.id, permission.id)
             values = {"source_granted": True, "target_granted": False,
-                      "exclusion_reason": "HRM/payroll excluded from operational ERP" if permission.mode == "archival_only" else "Target RBAC approval pending"}
+                      "exclusion_reason": "Payroll excluded from operational ERP" if permission.mode == "archival_only" else "Target RBAC approval pending"}
             row = existing_role_permissions.get(key)
             if row:
                 for field, expected in values.items():

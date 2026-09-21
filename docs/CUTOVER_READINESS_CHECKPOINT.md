@@ -44,7 +44,7 @@ The manifest defines a repeatable capture checklist for:
 4. All-location stock, transfers, transfer details and item traceability.
 5. Payment accounts, cash flow, VAT, trial balance and profitability evidence.
 6. Users, roles, permissions, business settings and CRM configuration.
-7. HRM evidence as archive-only data; HRM remains disabled in the operational ERP.
+7. Complete HRM capture for employees, departments, designations, attendance, shifts, holidays and leave controls; payroll remains excluded.
 8. Uploaded purchase, sales and contact documents where a hosting backup can expose them.
 
 ## Gates

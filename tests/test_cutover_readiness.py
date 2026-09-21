@@ -38,7 +38,9 @@ def test_cutover_readiness_is_read_only_and_fails_closed(tmp_path):
     assert report["source_mutation"] is False
     assert report["clone_mutation"] is False
     assert report["merge_allowed"] is False
-    assert next(item for item in report["cutover_export_families"] if item["family"] == "hrm_archive_only")["target_operational"] is False
+    hrm = next(item for item in report["cutover_export_families"] if item["family"] == "hrm")
+    assert hrm["target_operational"] is True
+    assert hrm["payroll_included"] is False
     assert next(item for item in report["cutover_export_families"] if item["family"] == "uploaded_files")["browser_exportable"] is False
 
 

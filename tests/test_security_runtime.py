@@ -26,7 +26,7 @@ def test_persistent_sessions_survive_store_instances_and_revoke(tmp_path):
     assert first.get(token, now=102) is None
     with Session(engine) as session:
         assert session.scalar(select(func.count(OperationalWebSession.token_hash))) == 1
-        assert session.scalar(select(func.count(OperationalSchemaMigration.version))) == 19
+        assert session.get(OperationalSchemaMigration, "0049") is not None
 
 
 def test_persistent_login_throttle_is_shared_and_clearable(tmp_path):

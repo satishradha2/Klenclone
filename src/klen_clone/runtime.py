@@ -66,12 +66,13 @@ def build_runtime_foundation(session: Session, snapshot_name: str) -> dict:
         "inventory": ("Inventory", "/erp/inventory"), "accounting": ("Accounting", "/erp/accounting"),
         "crm": ("CRM", "/erp/crm"), "delivery": ("Delivery", "/erp/delivery"),
         "reporting": ("Reports", "/erp/reports"), "administration": ("Administration", "/erp/admin"),
+        "hrm": ("Human Resources", "/erp/hrm"),
     }
     for code, (name, prefix) in module_specs.items():
         _, was_created = _add_once(session, ErpRuntimeModule,
             {"snapshot_id": snapshot.id, "module_code": code},
             {"module_name": name, "route_prefix": prefix, "module_status": "shell_disabled",
-             "operation_enabled": False, "evidence": {"hrm_payroll_excluded": True}})
+             "operation_enabled": False, "evidence": {"hrm_included": True, "payroll_excluded": True}})
         created["runtime_modules"] += was_created
 
     active_grants = session.scalar(select(func.count(ErpSecurityRolePermission.id)).where(

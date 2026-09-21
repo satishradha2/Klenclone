@@ -43,6 +43,6 @@ The application now contains a fail-closed production security profile and a pro
 
 ## Current status
 
-Production deployment is intentionally pending because no production host, TLS endpoint, managed-secret location, monitoring destination or final cutover approval has been supplied. Local posting remains disabled and HR/payroll remains excluded.
+Production deployment is intentionally pending because no production host, TLS endpoint, managed-secret location, monitoring destination or final cutover approval has been supplied. Local posting remains disabled. HRM is included; payroll remains excluded.
 
 Verification completed with 130 passing tests and one optional PostgreSQL integration test skipped. The production Compose overlay validates successfully with synthetic configuration. The rebuilt local Docker deployment is healthy on port 18082, operational schema version 0015 is installed, and the preserved counts remain 464 products, 881 parties, 579 stock positions and 264 opening party balances. All integrated posting ledgers remain empty.

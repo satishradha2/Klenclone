@@ -17,8 +17,9 @@ def test_canonical_content_hash_is_key_order_independent():
     assert canonical_content_hash(left) == canonical_content_hash(right)
 
 
-def test_hrm_and_payroll_are_archival_only_not_operational():
-    assert set(ARCHIVAL_ONLY_MODULES) == {"hrm", "payroll"}
+def test_hrm_is_operational_and_payroll_remains_archival_only():
+    assert "hrm" in OPERATIONAL_MODULES
+    assert set(ARCHIVAL_ONLY_MODULES) == {"payroll"}
     assert not set(ARCHIVAL_ONLY_MODULES) & set(OPERATIONAL_MODULES)
 
 

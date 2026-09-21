@@ -17,7 +17,7 @@ An isolated authenticated UAT copy is available at `http://127.0.0.1:18082/#uat`
 - Repeated login failures are rate limited.
 - Password reset is a dry-run response and changes no password or business data.
 - All non-authentication POST/PUT/PATCH/DELETE requests remain blocked with HTTP 405.
-- HRM and payroll are not exposed.
+- At this historical checkpoint HRM was not yet exposed; HRM is now included in the target ERP through separately authorized workflows. Payroll remains excluded.
 
 ## Protected workspaces
 

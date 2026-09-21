@@ -4,11 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Asas ERP | Business operations</title>
-  <link rel="stylesheet" href="/static/erp.css">
+  <link rel="stylesheet" href="/static/erp.css?v=20260919-statements-1">
   <link rel="stylesheet" href="/static/sidebar-fix.css">
   <link rel="stylesheet" href="/static/glossary.css">
   <link rel="stylesheet" href="/static/pagination.css">
   <link rel="stylesheet" href="/static/review.css">
+  <link rel="stylesheet" href="/static/general-ledger.css">
 </head>
 <body>
   <aside class="sidebar">
@@ -17,22 +18,46 @@
       <a href="#overview" data-route="overview" class="active"><span>◫</span>Overview</a>
       <p>OPERATIONS</p>
       <a href="#sales" data-route="sales"><span>↗</span>Sales</a>
+      <a href="#crm" data-route="crm"><span>◇</span>CRM</a>
+      <a href="#sales-orders" data-route="sales-orders"><span>⇢</span>Sales orders</a>
+      <a href="#pos" data-route="pos"><span>▦</span>POS & counter sales</a>
+      <a href="#van-sales" data-route="van-sales"><span>▰</span>Van sales</a>
+      <a href="#deliveries" data-route="deliveries"><span>▣</span>Delivery fulfilment</a>
+      <a href="#customer-invoices" data-route="customer-invoices"><span>▤</span>Customer invoices</a>
       <a href="#sales-returns" data-route="sales-returns"><span>↩</span>Sales returns</a>
       <a href="#purchases" data-route="purchases"><span>↙</span>Purchasing</a>
+      <a href="#procurement" data-route="procurement"><span>⌘</span>Procurement</a>
       <a href="#purchase-returns" data-route="purchase-returns"><span>↪</span>Purchase returns</a>
       <a href="#drafts" data-route="drafts"><span>＋</span>Draft entry</a>
       <a href="#inventory" data-route="inventory"><span>▦</span>Inventory</a>
       <a href="#inventory-operations" data-route="inventory-operations"><span>⇄</span>Stock operations</a>
       <a href="#goods-receipts" data-route="goods-receipts"><span>✓</span>Goods receipts</a>
       <p>MASTERS</p>
+      <a href="#company-setup" data-route="company-setup"><span>⚙</span>Company setup</a>
+      <a href="#users-roles" data-route="users-roles"><span>♙</span>Users & roles</a>
+      <a href="#chart-of-accounts" data-route="chart-of-accounts"><span>≡</span>Chart of accounts</a>
       <a href="#products" data-route="products"><span>◇</span>Products</a>
       <a href="#customers" data-route="customers"><span>○</span>Customers</a>
       <a href="#suppliers" data-route="suppliers"><span>△</span>Suppliers</a>
+      <p>PEOPLE</p>
+      <a href="#hrm" data-route="hrm"><span>♧</span>HRM</a>
       <p>FINANCE</p>
       <a href="#payments" data-route="payments"><span>¤</span>Receipts & payments</a>
+      <a href="#cash-management" data-route="cash-management"><span>▧</span>Bank & cash</a>
+      <a href="#expenses" data-route="expenses"><span>◫</span>Expenses & petty cash</a>
+      <a href="#fixed-assets" data-route="fixed-assets"><span>▣</span>Fixed assets</a>
+      <a href="#vat-control" data-route="vat-control"><span>◆</span>UAE VAT</a>
+      <a href="#period-close" data-route="period-close"><span>◉</span>Month-end close</a>
+      <a href="#financial-statements" data-route="financial-statements"><span>▥</span>Financial statements</a>
       <a href="#ageing" data-route="ageing"><span>◷</span>AR/AP ageing</a>
+      <a href="#customer-statements" data-route="customer-statements"><span>▤</span>Customer statements</a>
+      <a href="#credit-control" data-route="credit-control"><span>◈</span>Credit control</a>
       <a href="#accounting" data-route="accounting"><span>≋</span>Accounting</a>
+      <a href="#general-ledger" data-route="general-ledger"><span>▤</span>General ledger</a>
       <p>GOVERNANCE</p>
+      <a href="#audit-compliance" data-route="audit-compliance"><span>◈</span>Audit & compliance</a>
+      <a href="#cutover-rehearsal" data-route="cutover-rehearsal"><span>⟳</span>Cutover rehearsal</a>
+      <a href="#completion-audit" data-route="completion-audit"><span>◎</span>Completion audit</a>
       <a href="#reviews" data-route="reviews"><span>✓</span>Review center</a>
       <a href="#reports" data-route="reports"><span>▥</span>Reports</a>
     </nav>
@@ -47,9 +72,28 @@
     <section id="content" aria-live="polite"><div class="loading">Loading cloned data…</div></section>
   </main>
   <script src="/static/purchase-returns.js" defer></script>
-  <script src="/static/payments.js" defer></script>
-  <script src="/static/financial-reports.js" defer></script>
-  <script src="/static/erp.js" defer></script>
+  <script src="/static/payments.js?v=20260919-receivables-2" defer></script>
+  <script src="/static/cash-management.js?v=20260919-bank-2" defer></script>
+  <script src="/static/expenses.js?v=20260921-expense-1" defer></script>
+  <script src="/static/fixed-assets.js?v=20260921-assets-1" defer></script>
+  <script src="/static/vat-control.js?v=20260921-vat-1" defer></script>
+  <script src="/static/period-close.js?v=20260921-close-1" defer></script>
+  <script src="/static/close-reporting.js?v=20260921-reporting-1" defer></script>
+  <script src="/static/audit-compliance.js?v=20260921-audit-1" defer></script>
+  <script src="/static/cutover-rehearsal.js?v=20260921-cutover-1" defer></script>
+  <script src="/static/completion-audit.js?v=20260921-completion-1" defer></script>
+  <script src="/static/financial-reports.js?v=20260919-statements-1" defer></script>
+  <script src="/static/credit-control.js?v=20260919-credit-2" defer></script>
+  <script src="/static/general-ledger.js" defer></script>
+  <script src="/static/procurement.js" defer></script>
+  <script src="/static/sales-orders.js?v=20260919-sales-orders-2" defer></script>
+  <script src="/static/pos.js?v=20260921-pos-1" defer></script>
+  <script src="/static/van-sales.js?v=20260921-van-sales-1" defer></script>
+  <script src="/static/crm.js?v=20260921-crm-1" defer></script>
+  <script src="/static/deliveries.js?v=20260919-deliveries-1" defer></script>
+  <script src="/static/customer-invoices.js?v=20260919-customer-invoices-2" defer></script>
+  <script src="/static/erp.js?v=20260919-credit-1" defer></script>
+  <script src="/static/hrm-lifecycle.js?v=20260921-hrm-lifecycle-1" defer></script>
   <script src="/static/glossary.js" defer></script>
   <script src="/static/table-pagination.js" defer></script>
 </body>

@@ -1,4 +1,5 @@
-from datetime import date
+import uuid
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -14,6 +15,7 @@ from klen_clone.inventory_operations import (
 from klen_clone.goods_receipts import create_goods_receipt, rehearse_goods_receipt_posting, transition_goods_receipt
 from klen_clone.operational import OperationalFiscalPeriod, OperationalStockPosition, initialize_operational_database, make_operational_engine
 from klen_clone.payments import OperationalPaymentAllocationClaim, create_payment, rehearse_payment_posting, transition_payment
+from klen_clone.procurement_matching import OperationalSupplierInvoice, OperationalSupplierInvoiceLine
 from klen_clone.purchase_returns import create_purchase_return, rehearse_purchase_return_posting, transition_purchase_return
 from klen_clone.sales_returns import create_sales_return, rehearse_sales_return_posting, transition_sales_return
 from klen_clone.posting_integration import (
@@ -40,6 +42,17 @@ def posting_session(tmp_path) -> Session:
             quantity_on_hand=Decimal("5"), quantity_reserved=Decimal("0"), average_unit_cost=Decimal("8.00"),
             availability_enabled=True, source_status="test_reconciled"),
     ])
+    invoice = OperationalSupplierInvoice(invoice_key="invoice-1", supplier_invoice_no="SUPINV-1",
+        purchase_order_id=1, supplier_code="SUP-1", location_code="SHJ", invoice_date=date(2026, 9, 8),
+        due_date=date(2026, 10, 8), currency_code="AED", subtotal=Decimal("80"), tax_amount=Decimal("4"),
+        total_amount=Decimal("84"), status="posted", match_status="passed", match_summary="POSTED",
+        posting_enabled=False, created_by="invoice-maker", decided_by="invoice-approver",
+        decision_note="test", revision=4, state_changed_by="posting-user")
+    session.add(invoice)
+    session.flush()
+    session.add(OperationalSupplierInvoiceLine(invoice_id=invoice.id, purchase_order_line_id=1, sku="SKU-1",
+        quantity=Decimal("10"), unit_price=Decimal("8"), tax_rate=Decimal("5"), net_amount=Decimal("80"),
+        tax_amount=Decimal("4"), gross_amount=Decimal("84")))
     session.commit()
     return session
 
@@ -160,19 +173,40 @@ def test_receipt_and_both_return_types_post_and_reverse_through_the_same_control
             "product_name_snapshot": "Product One", "quantity": Decimal("2"), "restock_quantity": Decimal("2"),
             "writeoff_quantity": Decimal("0"), "uom": "Piece", "canonical_uom": "piece",
             "factor_to_base_snapshot": Decimal("1"), "unit_price": Decimal("10"), "tax_rate": Decimal("5"),
-            "unit_cost_snapshot": Decimal("7.65"), "disposition_reason": None}])
+            "unit_cost_snapshot": Decimal("7.65"), "original_invoice_quantity_snapshot": Decimal("10"),
+            "original_invoice_unit_price_snapshot": Decimal("10"), "disposition_reason": None}],
+        original_invoice_source_record_id=101, original_invoice_total_snapshot=Decimal("105"),
+        original_invoice_evidence_hash="a" * 64)
     sales_return = transition_sales_return(session, sales_return, expected_revision=1, action="submit", actor="maker")
     sales_return = transition_sales_return(session, sales_return, expected_revision=2, action="approve", actor="approver")
     sales_plan = rehearse_sales_return_posting(session, sales_return, actor="approver")
+    with pytest.raises(ValueError, match="maker cannot execute"):
+        execute_integrated_posting(session, resource_type="sales_return", resource_key=sales_return.return_key,
+            idempotency_key=sales_plan["idempotency_key"], actor="maker")
     sales_result = execute_integrated_posting(session, resource_type="sales_return", resource_key=sales_return.return_key,
         idempotency_key=sales_plan["idempotency_key"], actor="approver")
     sales_batch = session.scalar(select(OperationalIntegratedPostingBatch).where(
         OperationalIntegratedPostingBatch.batch_key == sales_result["batch_key"]))
+    sales_accounts = set(session.scalars(select(OperationalIntegratedJournalLine.account_code).where(
+        OperationalIntegratedJournalLine.batch_id == sales_batch.id)))
+    assert sales_accounts == {"4010", "2120", "1200", "1300", "5120", "5000"}
+    sales_subledger = session.scalar(select(OperationalIntegratedSubledgerEntry).where(
+        OperationalIntegratedSubledgerEntry.batch_id == sales_batch.id))
+    assert sales_subledger.entry_type == "receivable_credit"
+    assert sales_subledger.source_reference_key == "INV-1" and sales_subledger.amount == Decimal("-21.00")
+    receipt_dependency = OperationalPaymentAllocationClaim(claim_key=str(uuid.uuid4()), payment_id=998,
+        payment_allocation_id=998, party_code="CUS-1", source_type="invoice",
+        source_reference_key="INV-1", amount=Decimal("1"), status="active",
+        created_at=datetime.now(timezone.utc))
+    session.add(receipt_dependency); session.commit()
+    with pytest.raises(ValueError, match="later customer receipt"):
+        execute_integrated_reversal(session, sales_batch, actor="controller", reason="Sales return test rollback")
+    session.rollback(); receipt_dependency.status = "released"; session.commit()
     execute_integrated_reversal(session, sales_batch, actor="controller", reason="Sales return test rollback")
     assert sales_return.status == "reversed" and sales_return.credit_note.status == "reversed"
 
     purchase_return = create_purchase_return(session, supplier_code="SUP-1", supplier_name_snapshot="Supplier One",
-        location_code="SHJ", source_reference_type="goods_receipt", source_reference_key="GRN-1",
+        location_code="SHJ", source_reference_type="purchase_invoice", source_reference_key="SUPINV-1",
         return_date=date(2026, 9, 9), reason_code="quality", notes=None, actor="maker",
         lines=[{"sku": "SKU-1", "product_name_snapshot": "Product One", "source_received_quantity": Decimal("10"),
             "quantity": Decimal("4"), "supplier_return_quantity": Decimal("4"),
@@ -182,10 +216,28 @@ def test_receipt_and_both_return_types_post_and_reverse_through_the_same_control
     purchase_return = transition_purchase_return(session, purchase_return, expected_revision=1, action="submit", actor="maker")
     purchase_return = transition_purchase_return(session, purchase_return, expected_revision=2, action="approve", actor="approver")
     purchase_plan = rehearse_purchase_return_posting(session, purchase_return, actor="approver")
+    with pytest.raises(ValueError, match="maker cannot execute"):
+        execute_integrated_posting(session, resource_type="purchase_return",
+            resource_key=purchase_return.return_key, idempotency_key=purchase_plan["idempotency_key"], actor="maker")
     purchase_result = execute_integrated_posting(session, resource_type="purchase_return",
         resource_key=purchase_return.return_key, idempotency_key=purchase_plan["idempotency_key"], actor="approver")
     purchase_batch = session.scalar(select(OperationalIntegratedPostingBatch).where(
         OperationalIntegratedPostingBatch.batch_key == purchase_result["batch_key"]))
+    purchase_accounts = set(session.scalars(select(OperationalIntegratedJournalLine.account_code).where(
+        OperationalIntegratedJournalLine.batch_id == purchase_batch.id)))
+    assert {"2100", "1320", "1300", "5120", "5110"}.issubset(purchase_accounts)
+    purchase_subledger = session.scalar(select(OperationalIntegratedSubledgerEntry).where(
+        OperationalIntegratedSubledgerEntry.batch_id == purchase_batch.id))
+    assert purchase_subledger.entry_type == "payable_debit"
+    assert purchase_subledger.source_reference_key == "SUPINV-1" and purchase_subledger.amount == Decimal("-33.60")
+    dependency = OperationalPaymentAllocationClaim(claim_key=str(uuid.uuid4()), payment_id=999,
+        payment_allocation_id=999, party_code="SUP-1", source_type="invoice",
+        source_reference_key="SUPINV-1", amount=Decimal("1"), status="active",
+        created_at=datetime.now(timezone.utc))
+    session.add(dependency); session.commit()
+    with pytest.raises(ValueError, match="later supplier payment"):
+        execute_integrated_reversal(session, purchase_batch, actor="controller", reason="Purchase return test rollback")
+    session.rollback(); dependency.status = "released"; session.commit()
     execute_integrated_reversal(session, purchase_batch, actor="controller", reason="Purchase return test rollback")
     assert purchase_return.status == "reversed" and purchase_return.debit_note.status == "reversed"
     assert session.scalar(select(OperationalStockPosition).where(

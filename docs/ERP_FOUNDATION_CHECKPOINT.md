@@ -34,7 +34,7 @@ The manifest digest is `267a604a17ded07f5c45862b6b18d91814c5970378651be98f7c8b04
 
 ## HRM and payroll boundary
 
-HRM and payroll are explicitly `archival_only`, with `target_enabled=false` and `posting_enabled=false`. Their captured source rows remain protected in raw/staging evidence so exclusion from the operational ERP does not mean data deletion.
+HRM is an included operational module with governed target records while its captured source rows remain protected in raw/staging evidence. Payroll alone is `archival_only`, with `target_enabled=false` and `posting_enabled=false`.
 
 ## Safety controls
 

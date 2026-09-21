@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import uuid
 from datetime import date, datetime
@@ -9,7 +10,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, text
@@ -19,6 +20,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .auth import UatSessionStore, verify_password
 from .delta_overlay import load_delta_overlay
 from .db import make_engine
+from .inventory import canonical_uom as normalize_uom
 from .models import (
     ErpGlAccount,
     ErpAuditEvent,
@@ -67,21 +69,126 @@ from .data_reviews import (
     transaction_review_findings, transition_review,
 )
 from .sales_returns import (
-    OperationalSalesReturn, create_sales_return, list_sales_returns,
+    OperationalSalesReturn, OperationalSalesReturnPostingRehearsal,
+    _sales_return_rehearsal_payload, create_sales_return, list_sales_returns,
     rehearse_sales_return_posting, replace_sales_return,
     sales_return_control_counts, transition_sales_return,
 )
+from .sales_invoices import (
+    OperationalSalesInvoicePostingRehearsal,
+    rehearse_sales_invoice_posting,
+    sales_invoice_rehearsal_payload,
+)
+from .sales_orders import (
+    OperationalSalesOrder, OperationalSalesQuotation,
+    accept_sales_quotation, convert_sales_quotation, create_sales_quotation,
+    list_sales_orders, list_sales_quotations, replace_sales_quotation,
+    sales_order_control_counts, transition_sales_quotation,
+)
+from .delivery_fulfillment import (
+    OperationalDeliveryFulfillment, OperationalDeliveryReservation,
+    OperationalDeliveryStockMovement, allocate_sales_order,
+    delivery_control_counts, list_delivery_fulfillments, transition_delivery,
+)
+from .customer_invoices import (
+    OperationalCustomerInvoice, OperationalCustomerInvoicePostingRehearsal,
+    create_customer_invoice, customer_invoice_control_counts,
+    customer_invoice_rehearsal_payload, list_customer_invoices,
+    rehearse_customer_invoice, transition_customer_invoice,
+)
 from .purchase_returns import (
-    OperationalPurchaseReturn, create_purchase_return, list_purchase_returns,
+    OperationalPurchaseReturn, OperationalPurchaseReturnPostingRehearsal,
+    create_purchase_return, list_purchase_returns,
     purchase_return_control_counts, rehearse_purchase_return_posting,
     replace_purchase_return, transition_purchase_return,
+    _purchase_return_rehearsal_payload,
 )
 from .payments import (
-    OperationalPayment, OperationalPaymentAllocationClaim, create_payment,
+    OperationalPayment, OperationalPaymentAllocationClaim,
+    OperationalPaymentPostingRehearsal, create_payment,
+    customer_invoice_open_items, customer_invoice_settlement,
     list_payments, payment_control_counts, rehearse_payment_posting,
-    replace_payment, transition_payment,
+    payment_rehearsal_payload, replace_payment, transition_payment,
 )
-from .financial_reports import build_accounting_summary, build_ageing_report
+from .cash_management import (
+    OperationalCashAccount, OperationalStatementBatch, OperationalStatementLine,
+    cash_account_payload, cash_management_payload, create_cash_account,
+    create_statement_batch, decide_cash_account, explain_statement_line,
+    match_statement_line, rehearse_reconciliation, statement_payload,
+    transition_statement_batch,
+)
+from .expense_management import (
+    OperationalExpenseClaim, OperationalPettyCashAdvance,
+    create_expense_claim, create_petty_cash_advance, expense_claim_payload,
+    expense_workspace_payload, petty_advance_payload, rehearse_expense,
+    rehearse_petty_cash, transition_expense_claim, transition_petty_cash_advance,
+)
+from .fixed_assets import (
+    OperationalFixedAsset, create_fixed_asset, decide_asset_disposal,
+    fixed_asset_payload, fixed_asset_workspace_payload, rehearse_fixed_asset,
+    request_asset_disposal, transition_fixed_asset,
+)
+from .vat_control import (
+    OperationalVatAdjustment, OperationalVatPeriod, adjustment_payload as vat_adjustment_payload,
+    create_vat_adjustment, create_vat_period, decide_vat_adjustment,
+    rehearse_vat_return, transition_vat_period, vat_period_payload,
+    vat_workspace_payload,
+)
+from .period_close import (
+    OperationalCloseAdjustment, OperationalPeriodClose,
+    close_adjustment_payload, create_close_adjustment, create_period_close,
+    decide_close_adjustment, period_close_payload, period_close_workspace_payload,
+    rehearse_period_close, transition_period_close,
+)
+from .close_reporting import (
+    OperationalFinancialReportPackage, generate_report_package, pdf_bytes,
+    report_package_payload, reporting_workspace_payload, transition_report_package,
+    workbook_bytes,
+)
+from .audit_compliance import (
+    OperationalStatutoryEvidencePackage, audit_compliance_workspace_payload,
+    generate_statutory_package, statutory_json_bytes, statutory_package_payload,
+    statutory_workbook_bytes, transition_statutory_package,
+)
+from .cutover_rehearsal import (
+    OperationalCutoverRehearsalPackage, cutover_json_bytes,
+    cutover_rehearsal_payload, cutover_rehearsal_workspace_payload,
+    cutover_workbook_bytes, generate_cutover_rehearsal,
+    transition_cutover_rehearsal,
+)
+from .completion_audit import completion_audit_payload
+from .pos_counter import (
+    OperationalPosShift, OperationalPosTill, approve_close, create_till,
+    open_shift, pos_workspace_payload, record_sale, submit_close,
+)
+from .van_sales import (
+    OperationalVanRoute, create_route, submit_load, sync_offline_event,
+    transition_route, van_workspace_payload,
+)
+from .crm import add_activity, create_lead, create_proposal, crm_workspace_payload, decide_proposal
+from .commercial_pricing import (
+    OperationalCustomerPriceGroup, OperationalCustomerPriceGroupAssignment, OperationalPriceList,
+    OperationalPriceListItem, OperationalPromotion, approve_price_list, approve_promotion,
+    assign_customer_price_group, create_customer_price_group, create_price_list, create_promotion,
+    enforce_quotation_pricing,
+)
+from .credit_management import (
+    OperationalCollectionAction, OperationalCreditLimitRequest,
+    OperationalCreditOverrideRequest, OperationalCustomerCreditProfile,
+    OperationalDunningRequest, collection_action_payload,
+    create_collection_action, create_credit_limit_request,
+    create_credit_override_request, create_dunning_request,
+    credit_override_payload, credit_request_payload, credit_workspace_payload,
+    dunning_request_payload, set_credit_hold, transition_collection_action,
+    transition_credit_limit_request, transition_credit_override_request,
+    transition_dunning_request,
+)
+from .financial_reports import build_accounting_summary, build_ageing_report, build_customer_statement
+from .hrm_lifecycle import (
+    add_employee_document, create_candidate, create_lifecycle_case,
+    create_workforce_request, decide_workforce_request, hrm_lifecycle_payload,
+    move_candidate, transition_lifecycle_case,
+)
 from .posting_integration import (
     RESOURCE_TYPES,
     OperationalIntegratedPostingBatch,
@@ -93,6 +200,45 @@ from .posting_integration import (
 from .provisioned_users import load_provisioned_users
 from .security_runtime import PersistentSessionStore, production_security_settings, validate_production_security
 from .operational_masters import OperationalLocationMaster, OperationalPartyMaster, OperationalProductMaster
+from .enterprise_setup import (
+    add_branch, add_van, add_warehouse, enterprise_setup_payload,
+    initialize_enterprise_setup, transition_operating_unit, update_company_profile,
+)
+from .finance_foundation import (
+    OperationalChartAccount, decide_finance_approval, finance_foundation_payload, initialize_finance_foundation,
+    request_finance_approval,
+)
+from .finance_reconciliation import (
+    decide_reconciliation_review, finance_reconciliation_payload,
+    initialize_finance_reconciliation, request_reconciliation_review,
+)
+from .finance_ledger import (
+    OperationalGeneralJournal, create_general_journal, general_ledger_payload,
+    replace_general_journal, transition_general_journal,
+)
+from .hrm import OperationalHrmAttendance, OperationalHrmEmployee, hrm_payload, initialize_hrm_test_data
+from .hrm_operations import (
+    assign_shift, create_attendance_correction, create_department, create_designation,
+    create_holiday, create_leave_request, create_shift, decide_attendance_correction,
+    decide_employee_change, decide_leave, hrm_operations_payload, initialize_hrm_operations,
+    request_employee_change,
+)
+from .procurement import (
+    award_quote, capture_quote, create_requisition, create_rfq, procurement_payload,
+    transition_purchase_order, transition_requisition,
+)
+from .procurement_matching import (
+    OperationalSupplierAdjustment, OperationalSupplierInvoice, adjustment_payload,
+    approve_invoice_tolerance, create_supplier_adjustment, create_supplier_invoice,
+    decide_policy_change, decide_supplier_invoice, evaluate_invoice_match,
+    invoice_payload, policy_payload, rehearse_supplier_adjustment_posting,
+    rehearse_supplier_invoice_posting, request_policy_change,
+    transition_supplier_adjustment, validate_po_receipt,
+)
+from .access_control import (
+    access_control_payload, assign_role, create_user_profile, effective_principal,
+    initialize_access_profiles, revoke_role, set_user_status,
+)
 from .source_verification import source_verification_counts
 
 
@@ -140,6 +286,295 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=1, max_length=500)
 
 
+class CompanyProfileSetupRequest(BaseModel):
+    legal_name: str | None = Field(default=None, min_length=2, max_length=500)
+    registered_address: str | None = Field(default=None, max_length=2000)
+    tax_registration_number: str | None = Field(default=None, max_length=120)
+    trade_license_number: str | None = Field(default=None, max_length=120)
+    logo_reference: str | None = Field(default=None, max_length=500)
+
+
+class BranchSetupRequest(BaseModel):
+    branch_code: str = Field(min_length=2, max_length=80, pattern="^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=2, max_length=300)
+
+
+class WarehouseSetupRequest(BaseModel):
+    branch_code: str = Field(min_length=2, max_length=80, pattern="^[A-Za-z0-9_-]+$")
+    warehouse_code: str = Field(min_length=2, max_length=80, pattern="^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=2, max_length=300)
+    warehouse_type: str = Field(pattern="^(available|returns|quarantine|in_transit)$")
+
+
+class VanSetupRequest(BaseModel):
+    van_code: str = Field(min_length=2, max_length=80, pattern="^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=2, max_length=300)
+    assigned_branch_code: str = Field(min_length=2, max_length=80, pattern="^[A-Za-z0-9_-]+$")
+
+
+class OperatingUnitDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class AccessUserRequest(BaseModel):
+    login_name: str = Field(min_length=3, max_length=200, pattern="^[A-Za-z0-9._@-]+$")
+    display_name: str = Field(min_length=2, max_length=300)
+
+
+class AccessUserStatusRequest(BaseModel):
+    status: str = Field(pattern="^(active|suspended|inactive|pending_provisioning)$")
+
+
+class RoleAssignmentRequest(BaseModel):
+    role_code: str = Field(min_length=2, max_length=80, pattern="^[a-z_]+$")
+    company_code: str = Field(default="ASAS", min_length=2, max_length=40, pattern="^[A-Za-z0-9_-]+$")
+    branch_code: str | None = Field(default=None, max_length=80)
+    warehouse_code: str | None = Field(default=None, max_length=80)
+    van_code: str | None = Field(default=None, max_length=80)
+    approval_limit_aed: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
+    effective_from: date = Field(default_factory=date.today)
+    effective_to: date | None = None
+
+
+class HrmDepartmentRequest(BaseModel):
+    code: str = Field(min_length=2, max_length=40, pattern="^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=2, max_length=200)
+
+
+class HrmDesignationRequest(BaseModel):
+    code: str = Field(min_length=2, max_length=60, pattern="^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=2, max_length=200)
+    department_code: str = Field(min_length=2, max_length=40)
+
+
+class HrmShiftRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=200)
+    shift_type: str = Field(min_length=2, max_length=120)
+    start_time: str | None = Field(default=None, max_length=40)
+    end_time: str | None = Field(default=None, max_length=40)
+
+
+class HrmHolidayRequest(BaseModel):
+    holiday_date: date
+    name: str = Field(min_length=2, max_length=200)
+    department_code: str | None = Field(default=None, max_length=40)
+
+
+class HrmEmployeeChangeRequest(BaseModel):
+    employee_key: str = Field(min_length=1, max_length=200)
+    employee_no: str = Field(min_length=1, max_length=60)
+    department_code: str | None = Field(default=None, max_length=40)
+    designation_code: str | None = Field(default=None, max_length=60)
+    join_date: date | None = None
+    employment_status: str = Field(pattern="^(active|on_leave|inactive|separated)$")
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class HrmDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class HrmLeaveRequest(BaseModel):
+    employee_key: str | None = Field(default=None, max_length=200)
+    leave_type: str = Field(min_length=2, max_length=60)
+    starts_on: date
+    ends_on: date
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class HrmAttendanceCorrectionRequest(BaseModel):
+    attendance_id: int = Field(ge=1)
+    corrected_clock_in: str | None = Field(default=None, max_length=40)
+    corrected_clock_out: str | None = Field(default=None, max_length=40)
+    corrected_duration_minutes: int | None = Field(default=None, ge=0, le=10080)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class HrmShiftAssignmentRequest(BaseModel):
+    employee_key: str = Field(min_length=1, max_length=200)
+    shift_name: str = Field(min_length=2, max_length=200)
+    effective_from: date
+    effective_to: date | None = None
+
+
+class HrmWorkforceRequest(BaseModel):
+    request_type: str = Field(pattern="^(new_position|replacement|temporary)$")
+    department_code: str = Field(min_length=2, max_length=40)
+    position_title: str = Field(min_length=2, max_length=200)
+    headcount: int = Field(ge=1, le=100)
+    needed_by: date
+    justification: str = Field(min_length=5, max_length=2000)
+
+
+class HrmCandidateRequest(BaseModel):
+    workforce_request_key: str = Field(min_length=1, max_length=60)
+    full_name: str = Field(min_length=2, max_length=300)
+    contact_reference: str | None = Field(default=None, max_length=300)
+
+
+class HrmCandidateStageRequest(BaseModel):
+    stage: str = Field(pattern="^(screening|interview|offer|accepted|rejected)$")
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class HrmEmployeeDocumentRequest(BaseModel):
+    employee_key: str = Field(min_length=1, max_length=200)
+    document_type: str = Field(pattern="^(passport|visa|emirates_id|work_permit|contract|certificate|other)$")
+    document_number: str = Field(min_length=2, max_length=160)
+    issued_on: date | None = None
+    expires_on: date | None = None
+    evidence_reference: str = Field(min_length=3, max_length=500)
+
+
+class HrmLifecycleCaseRequest(BaseModel):
+    employee_key: str = Field(min_length=1, max_length=200)
+    case_type: str = Field(pattern="^(onboarding|performance|training|disciplinary|separation|end_of_service)$")
+    subject: str = Field(min_length=3, max_length=300)
+    effective_on: date
+    details: str = Field(min_length=5, max_length=4000)
+    evidence_reference: str | None = Field(default=None, max_length=500)
+
+
+class ProcurementRequisitionLineRequest(BaseModel):
+    sku: str = Field(min_length=1, max_length=160)
+    quantity: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+    uom: str | None = Field(default=None, max_length=80)
+    specification: str | None = Field(default=None, max_length=2000)
+
+
+class ProcurementRequisitionRequest(BaseModel):
+    needed_by: date
+    location_code: str = Field(min_length=1, max_length=80)
+    purpose: str = Field(min_length=5, max_length=2000)
+    lines: list[ProcurementRequisitionLineRequest] = Field(min_length=1, max_length=100)
+
+
+class ProcurementDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class ProcurementRfqRequest(BaseModel):
+    requisition_key: str = Field(min_length=1, max_length=36)
+    response_due_on: date
+    supplier_codes: list[str] = Field(min_length=2, max_length=50)
+
+
+class ProcurementQuoteLineRequest(BaseModel):
+    sku: str = Field(min_length=1, max_length=160)
+    unit_price: Decimal = Field(ge=0, max_digits=18, decimal_places=4)
+    tax_rate: Decimal = Field(default=Decimal("5"), ge=0, le=100, max_digits=7, decimal_places=4)
+
+
+class ProcurementQuoteRequest(BaseModel):
+    supplier_code: str = Field(min_length=1, max_length=80)
+    supplier_reference: str | None = Field(default=None, max_length=160)
+    quoted_on: date
+    valid_until: date | None = None
+    currency_code: str = Field(default="AED", min_length=3, max_length=3)
+    delivery_days: int | None = Field(default=None, ge=0, le=3650)
+    payment_terms: str | None = Field(default=None, max_length=500)
+    lines: list[ProcurementQuoteLineRequest] = Field(min_length=1, max_length=100)
+
+
+class ProcurementAwardRequest(ProcurementDecisionRequest):
+    quotation_key: str = Field(min_length=1, max_length=36)
+    expected_on: date | None = None
+
+
+class SupplierInvoiceLineRequest(BaseModel):
+    sku: str = Field(min_length=1, max_length=160)
+    quantity: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+    unit_price: Decimal = Field(ge=0, max_digits=18, decimal_places=4)
+    tax_rate: Decimal = Field(default=Decimal("5"), ge=0, le=100, max_digits=7, decimal_places=4)
+
+
+class SupplierInvoiceRequest(BaseModel):
+    purchase_order_key: str = Field(min_length=1, max_length=36)
+    supplier_invoice_no: str = Field(min_length=1, max_length=160)
+    invoice_date: date
+    due_date: date | None = None
+    currency_code: str = Field(default="AED", min_length=3, max_length=3)
+    document_type: str = Field(pattern="^(tax_invoice|simplified_tax_invoice|non_tax_invoice)$")
+    supply_date: date | None = None
+    supplier_name: str = Field(min_length=1, max_length=500)
+    supplier_address: str = Field(min_length=1, max_length=2000)
+    supplier_trn: str | None = Field(default=None, max_length=30)
+    recipient_name: str = Field(min_length=1, max_length=500)
+    recipient_address: str = Field(min_length=1, max_length=2000)
+    recipient_trn: str | None = Field(default=None, max_length=30)
+    lines: list[SupplierInvoiceLineRequest] = Field(min_length=1, max_length=100)
+
+
+class MatchToleranceRequest(BaseModel):
+    price_tolerance_pct: Decimal = Field(ge=0, le=100, max_digits=7, decimal_places=4)
+    amount_tolerance: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class SupplierAdjustmentLineRequest(BaseModel):
+    sku: str = Field(min_length=1, max_length=160)
+    quantity: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+    unit_price: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=4)
+    tax_rate: Decimal | None = Field(default=None, ge=0, le=100, max_digits=7, decimal_places=4)
+
+
+class SupplierAdjustmentRequest(BaseModel):
+    invoice_key: str = Field(min_length=1, max_length=36)
+    adjustment_type: str = Field(pattern="^(credit_note|debit_note)$")
+    supplier_reference: str = Field(min_length=1, max_length=160)
+    adjustment_date: date
+    reason: str = Field(min_length=5, max_length=2000)
+    accounting_treatment: str = Field(default="price_variance", pattern="^(price_variance|freight_landed_cost|administrative_expense)$")
+    lines: list[SupplierAdjustmentLineRequest] = Field(min_length=1, max_length=100)
+
+
+class FinanceApprovalSubmissionRequest(BaseModel):
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class FinanceApprovalDecisionRequest(FinanceApprovalSubmissionRequest):
+    expected_revision: int = Field(ge=1)
+
+
+class FinanceReconciliationSubmissionRequest(BaseModel):
+    resolution_type: str = Field(pattern="^(recheck_final_sync|source_correction_required|target_mapping_correction|accepted_test_variance)$")
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class FinanceReconciliationDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class GeneralJournalLineRequest(BaseModel):
+    account_code: str = Field(min_length=1, max_length=40)
+    description: str | None = Field(default=None, max_length=500)
+    debit: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+    credit: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+
+
+class GeneralJournalRequest(BaseModel):
+    journal_date: date
+    branch_code: str = Field(default="MAIN", min_length=1, max_length=80)
+    reference: str | None = Field(default=None, max_length=200)
+    description: str = Field(min_length=5, max_length=2000)
+    lines: list[GeneralJournalLineRequest] = Field(min_length=2, max_length=100)
+
+
+class GeneralJournalUpdateRequest(GeneralJournalRequest):
+    expected_revision: int = Field(ge=1)
+
+
+class GeneralJournalDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
 class DraftLineRequest(BaseModel):
     sku: str = Field(min_length=1, max_length=100)
     quantity: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
@@ -164,6 +599,185 @@ class DraftUpdateRequest(DraftRequest):
 class DraftTransitionRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     note: str | None = Field(default=None, max_length=2000)
+
+
+class SalesQuotationRequest(BaseModel):
+    customer_code: str = Field(min_length=1, max_length=80)
+    location_code: str = Field(min_length=1, max_length=80)
+    quotation_date: date
+    valid_until: date
+    discount_amount: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+    payment_terms: str | None = Field(default=None, max_length=500)
+    delivery_terms: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=2000)
+    promotion_code: str | None = Field(default=None, max_length=80)
+    lines: list[DraftLineRequest] = Field(min_length=1, max_length=100)
+
+
+class CustomerPriceGroupRequest(BaseModel):
+    group_code: str = Field(min_length=1, max_length=80, pattern="^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=2, max_length=200)
+
+
+class CustomerPriceGroupAssignmentRequest(BaseModel):
+    group_code: str = Field(min_length=1, max_length=80, pattern="^[A-Za-z0-9_-]+$")
+
+
+class PriceListItemRequest(BaseModel):
+    sku: str = Field(min_length=1, max_length=100)
+    unit_price: Decimal = Field(ge=0, max_digits=18, decimal_places=4)
+
+
+class PriceListRequest(BaseModel):
+    name: str = Field(min_length=2, max_length=200)
+    customer_group: str = Field(min_length=1, max_length=80)
+    effective_from: date
+    effective_to: date | None = None
+    max_discount_percent: Decimal = Field(ge=0, le=100, max_digits=7, decimal_places=2)
+    items: list[PriceListItemRequest] = Field(min_length=1, max_length=1000)
+
+
+class PromotionRequest(BaseModel):
+    promotion_code: str = Field(min_length=1, max_length=80, pattern="^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=2, max_length=200)
+    customer_group: str = Field(min_length=1, max_length=80)
+    sku: str | None = Field(default=None, max_length=100)
+    discount_percent: Decimal = Field(gt=0, le=100, max_digits=7, decimal_places=2)
+    effective_from: date
+    effective_to: date | None = None
+
+
+class SalesQuotationAcceptanceRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    acceptance_reference: str = Field(min_length=1, max_length=300)
+
+
+class SalesOrderConversionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    requested_delivery_date: date | None = None
+    conversion_note: str = Field(min_length=5, max_length=2000)
+
+
+class PosTillRequest(BaseModel):
+    till_code: str = Field(min_length=1, max_length=40)
+    name: str = Field(min_length=1, max_length=200)
+    location_code: str = Field(min_length=1, max_length=80)
+
+
+class PosShiftOpenRequest(BaseModel):
+    till_key: str = Field(min_length=1, max_length=36)
+    business_date: date
+    opening_float: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+
+
+class PosSaleLineRequest(BaseModel):
+    sku: str = Field(min_length=1, max_length=160)
+    quantity: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+
+
+class PosSaleRequest(BaseModel):
+    shift_key: str = Field(min_length=1, max_length=36)
+    customer_name: str | None = Field(default=None, max_length=500)
+    payment_method: str = Field(pattern="^(cash|card)$")
+    amount_tendered: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    lines: list[PosSaleLineRequest] = Field(min_length=1, max_length=100)
+
+
+class PosCloseRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    counted_cash: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class PosCloseApprovalRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class VanRouteRequest(BaseModel):
+    van_code: str = Field(min_length=1, max_length=80)
+    route_date: date
+    driver_name: str = Field(min_length=1, max_length=200)
+    device_id: str = Field(min_length=1, max_length=100)
+    opening_float: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    customer_codes: list[str] = Field(min_length=1, max_length=100)
+
+
+class VanLoadRequest(BaseModel):
+    source_location: str = Field(min_length=1, max_length=80)
+    lines: list[PosSaleLineRequest] = Field(min_length=1, max_length=200)
+    expected_revision: int = Field(ge=1)
+
+
+class VanTransitionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+    counted_cash: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
+
+
+class VanOfflineEventRequest(BaseModel):
+    route_key: str = Field(min_length=1, max_length=36)
+    device_id: str = Field(min_length=1, max_length=100)
+    client_reference: str = Field(min_length=1, max_length=100)
+    event_type: str = Field(pattern="^(sale|return|collection)$")
+    customer_code: str = Field(min_length=1, max_length=80)
+    captured_at: datetime
+    payment_method: str | None = Field(default=None, pattern="^(cash|card|bank)$")
+    amount: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
+    evidence_reference: str | None = Field(default=None, max_length=300)
+    lines: list[PosSaleLineRequest] = Field(default_factory=list, max_length=100)
+
+
+class CrmLeadRequest(BaseModel):
+    company_name: str = Field(min_length=2, max_length=300)
+    contact_name: str | None = Field(default=None, max_length=200)
+    contact_email: str | None = Field(default=None, max_length=300)
+    source: str = Field(min_length=2, max_length=80)
+    owner: str = Field(min_length=2, max_length=200)
+    follow_up_at: datetime | None = None
+
+
+class CrmActivityRequest(BaseModel):
+    activity_type: str = Field(pattern="^(call|meeting|email|note)$")
+    note: str = Field(min_length=5, max_length=2000)
+    due_at: datetime | None = None
+
+
+class CrmProposalRequest(BaseModel):
+    title: str = Field(min_length=3, max_length=300)
+    value_aed: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+
+
+class CrmProposalDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class DeliveryAllocationRequest(BaseModel):
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class DeliveryActionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class DeliveryDispatchRequest(DeliveryActionRequest):
+    vehicle_number: str | None = Field(default=None, max_length=100)
+    driver_name: str | None = Field(default=None, max_length=200)
+    dispatched_at: datetime | None = None
+
+
+class ProofOfDeliveryRequest(DeliveryActionRequest):
+    received_by: str = Field(min_length=1, max_length=200)
+    pod_reference: str = Field(min_length=1, max_length=300)
+    delivered_at: datetime | None = None
+
+
+class CustomerInvoiceCreateRequest(BaseModel):
+    invoice_date: date
+    due_date: date
+    notes: str | None = Field(default=None, max_length=2000)
 
 
 class PostingExecutionRequest(BaseModel):
@@ -277,6 +891,217 @@ class PaymentRequest(BaseModel):
     allocations: list[PaymentAllocationRequest] = Field(default_factory=list, max_length=100)
 
 
+class CashAccountRequest(BaseModel):
+    account_code: str = Field(min_length=1, max_length=80)
+    account_name: str = Field(min_length=1, max_length=200)
+    account_type: str = Field(pattern="^(bank|cash)$")
+    bank_name: str | None = Field(default=None, max_length=200)
+    identifier: str | None = Field(default=None, max_length=64)
+    gl_account_code: str = Field(min_length=1, max_length=80)
+    location_code: str = Field(min_length=1, max_length=80)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class CashDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class StatementLineRequest(BaseModel):
+    external_id: str = Field(min_length=1, max_length=160)
+    transaction_date: date
+    value_date: date | None = None
+    reference: str | None = Field(default=None, max_length=160)
+    description: str = Field(min_length=1, max_length=500)
+    debit_amount: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+    credit_amount: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+
+
+class StatementBatchRequest(BaseModel):
+    account_key: str = Field(min_length=1, max_length=36)
+    statement_reference: str = Field(min_length=1, max_length=160)
+    statement_start: date
+    statement_end: date
+    opening_balance: Decimal = Field(max_digits=18, decimal_places=2)
+    closing_balance: Decimal = Field(max_digits=18, decimal_places=2)
+    source_file_name: str = Field(min_length=1, max_length=255)
+    lines: list[StatementLineRequest] = Field(min_length=1, max_length=2000)
+
+
+class StatementMatchRequest(BaseModel):
+    payment_key: str = Field(min_length=1, max_length=36)
+
+
+class StatementExceptionRequest(BaseModel):
+    category: str = Field(pattern="^(bank_fee|bank_interest|timing_difference|bank_error|other)$")
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class StatementDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class ExpenseClaimRequest(BaseModel):
+    claimant_type: str = Field(pattern="^(employee|supplier|company)$")
+    claimant_reference: str | None = Field(default=None, max_length=80)
+    claimant_name: str = Field(min_length=1, max_length=200)
+    expense_date: date
+    location_code: str = Field(min_length=1, max_length=80)
+    cost_center: str = Field(min_length=1, max_length=80)
+    category_code: str = Field(min_length=1, max_length=80)
+    description: str = Field(min_length=1, max_length=500)
+    receipt_reference: str = Field(min_length=1, max_length=200)
+    tax_invoice_no: str | None = Field(default=None, max_length=160)
+    supplier_trn: str | None = Field(default=None, max_length=15)
+    vat_rate: Decimal = Field(ge=0, le=100, max_digits=7, decimal_places=4)
+    net_amount: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    vat_amount: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    settlement_method: str = Field(pattern="^(reimbursement|direct_payment|petty_cash)$")
+    payment_account_key: str | None = Field(default=None, max_length=36)
+
+
+class ExpenseActionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class PettyCashAdvanceRequest(BaseModel):
+    recipient_reference: str | None = Field(default=None, max_length=80)
+    recipient_name: str = Field(min_length=1, max_length=200)
+    location_code: str = Field(min_length=1, max_length=80)
+    cost_center: str = Field(min_length=1, max_length=80)
+    account_key: str = Field(min_length=1, max_length=36)
+    requested_on: date
+    due_on: date
+    purpose: str = Field(min_length=5, max_length=500)
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+
+
+class PettyCashActionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str | None = Field(default=None, max_length=2000)
+    spent_amount: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
+    returned_amount: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=2)
+    category_code: str | None = Field(default=None, max_length=80)
+    receipt_reference: str | None = Field(default=None, max_length=200)
+
+
+class FixedAssetCreateRequest(BaseModel):
+    asset_name: str = Field(min_length=1, max_length=200)
+    category_code: str = Field(min_length=1, max_length=80)
+    supplier_reference: str | None = Field(default=None, max_length=120)
+    acquisition_reference: str = Field(min_length=1, max_length=160)
+    acquisition_date: date
+    available_for_use_date: date
+    location_code: str = Field(min_length=1, max_length=80)
+    cost_center: str = Field(min_length=1, max_length=80)
+    custodian: str | None = Field(default=None, max_length=200)
+    serial_number: str | None = Field(default=None, max_length=160)
+    useful_life_months: int = Field(ge=1, le=600)
+    cost_amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+    residual_value: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+
+
+class FixedAssetActionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class FixedAssetDisposalRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    disposal_date: date
+    disposal_proceeds: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class FixedAssetRehearsalRequest(BaseModel):
+    stage: str = Field(pattern="^(capitalization|depreciation|disposal)$")
+    as_of_date: date
+
+
+class VatPeriodCreateRequest(BaseModel):
+    period_code: str = Field(min_length=1, max_length=80)
+    starts_on: date
+    ends_on: date
+    due_on: date
+    company_trn: str = Field(pattern=r"^\d{15}$")
+
+
+class VatWorkflowRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class VatAdjustmentCreateRequest(BaseModel):
+    adjustment_type: str = Field(pattern="^(output_increase|output_decrease|input_increase|input_decrease|reverse_charge)$")
+    adjustment_date: date
+    evidence_reference: str = Field(min_length=3, max_length=200)
+    reason: str = Field(min_length=5, max_length=2000)
+    taxable_amount: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    vat_amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+    recovery_percent: Decimal = Field(ge=0, le=100, max_digits=7, decimal_places=4)
+
+
+class PeriodCloseCreateRequest(BaseModel):
+    fiscal_period_key: str = Field(min_length=1, max_length=20)
+
+
+class PeriodCloseWorkflowRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class CloseAdjustmentCreateRequest(BaseModel):
+    adjustment_type: str = Field(pattern="^(accrual|prepayment|fx_revaluation|inventory_valuation)$")
+    adjustment_date: date
+    debit_account: str = Field(min_length=2, max_length=120)
+    credit_account: str = Field(min_length=2, max_length=120)
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+    reversal_on: date | None = None
+    evidence_reference: str = Field(min_length=3, max_length=200)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class CreditLimitRequestCreate(BaseModel):
+    party_code: str = Field(min_length=1, max_length=80)
+    proposed_limit: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    proposed_terms_days: int = Field(ge=0, le=3650)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class CreditWorkflowRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class CreditOverrideRequestCreate(BaseModel):
+    quotation_key: str = Field(min_length=1, max_length=36)
+    valid_until: date
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class DunningRequestCreate(BaseModel):
+    party_code: str = Field(min_length=1, max_length=80)
+    stage: str = Field(pattern="^(reminder_1|reminder_2|final_notice|legal_referral)$")
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class CollectionActionCreate(BaseModel):
+    party_code: str = Field(min_length=1, max_length=80)
+    invoice_no: str | None = Field(default=None, max_length=80)
+    action_date: date
+    action_type: str = Field(pattern="^(call|email|visit|promise_to_pay|final_notice|legal_referral)$")
+    outcome: str = Field(min_length=3, max_length=2000)
+    next_followup_date: date | None = None
+    promise_amount: Decimal | None = Field(default=None, gt=0, max_digits=18, decimal_places=2)
+    promise_date: date | None = None
+
+
+class CollectionTransitionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+
+
 class ProductMasterUpdateRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     name: str = Field(min_length=1, max_length=500)
@@ -356,6 +1181,22 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     app.state.operational_sessions = operational_session_factory(app.state.operational_engine) if operational_url else None
     if app.state.operational_engine:
         initialize_operational_database(app.state.operational_engine)
+        with app.state.operational_sessions() as operational_session:
+            initialize_enterprise_setup(operational_session)
+            initialize_finance_foundation(operational_session)
+            initialize_access_profiles(operational_session, app.state.users_by_id.values())
+            with sessions() as clone_session:
+                finance_snapshot = clone_session.scalar(select(SourceSnapshot).where(SourceSnapshot.name == selected_snapshot))
+                if finance_snapshot is not None:
+                    hrm_batch = initialize_hrm_test_data(clone_session, operational_session, finance_snapshot)
+                    initialize_hrm_operations(operational_session, hrm_batch)
+                    finance_summary = build_accounting_summary(
+                        clone_session, operational_session, snapshot_id=finance_snapshot.id,
+                    )
+                    initialize_finance_reconciliation(
+                        operational_session, snapshot_name=finance_snapshot.name,
+                        trial_balance=finance_summary["trial_balance"],
+                    )
     app.state.sessions = (PersistentSessionStore(app.state.operational_sessions, security_settings["session_secret"])
                           if app.state.production_mode else UatSessionStore())
     if security_settings["allowed_hosts"]:
@@ -379,9 +1220,15 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     def active_session(request: Request):
         return app.state.sessions.get(request.cookies.get(app.state.session_cookie_name))
 
+    def resolve_principal(principal):
+        if principal is None or app.state.operational_sessions is None:
+            return principal
+        with app.state.operational_sessions() as operational_session:
+            return effective_principal(operational_session, principal)
+
     def current_user(request: Request):
         current = active_session(request)
-        return app.state.users_by_id.get(current.principal_id) if current else None
+        return resolve_principal(app.state.users_by_id.get(current.principal_id)) if current else None
 
     def require_user(request: Request, permission: str):
         if not app.state.auth_enabled:
@@ -469,12 +1316,34 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                                 or request.url.path.startswith("/api/v1/inventory-documents")
                                 or request.url.path.startswith("/api/v1/goods-receipts")
                                 or request.url.path.startswith("/api/v1/sales-returns")
+                                or request.url.path.startswith("/api/v1/sales-orders")
+                                or request.url.path.startswith("/api/v1/deliveries")
+                                or request.url.path.startswith("/api/v1/customer-invoices")
+                                or request.url.path.startswith("/api/v1/pos")
+                                or request.url.path.startswith("/api/v1/van-sales")
+                                or request.url.path.startswith("/api/v1/crm")
+                                or request.url.path.startswith("/api/v1/credit-control")
                                 or request.url.path.startswith("/api/v1/purchase-returns")
                                 or request.url.path.startswith("/api/v1/payments")
+                                or request.url.path.startswith("/api/v1/cash-management")
+                                or request.url.path.startswith("/api/v1/expense-management")
+                                or request.url.path.startswith("/api/v1/fixed-assets")
+                                or request.url.path.startswith("/api/v1/vat-control")
+                                or request.url.path.startswith("/api/v1/period-close")
+                                or request.url.path.startswith("/api/v1/close-reporting")
+                                or request.url.path.startswith("/api/v1/audit-compliance")
+                                or request.url.path.startswith("/api/v1/cutover-rehearsal")
                                 or request.url.path.startswith("/api/v1/posting/")
                                 or request.url.path.startswith("/api/v1/integrated-posting-batches")
                                 or request.url.path.startswith("/api/v1/data-reviews")
-                                or request.url.path.startswith("/api/v1/master-data/")) and request.method in {"POST", "PUT", "PATCH"}
+                                or request.url.path.startswith("/api/v1/master-data/")
+                                or request.url.path.startswith("/api/v1/setup/enterprise")
+                                or request.url.path.startswith("/api/v1/finance/approvals")
+                                or request.url.path.startswith("/api/v1/finance/reconciliation")
+                                or request.url.path.startswith("/api/v1/general-ledger")
+                                or request.url.path.startswith("/api/v1/access-control")
+                                or request.url.path.startswith("/api/v1/hrm/")
+                                or request.url.path.startswith("/api/v1/procurement")) and request.method in {"POST", "PUT", "PATCH", "DELETE"}
         if request.method not in {"GET", "HEAD", "OPTIONS"} and request.url.path not in auth_posts and not operational_mutation:
             return secure_response(JSONResponse(
                 status_code=405,
@@ -522,6 +1391,11 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             if snapshot_id:
                 audit(session, snapshot_id, "auth.login", "denied", request)
             raise HTTPException(status_code=401, detail="Invalid username or password")
+        user = resolve_principal(user)
+        if user is None:
+            if snapshot_id:
+                audit(session, snapshot_id, "auth.login", "access_profile_disabled", request)
+            raise HTTPException(status_code=403, detail="This ERP access profile is not active")
         app.state.sessions.clear_attempts(attempt_key)
         token, login_session = app.state.sessions.create(user.id, app.state.session_ttl)
         if snapshot_id:
@@ -541,7 +1415,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         current = active_session(request) if app.state.auth_enabled else None
         if not current:
             return {"authenticated": False, "authentication_enabled": app.state.auth_enabled}
-        user = app.state.users_by_id.get(current.principal_id)
+        user = resolve_principal(app.state.users_by_id.get(current.principal_id))
         if not user:
             return {"authenticated": False, "authentication_enabled": True}
         return {"authenticated": True, "authentication_enabled": True,
@@ -582,14 +1456,861 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             "snapshot": selected_snapshot,
             "snapshot_found": exists == 1,
             "posting_enabled": app.state.posting_enabled,
-            "hr_payroll_enabled": False,
+            "hrm_enabled": app.state.operational_sessions is not None,
+            "payroll_enabled": False,
             "authentication_enabled": app.state.auth_enabled,
             "production_mode": app.state.production_mode,
             "session_backend": "database" if app.state.production_mode else "process_local",
             "operational_database": operational_status,
         }
 
-    def draft_payload(draft) -> dict:
+    @app.get("/api/v1/setup/enterprise")
+    def enterprise_setup(operational_session=Depends(operational_session_dependency)):
+        """Read the target-ERP configuration without exposing or editing source evidence."""
+        return enterprise_setup_payload(operational_session)
+
+    @app.get("/api/v1/finance/foundation")
+    def finance_foundation(operational_session=Depends(operational_session_dependency)):
+        return finance_foundation_payload(operational_session)
+
+    def finance_permission(resource_type: str, action: str) -> str:
+        permissions = {
+            ("chart_account", "request"): "finance.chart.prepare",
+            ("chart_account", "decide"): "finance.chart.approve",
+            ("account_mapping", "request"): "finance.mapping.prepare",
+            ("account_mapping", "decide"): "finance.mapping.approve",
+        }
+        permission = permissions.get((resource_type, action))
+        if permission is None:
+            raise HTTPException(status_code=422, detail="Unsupported finance approval resource type")
+        return permission
+
+    @app.post("/api/v1/finance/approvals/{resource_type}/{resource_key}/request")
+    def submit_finance_approval(resource_type: str, resource_key: str,
+                                payload: FinanceApprovalSubmissionRequest, request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, finance_permission(resource_type, "request"))
+        try:
+            request_finance_approval(
+                operational_session, actor=user.username, resource_type=resource_type,
+                resource_key=resource_key, note=payload.note,
+            )
+            return finance_foundation_payload(operational_session)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/finance/approvals/{resource_type}/{resource_key}/{action}")
+    def resolve_finance_approval(resource_type: str, resource_key: str, action: str,
+                                 payload: FinanceApprovalDecisionRequest, request: Request,
+                                 operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, finance_permission(resource_type, "decide"))
+        try:
+            decide_finance_approval(
+                operational_session, actor=user.username, resource_type=resource_type,
+                resource_key=resource_key, action=action,
+                expected_revision=payload.expected_revision, note=payload.note,
+            )
+            return finance_foundation_payload(operational_session)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/finance/reconciliation")
+    def finance_reconciliation(request: Request,
+                               snapshot: SourceSnapshot = Depends(snapshot_dependency),
+                               session: Session = Depends(session_dependency),
+                               operational_session=Depends(operational_session_dependency)):
+        require_finance_report_scope(request, snapshot, session)
+        return finance_reconciliation_payload(operational_session)
+
+    @app.post("/api/v1/finance/reconciliation/{review_key}/request")
+    def submit_finance_reconciliation(
+        review_key: str, payload: FinanceReconciliationSubmissionRequest, request: Request,
+        operational_session=Depends(operational_session_dependency),
+    ):
+        user = require_csrf(request, "finance.reconciliation.prepare")
+        try:
+            request_reconciliation_review(
+                operational_session, actor=user.username, review_key=review_key,
+                resolution_type=payload.resolution_type, note=payload.note,
+            )
+            return finance_reconciliation_payload(operational_session)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/finance/reconciliation/{review_key}/{action}")
+    def resolve_finance_reconciliation(
+        review_key: str, action: str, payload: FinanceReconciliationDecisionRequest,
+        request: Request, operational_session=Depends(operational_session_dependency),
+    ):
+        user = require_csrf(request, "finance.reconciliation.approve")
+        try:
+            decide_reconciliation_review(
+                operational_session, actor=user.username, review_key=review_key, action=action,
+                expected_revision=payload.expected_revision, note=payload.note,
+            )
+            return finance_reconciliation_payload(operational_session)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/general-ledger")
+    def general_ledger(
+        request: Request, account_code: str | None = Query(default=None, max_length=40),
+        snapshot: SourceSnapshot = Depends(snapshot_dependency),
+        session: Session = Depends(session_dependency),
+        operational_session=Depends(operational_session_dependency),
+    ):
+        require_finance_report_scope(request, snapshot, session)
+        if account_code and not operational_session.scalar(select(OperationalChartAccount.id).where(
+            OperationalChartAccount.company_code == "ASAS",
+            OperationalChartAccount.account_code == account_code,
+        )):
+            raise HTTPException(status_code=404, detail="General-ledger account was not found")
+        return general_ledger_payload(operational_session, account_code=account_code)
+
+    def find_general_journal(operational_session: Session, journal_key: str, *, lock: bool = False):
+        query = select(OperationalGeneralJournal).where(
+            OperationalGeneralJournal.company_code == "ASAS",
+            OperationalGeneralJournal.journal_key == journal_key,
+        )
+        journal = operational_session.scalar(query.with_for_update() if lock else query)
+        if journal is None:
+            raise HTTPException(status_code=404, detail="General journal was not found")
+        return journal
+
+    @app.post("/api/v1/general-ledger/journals", status_code=201)
+    def new_general_journal(payload: GeneralJournalRequest, request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "journal.prepare")
+        try:
+            create_general_journal(
+                operational_session, actor=user.username, journal_date=payload.journal_date,
+                branch_code=payload.branch_code, reference=payload.reference,
+                description=payload.description,
+                lines=[row.model_dump() for row in payload.lines],
+            )
+            return general_ledger_payload(operational_session)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.put("/api/v1/general-ledger/journals/{journal_key}")
+    def update_general_journal(journal_key: str, payload: GeneralJournalUpdateRequest,
+                               request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "journal.prepare")
+        journal = find_general_journal(operational_session, journal_key, lock=True)
+        try:
+            replace_general_journal(
+                operational_session, journal, actor=user.username,
+                expected_revision=payload.expected_revision, journal_date=payload.journal_date,
+                branch_code=payload.branch_code, reference=payload.reference,
+                description=payload.description,
+                lines=[row.model_dump() for row in payload.lines],
+            )
+            return general_ledger_payload(operational_session)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/general-ledger/journals/{journal_key}/{action}")
+    def decide_general_journal(journal_key: str, action: str,
+                               payload: GeneralJournalDecisionRequest, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        if action not in {"request", "approve", "reject"}:
+            raise HTTPException(status_code=404, detail="Unsupported general-journal action")
+        permission = "journal.prepare" if action == "request" else "journal.approve"
+        user = require_csrf(request, permission)
+        journal = find_general_journal(operational_session, journal_key, lock=True)
+        try:
+            transition_general_journal(
+                operational_session, journal, actor=user.username, action=action,
+                expected_revision=payload.expected_revision, note=payload.note,
+            )
+            return general_ledger_payload(operational_session)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def access_payload(operational_session):
+        return access_control_payload(
+            operational_session, provisioned_logins=set(app.state.users_by_login),
+        )
+
+    @app.get("/api/v1/access-control")
+    def access_control(request: Request, operational_session=Depends(operational_session_dependency)):
+        require_any_user(request, {"access.review", "user.manage", "role.manage", "enterprise.setup"})
+        return access_payload(operational_session)
+
+    @app.get("/api/v1/hrm")
+    def hrm_workspace(request: Request, q: str = Query("", max_length=120),
+                      limit: int = Query(500, ge=1, le=500), offset: int = Query(0, ge=0),
+                      operational_session=Depends(operational_session_dependency)):
+        user = require_any_user(request, {"hrm.read", "hrm.manage", "enterprise.setup"})
+        result = hrm_payload(operational_session, query=q, limit=limit, offset=offset)
+        result["operations"] = hrm_operations_payload(
+            operational_session, principal_username=user.username if user else None,
+        )
+        result["lifecycle"] = hrm_lifecycle_payload(operational_session)
+        result["permissions"] = sorted(user.permissions) if user else []
+        return result
+
+    def hrm_result(operational_session, user):
+        result = hrm_payload(operational_session, query="", limit=500, offset=0)
+        result["operations"] = hrm_operations_payload(
+            operational_session, principal_username=user.username if user else None,
+        )
+        result["lifecycle"] = hrm_lifecycle_payload(operational_session)
+        result["permissions"] = sorted(user.permissions) if user else []
+        return result
+
+    @app.get("/api/v1/hrm/self-service")
+    def hrm_self_service(request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_any_user(request, {"hrm.self.read", "hrm.read", "hrm.manage", "enterprise.setup"})
+        result = hrm_result(operational_session, user)
+        own = next((row for row in result["employees"]
+                    if (row.get("username") or "").casefold() == user.username.casefold()), None)
+        if own is None:
+            result["employees"] = []
+            result["attendance"] = []
+        else:
+            result["employees"] = [own]
+            result["attendance"] = [row for row in result["attendance"]
+                                    if row.get("employee_name") == own.get("display_name")]
+        operations = result["operations"]
+        own_key = operations["self_service"]["employee_key"]
+        operations["profiles"] = [row for row in operations["profiles"] if row["employee_key"] == own_key]
+        operations["leave_requests"] = [row for row in operations["leave_requests"] if row["employee_key"] == own_key]
+        operations["shift_assignments"] = [row for row in operations["shift_assignments"] if row["employee_key"] == own_key]
+        operations["attendance_corrections"] = [row for row in operations["attendance_corrections"]
+                                                 if row["attendance_id"] in {item["id"] for item in result["attendance"]}]
+        return result
+
+    @app.post("/api/v1/hrm/departments", status_code=201)
+    def add_hrm_department(payload: HrmDepartmentRequest, request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.manage", "enterprise.setup"})
+        try:
+            create_department(operational_session, code=payload.code, name=payload.name, actor=user.username)
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/designations", status_code=201)
+    def add_hrm_designation(payload: HrmDesignationRequest, request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.manage", "enterprise.setup"})
+        try:
+            create_designation(operational_session, code=payload.code, name=payload.name,
+                               department_code=payload.department_code, actor=user.username)
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/shifts", status_code=201)
+    def add_hrm_shift(payload: HrmShiftRequest, request: Request,
+                      operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"shift.manage", "hrm.manage", "enterprise.setup"})
+        try:
+            create_shift(operational_session, name=payload.name, shift_type=payload.shift_type,
+                         start_time=payload.start_time, end_time=payload.end_time, actor=user.username)
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/holidays", status_code=201)
+    def add_hrm_holiday(payload: HrmHolidayRequest, request: Request,
+                        operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.manage", "enterprise.setup"})
+        try:
+            create_holiday(operational_session, holiday_date=payload.holiday_date, name=payload.name,
+                           department_code=payload.department_code, actor=user.username)
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/employee-changes", status_code=201)
+    def add_hrm_employee_change(payload: HrmEmployeeChangeRequest, request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.employee.prepare", "hrm.manage", "enterprise.setup"})
+        try:
+            request_employee_change(operational_session, actor=user.username, **payload.model_dump())
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/employee-changes/{profile_key}/{action}")
+    def decide_hrm_employee(profile_key: str, action: str, payload: HrmDecisionRequest, request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.employee.approve", "hrm.manage", "enterprise.setup"})
+        try:
+            decide_employee_change(operational_session, profile_key=profile_key, action=action,
+                                   expected_revision=payload.expected_revision, note=payload.note, actor=user.username)
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def own_employee_key(operational_session, username: str) -> str | None:
+        employee = operational_session.scalar(select(OperationalHrmEmployee).where(
+            func.lower(OperationalHrmEmployee.username) == username.casefold()))
+        return employee.employee_key if employee else None
+
+    @app.post("/api/v1/hrm/leave-requests", status_code=201)
+    def add_hrm_leave(payload: HrmLeaveRequest, request: Request,
+                      operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"leave.prepare", "leave.self.create", "hrm.manage", "enterprise.setup"})
+        employee_key = payload.employee_key or own_employee_key(operational_session, user.username)
+        if not employee_key:
+            raise HTTPException(status_code=422, detail="No HRM employee is linked to this login")
+        if "leave.self.create" in user.permissions and not {"leave.prepare", "hrm.manage", "enterprise.setup"}.intersection(user.permissions):
+            if employee_key != own_employee_key(operational_session, user.username):
+                raise HTTPException(status_code=403, detail="Self-service leave may only be requested for the signed-in employee")
+        try:
+            values = payload.model_dump(exclude={"employee_key"}); values["employee_key"] = employee_key
+            create_leave_request(operational_session, actor=user.username, **values)
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/leave-requests/{leave_key}/{action}")
+    def decide_hrm_leave(leave_key: str, action: str, payload: HrmDecisionRequest, request: Request,
+                         operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"leave.approve", "hrm.manage", "enterprise.setup"})
+        try:
+            decide_leave(operational_session, leave_key=leave_key, action=action,
+                         expected_revision=payload.expected_revision, note=payload.note, actor=user.username)
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/attendance-corrections", status_code=201)
+    def add_hrm_attendance_correction(payload: HrmAttendanceCorrectionRequest, request: Request,
+                                      operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"attendance.prepare", "attendance.self.create", "hrm.manage", "enterprise.setup"})
+        if "attendance.self.create" in user.permissions and not {"attendance.prepare", "hrm.manage", "enterprise.setup"}.intersection(user.permissions):
+            attendance = operational_session.get(OperationalHrmAttendance, payload.attendance_id)
+            own = own_employee_key(operational_session, user.username)
+            employee = operational_session.get(OperationalHrmEmployee, attendance.employee_id) if attendance else None
+            if not employee or employee.employee_key != own:
+                raise HTTPException(status_code=403, detail="Self-service correction may only target the signed-in employee")
+        try:
+            create_attendance_correction(operational_session, actor=user.username, **payload.model_dump())
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/attendance-corrections/{correction_key}/{action}")
+    def decide_hrm_attendance(correction_key: str, action: str, payload: HrmDecisionRequest, request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"attendance.approve", "hrm.manage", "enterprise.setup"})
+        try:
+            decide_attendance_correction(operational_session, correction_key=correction_key, action=action,
+                                         expected_revision=payload.expected_revision, note=payload.note, actor=user.username)
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/shift-assignments", status_code=201)
+    def add_hrm_shift_assignment(payload: HrmShiftAssignmentRequest, request: Request,
+                                 operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"shift.manage", "hrm.manage", "enterprise.setup"})
+        try:
+            assign_shift(operational_session, actor=user.username, **payload.model_dump())
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/workforce-requests", status_code=201)
+    def add_hrm_workforce_request(payload: HrmWorkforceRequest, request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.lifecycle.prepare", "hrm.manage", "enterprise.setup"})
+        try:
+            create_workforce_request(operational_session, actor=user.username, **payload.model_dump())
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/workforce-requests/{request_key}/{action}")
+    def decide_hrm_workforce_request(request_key: str, action: str, payload: HrmDecisionRequest,
+                                     request: Request,
+                                     operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.lifecycle.approve", "hrm.manage", "enterprise.setup"})
+        try:
+            decide_workforce_request(operational_session, request_key=request_key, action=action,
+                expected_revision=payload.expected_revision, note=payload.note, actor=user.username)
+            return hrm_result(operational_session, user)
+        except (ValueError, PermissionError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/candidates", status_code=201)
+    def add_hrm_candidate(payload: HrmCandidateRequest, request: Request,
+                          operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.lifecycle.prepare", "hrm.manage", "enterprise.setup"})
+        try:
+            create_candidate(operational_session, actor=user.username, **payload.model_dump())
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/candidates/{candidate_key}/stage")
+    def move_hrm_candidate(candidate_key: str, payload: HrmCandidateStageRequest, request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.lifecycle.prepare", "hrm.manage", "enterprise.setup"})
+        try:
+            move_candidate(operational_session, candidate_key=candidate_key, actor=user.username,
+                           **payload.model_dump())
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/employee-documents", status_code=201)
+    def add_hrm_document(payload: HrmEmployeeDocumentRequest, request: Request,
+                         operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.lifecycle.prepare", "hrm.manage", "enterprise.setup"})
+        try:
+            add_employee_document(operational_session, actor=user.username, **payload.model_dump())
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/lifecycle-cases", status_code=201)
+    def add_hrm_lifecycle_case(payload: HrmLifecycleCaseRequest, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"hrm.lifecycle.prepare", "hrm.manage", "enterprise.setup"})
+        try:
+            create_lifecycle_case(operational_session, actor=user.username, **payload.model_dump())
+            return hrm_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/hrm/lifecycle-cases/{case_key}/{action}")
+    def transition_hrm_lifecycle_case(case_key: str, action: str, payload: HrmDecisionRequest,
+                                      request: Request,
+                                      operational_session=Depends(operational_session_dependency)):
+        permission = "hrm.lifecycle.approve" if action in {"approve", "reject"} else "hrm.lifecycle.prepare"
+        user = require_any_csrf(request, {permission, "hrm.manage", "enterprise.setup"})
+        try:
+            transition_lifecycle_case(operational_session, case_key=case_key, action=action,
+                expected_revision=payload.expected_revision, note=payload.note, actor=user.username)
+            return hrm_result(operational_session, user)
+        except (ValueError, PermissionError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    PROCUREMENT_READ = {"purchase.requisition.create", "purchase.requisition.approve", "rfq.create", "supplier_quote.manage",
+                        "purchase_order.prepare", "purchase_order.approve", "supplier_bill.prepare",
+                        "supplier_bill.approve", "supplier_bill.tolerance.approve",
+                        "supplier_adjustment.prepare", "supplier_adjustment.approve",
+                        "supplier_bill.rehearse", "match_tolerance.prepare", "match_tolerance.approve",
+                        "posting.execute", "posting.reverse", "enterprise.setup"}
+
+    def procurement_scope(user) -> tuple[str, ...]:
+        return tuple(user.allowed_locations) if user else ("*",)
+
+    def procurement_result(operational_session: Session, user) -> dict:
+        scope = procurement_scope(user)
+        result = procurement_payload(operational_session, allowed_locations=scope)
+        invoices = invoice_payload(operational_session, allowed_locations=scope)
+        invoice_keys = {row["invoice_key"] for row in invoices}
+        posting_rows = list(operational_session.scalars(select(OperationalIntegratedPostingBatch).where(
+            OperationalIntegratedPostingBatch.resource_type == "supplier_invoice",
+            OperationalIntegratedPostingBatch.resource_key.in_(invoice_keys),
+            OperationalIntegratedPostingBatch.batch_kind == "posting"))) if invoice_keys else []
+        postings = {row.resource_key: row for row in posting_rows}
+        for invoice in invoices:
+            batch = postings.get(invoice["invoice_key"])
+            invoice["posting_enabled"] = app.state.posting_enabled
+            invoice["posting"] = ({"batch_key": batch.batch_key, "status": batch.status,
+                "posted_at": batch.posted_at, "posted_by": batch.posted_by,
+                "posting_fingerprint": batch.posting_fingerprint} if batch else None)
+        result["supplier_invoices"] = invoices
+        adjustments = adjustment_payload(operational_session, allowed_locations=scope)
+        adjustment_keys = {row["adjustment_key"] for row in adjustments}
+        adjustment_posting_rows = list(operational_session.scalars(select(OperationalIntegratedPostingBatch).where(
+            OperationalIntegratedPostingBatch.resource_type == "supplier_adjustment",
+            OperationalIntegratedPostingBatch.resource_key.in_(adjustment_keys),
+            OperationalIntegratedPostingBatch.batch_kind == "posting"))) if adjustment_keys else []
+        adjustment_postings = {row.resource_key: row for row in adjustment_posting_rows}
+        for adjustment in adjustments:
+            batch = adjustment_postings.get(adjustment["adjustment_key"])
+            adjustment["posting_enabled"] = app.state.posting_enabled
+            adjustment["posting"] = ({"batch_key": batch.batch_key, "status": batch.status,
+                "posted_at": batch.posted_at, "posted_by": batch.posted_by,
+                "posting_fingerprint": batch.posting_fingerprint} if batch else None)
+        result["supplier_adjustments"] = adjustments
+        result["match_policy"] = policy_payload(operational_session)
+        result["controls"].update({
+            "posting_enabled": app.state.posting_enabled,
+            "supplier_invoices": len(invoices),
+            "invoice_match_exceptions": sum(row["match_status"] == "exception" for row in invoices),
+            "approved_supplier_invoices": sum(row["status"] == "approved" for row in invoices),
+            "tax_document_exceptions": sum((row["tax_document"] or {}).get("validation_status") == "exception" for row in invoices),
+            "invoice_posting_rehearsals": sum(row["posting_rehearsal"] is not None for row in invoices),
+            "posted_supplier_invoices": sum(row["status"] == "posted" for row in invoices),
+            "supplier_adjustments": len(adjustments),
+            "pending_supplier_adjustments": sum(row["status"] == "submitted" for row in adjustments),
+            "adjustment_posting_rehearsals": sum(row["posting_rehearsal"] is not None for row in adjustments),
+            "posted_supplier_adjustments": sum(row["status"] == "posted" for row in adjustments),
+        })
+        return result
+
+    @app.get("/api/v1/procurement")
+    def procurement_workspace(request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        user = require_any_user(request, PROCUREMENT_READ)
+        return procurement_result(operational_session, user)
+
+    @app.post("/api/v1/procurement/requisitions", status_code=201)
+    def add_procurement_requisition(payload: ProcurementRequisitionRequest, request: Request,
+                                    operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"purchase.requisition.create", "enterprise.setup"})
+        try:
+            if not location_allowed(user, payload.location_code):
+                raise HTTPException(status_code=403, detail="Receiving location is outside the user's operational scope")
+            create_requisition(operational_session, actor=user.username, **payload.model_dump())
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/requisitions/{requisition_key}/{action}")
+    def change_procurement_requisition(requisition_key: str, action: str,
+                                       payload: ProcurementDecisionRequest, request: Request,
+                                       operational_session=Depends(operational_session_dependency)):
+        permission = ({"purchase.requisition.create", "enterprise.setup"} if action in {"submit", "cancel"}
+                      else {"purchase.requisition.approve", "enterprise.setup"})
+        user = require_any_csrf(request, permission)
+        try:
+            transition_requisition(operational_session, requisition_key=requisition_key, action=action,
+                                   expected_revision=payload.expected_revision, note=payload.note,
+                                   actor=user.username, allowed_locations=procurement_scope(user))
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/rfqs", status_code=201)
+    def add_procurement_rfq(payload: ProcurementRfqRequest, request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"rfq.create", "enterprise.setup"})
+        try:
+            create_rfq(operational_session, actor=user.username,
+                       allowed_locations=procurement_scope(user), **payload.model_dump())
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/rfqs/{rfq_key}/quotations", status_code=201)
+    def add_supplier_quotation(rfq_key: str, payload: ProcurementQuoteRequest, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"supplier_quote.manage", "enterprise.setup"})
+        try:
+            capture_quote(operational_session, rfq_key=rfq_key, actor=user.username,
+                          allowed_locations=procurement_scope(user), **payload.model_dump())
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/rfqs/{rfq_key}/award", status_code=201)
+    def award_supplier_quotation(rfq_key: str, payload: ProcurementAwardRequest, request: Request,
+                                 operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"purchase_order.prepare", "enterprise.setup"})
+        try:
+            award_quote(operational_session, rfq_key=rfq_key, actor=user.username,
+                        allowed_locations=procurement_scope(user), **payload.model_dump())
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/purchase-orders/{purchase_order_key}/{action}")
+    def change_purchase_order(purchase_order_key: str, action: str,
+                              payload: ProcurementDecisionRequest, request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        permission = ({"purchase_order.prepare", "enterprise.setup"} if action in {"submit", "cancel"}
+                      else {"purchase_order.approve", "enterprise.setup"})
+        user = require_any_csrf(request, permission)
+        try:
+            transition_purchase_order(operational_session, purchase_order_key=purchase_order_key,
+                                      action=action, expected_revision=payload.expected_revision,
+                                      note=payload.note, actor=user.username,
+                                      allowed_locations=procurement_scope(user))
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/supplier-invoices", status_code=201)
+    def add_supplier_invoice(payload: SupplierInvoiceRequest, request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"supplier_bill.prepare", "enterprise.setup"})
+        try:
+            create_supplier_invoice(operational_session, actor=user.username,
+                allowed_locations=procurement_scope(user), **payload.model_dump())
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/supplier-invoices/{invoice_key}/match")
+    def match_supplier_invoice(invoice_key: str, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"supplier_bill.prepare", "enterprise.setup"})
+        invoice = operational_session.scalar(select(OperationalSupplierInvoice).where(
+            OperationalSupplierInvoice.invoice_key == invoice_key).with_for_update())
+        if not invoice or not location_allowed(user, invoice.location_code):
+            raise HTTPException(status_code=404, detail="Supplier invoice not found")
+        try:
+            evaluate_invoice_match(operational_session, invoice, actor=user.username)
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/supplier-invoices/{invoice_key}/posting-rehearsal")
+    def rehearse_supplier_invoice(invoice_key: str, request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"supplier_bill.rehearse", "enterprise.setup"})
+        invoice = operational_session.scalar(select(OperationalSupplierInvoice).where(
+            OperationalSupplierInvoice.invoice_key == invoice_key).with_for_update())
+        if not invoice or not location_allowed(user, invoice.location_code):
+            raise HTTPException(status_code=404, detail="Supplier invoice not found")
+        try:
+            return rehearse_supplier_invoice_posting(operational_session, invoice, actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/supplier-invoices/{invoice_key}/{action}")
+    def approve_supplier_invoice(invoice_key: str, action: str, payload: ProcurementDecisionRequest,
+                                 request: Request,
+                                 operational_session=Depends(operational_session_dependency)):
+        if action not in {"approve", "reject", "approve-tolerance"}:
+            raise HTTPException(status_code=404, detail="Supplier invoice action not found")
+        permission = ({"supplier_bill.tolerance.approve", "enterprise.setup"}
+                      if action == "approve-tolerance"
+                      else {"supplier_bill.approve", "enterprise.setup"})
+        user = require_any_csrf(request, permission)
+        invoice = operational_session.scalar(select(OperationalSupplierInvoice).where(
+            OperationalSupplierInvoice.invoice_key == invoice_key).with_for_update())
+        if not invoice or not location_allowed(user, invoice.location_code):
+            raise HTTPException(status_code=404, detail="Supplier invoice not found")
+        try:
+            if action == "approve-tolerance":
+                approve_invoice_tolerance(operational_session, invoice,
+                    expected_revision=payload.expected_revision, note=payload.note, actor=user.username)
+            else:
+                decide_supplier_invoice(operational_session, invoice, action=action,
+                    expected_revision=payload.expected_revision, note=payload.note, actor=user.username)
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/match-policy/request")
+    def request_match_policy(payload: MatchToleranceRequest, request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"match_tolerance.prepare", "enterprise.setup"})
+        try:
+            request_policy_change(operational_session, actor=user.username, **payload.model_dump())
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/match-policy/{action}")
+    def approve_match_policy(action: str, payload: ProcurementDecisionRequest, request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        if action not in {"approve", "reject"}:
+            raise HTTPException(status_code=404, detail="Match-policy action not found")
+        user = require_any_csrf(request, {"match_tolerance.approve", "enterprise.setup"})
+        try:
+            decide_policy_change(operational_session, action=action,
+                expected_revision=payload.expected_revision, note=payload.note, actor=user.username)
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/supplier-adjustments", status_code=201)
+    def add_supplier_adjustment(payload: SupplierAdjustmentRequest, request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"supplier_adjustment.prepare", "enterprise.setup"})
+        try:
+            create_supplier_adjustment(operational_session, actor=user.username,
+                allowed_locations=procurement_scope(user), **payload.model_dump())
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/supplier-adjustments/{adjustment_key}/posting-rehearsal")
+    def rehearse_supplier_adjustment(adjustment_key: str, request: Request,
+                                     operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"supplier_bill.rehearse", "enterprise.setup"})
+        adjustment = operational_session.scalar(select(OperationalSupplierAdjustment).where(
+            OperationalSupplierAdjustment.adjustment_key == adjustment_key).with_for_update())
+        if not adjustment or not location_allowed(user, adjustment.location_code):
+            raise HTTPException(status_code=404, detail="Supplier adjustment not found")
+        try:
+            return rehearse_supplier_adjustment_posting(operational_session, adjustment, actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/procurement/supplier-adjustments/{adjustment_key}/{action}")
+    def change_supplier_adjustment(adjustment_key: str, action: str,
+                                   payload: ProcurementDecisionRequest, request: Request,
+                                   operational_session=Depends(operational_session_dependency)):
+        if action not in {"submit", "cancel", "approve", "reject"}:
+            raise HTTPException(status_code=404, detail="Supplier-adjustment action not found")
+        permission = ({"supplier_adjustment.prepare", "enterprise.setup"}
+                      if action in {"submit", "cancel"}
+                      else {"supplier_adjustment.approve", "enterprise.setup"})
+        user = require_any_csrf(request, permission)
+        adjustment = operational_session.scalar(select(OperationalSupplierAdjustment).where(
+            OperationalSupplierAdjustment.adjustment_key == adjustment_key).with_for_update())
+        if not adjustment or not location_allowed(user, adjustment.location_code):
+            raise HTTPException(status_code=404, detail="Supplier adjustment not found")
+        try:
+            transition_supplier_adjustment(operational_session, adjustment, action=action,
+                expected_revision=payload.expected_revision, note=payload.note, actor=user.username)
+            return procurement_result(operational_session, user)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/access-control/users", status_code=201)
+    def create_access_user(payload: AccessUserRequest, request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"user.manage", "enterprise.setup"})
+        try:
+            create_user_profile(
+                operational_session, actor=user.username, login_name=payload.login_name,
+                display_name=payload.display_name,
+                identity_ready=payload.login_name.casefold() in app.state.users_by_login,
+            )
+            return access_payload(operational_session)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.patch("/api/v1/access-control/users/{user_key}/status")
+    def change_access_user_status(user_key: str, payload: AccessUserStatusRequest, request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"user.manage", "enterprise.setup"})
+        target = next((row for row in access_payload(operational_session)["users"]
+                       if row["user_key"] == user_key), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail="ERP user profile was not found")
+        try:
+            set_user_status(
+                operational_session, actor=user.username, user_key=user_key, status=payload.status,
+                identity_ready=bool(target["identity_ready"]),
+            )
+            return access_payload(operational_session)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/access-control/users/{user_key}/assignments", status_code=201)
+    def create_role_assignment(user_key: str, payload: RoleAssignmentRequest, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"role.manage", "user.manage", "enterprise.setup"})
+        try:
+            assign_role(
+                operational_session, actor=user.username, user_key=user_key,
+                role_code=payload.role_code, company_code=payload.company_code,
+                branch_code=payload.branch_code, warehouse_code=payload.warehouse_code,
+                van_code=payload.van_code, approval_limit_aed=payload.approval_limit_aed,
+                effective_from=payload.effective_from, effective_to=payload.effective_to,
+            )
+            return access_payload(operational_session)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.delete("/api/v1/access-control/users/{user_key}/assignments/{assignment_id}")
+    def delete_role_assignment(user_key: str, assignment_id: int, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"role.manage", "user.manage", "enterprise.setup"})
+        try:
+            revoke_role(operational_session, actor=user.username, user_key=user_key,
+                        assignment_id=assignment_id)
+            return access_payload(operational_session)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.patch("/api/v1/setup/enterprise/company")
+    def update_enterprise_company(payload: CompanyProfileSetupRequest, request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "enterprise.setup")
+        try:
+            return update_company_profile(operational_session, actor=user.username,
+                legal_name=payload.legal_name, profile_updates={
+                    "registered_address": payload.registered_address,
+                    "tax_registration_number": payload.tax_registration_number,
+                    "trade_license_number": payload.trade_license_number,
+                    "logo_reference": payload.logo_reference,
+                })
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/setup/enterprise/branches", status_code=201)
+    def create_enterprise_branch(payload: BranchSetupRequest, request: Request,
+                                 operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "enterprise.setup")
+        try:
+            return add_branch(operational_session, actor=user.username,
+                              branch_code=payload.branch_code, name=payload.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/setup/enterprise/warehouses", status_code=201)
+    def create_enterprise_warehouse(payload: WarehouseSetupRequest, request: Request,
+                                    operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "enterprise.setup")
+        try:
+            return add_warehouse(operational_session, actor=user.username,
+                                 branch_code=payload.branch_code, warehouse_code=payload.warehouse_code,
+                                 name=payload.name, warehouse_type=payload.warehouse_type)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/setup/enterprise/vans", status_code=201)
+    def create_enterprise_van(payload: VanSetupRequest, request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "enterprise.setup")
+        try:
+            return add_van(operational_session, actor=user.username, van_code=payload.van_code,
+                           name=payload.name, assigned_branch_code=payload.assigned_branch_code)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/setup/enterprise/{unit_kind}/{unit_code}/{action}")
+    def decide_operating_unit(unit_kind: str, unit_code: str, action: str,
+                              payload: OperatingUnitDecisionRequest, request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        required_permission = "enterprise.setup" if action == "request_activation" else "enterprise.approve"
+        user = require_csrf(request, required_permission)
+        try:
+            return transition_operating_unit(operational_session, actor=user.username,
+                unit_kind=unit_kind, unit_code=unit_code, action=action,
+                expected_revision=payload.expected_revision, note=payload.note)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def draft_payload(draft, operational_session: Session | None = None) -> dict:
+        rehearsal = None
+        posting = None
+        if operational_session is not None and draft.document_type == "sale":
+            rehearsal = operational_session.scalar(select(OperationalSalesInvoicePostingRehearsal).where(
+                OperationalSalesInvoicePostingRehearsal.sales_invoice_id == draft.id,
+                OperationalSalesInvoicePostingRehearsal.invoice_revision == draft.revision))
+            posting = operational_session.scalar(select(OperationalIntegratedPostingBatch).where(
+                OperationalIntegratedPostingBatch.resource_type == "sales_invoice",
+                OperationalIntegratedPostingBatch.resource_key == draft.draft_key,
+                OperationalIntegratedPostingBatch.batch_kind == "posting").order_by(
+                    OperationalIntegratedPostingBatch.posting_sequence.desc()))
         return {
             "draft_key": draft.draft_key, "draft_no": draft.draft_no,
             "document_type": draft.document_type, "party_code": draft.party_code,
@@ -601,6 +2322,10 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             "created_at": draft.created_at, "notes": draft.notes,
             "revision": draft.revision, "state_changed_at": draft.state_changed_at,
             "state_changed_by": draft.state_changed_by,
+            "posting_rehearsal": (sales_invoice_rehearsal_payload(rehearsal, draft)
+                                  if rehearsal else None),
+            "posting": ({"batch_key": posting.batch_key, "status": posting.status}
+                        if posting else None),
             "lines": [{"line_no": line.line_no, "sku": line.sku,
                        "product_name": line.product_name_snapshot, "quantity": line.quantity,
                        "uom": line.uom, "canonical_uom": line.canonical_uom,
@@ -624,10 +2349,17 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         open_periods = operational_session.scalar(select(func.count(OperationalFiscalPeriod.id)).where(
             OperationalFiscalPeriod.status == "open",
             OperationalFiscalPeriod.rehearsal_enabled.is_(True))) or 0
-        return {"items": [draft_payload(row) for row in rows], "total": len(rows),
-                "posting_enabled": False, "workflow": ["draft", "submitted", "approved", "cancelled"],
+        return {"items": [draft_payload(row, operational_session) for row in rows], "total": len(rows),
+                "posting_enabled": app.state.posting_enabled,
+                "workflow": ["draft", "submitted", "approved", "cancelled", "posted", "reversed"],
                 "controls": {"stock_positions": stock_positions, "open_rehearsal_periods": open_periods,
                              "permanent_journals": operational_session.scalar(select(func.count(OperationalJournalBatch.id))) or 0,
+                             "sales_invoice_rehearsals": operational_session.scalar(select(func.count(
+                                 OperationalSalesInvoicePostingRehearsal.id))) or 0,
+                             "posted_sales_invoices": operational_session.scalar(select(func.count(
+                                 OperationalIntegratedPostingBatch.id)).where(
+                                     OperationalIntegratedPostingBatch.resource_type == "sales_invoice",
+                                     OperationalIntegratedPostingBatch.batch_kind == "posting")) or 0,
                              "subledger_entries": operational_session.scalar(select(func.count(OperationalSubledgerEntry.id))) or 0,
                              "reversal_requests": operational_session.scalar(select(func.count(OperationalReversalRequest.id))) or 0,
                              "posting_probes": operational_session.scalar(select(func.count(OperationalPostingProbe.id))) or 0,
@@ -643,7 +2375,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             raise HTTPException(status_code=404, detail="Draft not found")
         if not location_allowed(current_user(request), draft.location_code):
             raise HTTPException(status_code=404, detail="Draft not found")
-        return draft_payload(draft)
+        return draft_payload(draft, operational_session)
 
     @app.get("/api/v1/selectors/locations")
     def location_selector(request: Request, snapshot: SourceSnapshot = Depends(snapshot_dependency),
@@ -663,6 +2395,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
 
     @app.get("/api/v1/selectors/parties")
     def party_selector(kind: str = Query(pattern="^(customer|supplier)$"), q: str = Query("", max_length=120),
+                       limit: int = Query(30, ge=1, le=500),
                        snapshot: SourceSnapshot = Depends(snapshot_dependency), session: Session = Depends(session_dependency),
                        operational_session=Depends(optional_operational_session_dependency)):
         if operational_session is not None and operational_session.scalar(select(func.count(OperationalPartyMaster.id))):
@@ -672,7 +2405,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 filters.append(or_(OperationalPartyMaster.party_code.ilike(pattern), OperationalPartyMaster.legal_or_business_name.ilike(pattern)))
             rows = [dict(row._mapping) for row in operational_session.execute(select(
                 OperationalPartyMaster.party_code, OperationalPartyMaster.legal_or_business_name.label("name")
-            ).where(*filters).order_by(OperationalPartyMaster.legal_or_business_name).limit(30)).all()]
+            ).where(*filters).order_by(OperationalPartyMaster.legal_or_business_name).limit(limit)).all()]
             return {"items": rows}
         filters = [ErpParty.snapshot_id == snapshot.id, ErpParty.party_kind.in_((kind, "both"))]
         if q:
@@ -680,13 +2413,13 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             filters.append(or_(ErpParty.party_code.ilike(pattern), ErpParty.legal_or_business_name.ilike(pattern)))
         rows = [dict(row._mapping) for row in session.execute(select(
             ErpParty.party_code, ErpParty.legal_or_business_name.label("name")
-        ).where(*filters).order_by(ErpParty.legal_or_business_name).limit(30)).all()]
+        ).where(*filters).order_by(ErpParty.legal_or_business_name).limit(limit)).all()]
         if app.state.delta_overlay:
             existing = {row["party_code"] for row in rows}
             additions = [{"party_code": row["party_code"], "name": row["legal_or_business_name"]}
                          for row in app.state.delta_overlay.party_records(kind)
                          if row["party_code"] not in existing and _contains(row, q)]
-            rows = (rows + additions)[:30]
+            rows = (rows + additions)[:limit]
         return {"items": rows}
 
     @app.get("/api/v1/selectors/products")
@@ -770,6 +2503,27 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             raise HTTPException(status_code=403, detail=f"Permission {permission} is required")
         return user
 
+    def require_any_csrf(request: Request, permissions: set[str]):
+        current = active_session(request)
+        if not current:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        if not hmac.compare_digest(request.headers.get("x-csrf-token", ""), current.csrf_token):
+            raise HTTPException(status_code=403, detail="CSRF validation failed")
+        user = current_user(request)
+        if not user or not permissions.intersection(user.permissions):
+            raise HTTPException(status_code=403, detail=f"One of these permissions is required: {', '.join(sorted(permissions))}")
+        return user
+
+    def require_any_user(request: Request, permissions: set[str]):
+        if not app.state.auth_enabled:
+            return None
+        user = current_user(request)
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        if not permissions.intersection(user.permissions):
+            raise HTTPException(status_code=403, detail=f"One of these permissions is required: {', '.join(sorted(permissions))}")
+        return user
+
     def operational_masters_present(operational_session: Session, model) -> bool:
         return bool(operational_session.scalar(select(func.count(model.id))))
 
@@ -834,11 +2588,14 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 if overlay_product:
                     product = (overlay_product["sku"], overlay_product["name"],
                                overlay_product["purchase_price_evidence"], overlay_product["selling_price_evidence"],
-                               overlay_product["base_uom"], overlay_product["base_uom"].casefold(), Decimal("1"), "provisional")
+                               overlay_product["base_uom"], normalize_uom(overlay_product["base_uom"]),
+                               Decimal("1"), "provisional")
             if not product:
                 raise HTTPException(status_code=422, detail=f"Product SKU {item.sku} is not present in the cloned master")
-            source_uom, canonical_uom = str(product[4] or ""), str(product[5] or "")
-            if product[7] == "unobserved" or item.uom.casefold() not in {source_uom.casefold(), canonical_uom.casefold()}:
+            source_uom = str(product[4] or "")
+            canonical_uom = normalize_uom(str(product[5] or "") or source_uom) or ""
+            if (product[7] == "unobserved"
+                    or normalize_uom(item.uom) not in {normalize_uom(source_uom), canonical_uom}):
                 raise HTTPException(status_code=422, detail=f"UOM {item.uom} is not an approved base-unit mapping for SKU {item.sku}")
             factor = Decimal(str(product[6]))
             default_price = product[3] if payload.document_type == "sale" else product[2]
@@ -942,6 +2699,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         if not location_allowed(user, draft.location_code):
             raise HTTPException(status_code=404, detail="Draft not found")
         try:
+            if draft.document_type == "sale":
+                return rehearse_sales_invoice_posting(operational_session, draft, actor=user.username)
             return rehearse_posting(operational_session, draft, actor=user.username)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -957,6 +2716,10 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         if not draft or not location_allowed(user, draft.location_code):
             raise HTTPException(status_code=404, detail="Draft not found")
         try:
+            if draft.document_type == "sale":
+                return execute_integrated_posting(operational_session, resource_type="sales_invoice",
+                    resource_key=draft.draft_key, actor=user.username,
+                    idempotency_key=payload.idempotency_key)
             return execute_posting(operational_session, draft, actor=user.username,
                                    idempotency_key=payload.idempotency_key)
         except ValueError as exc:
@@ -1208,7 +2971,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         }
 
     def prepare_goods_receipt(payload: GoodsReceiptRequest, clone_session: Session,
-                              operational_session: Session, user) -> tuple[str, list[dict]]:
+                              operational_session: Session, user,
+                              exclude_receipt_id: int | None = None) -> tuple[str, list[dict]]:
         snapshot = clone_session.scalar(select(SourceSnapshot).where(SourceSnapshot.name == selected_snapshot))
         if not snapshot:
             raise HTTPException(status_code=404, detail="Configured BizModo clone snapshot is unavailable")
@@ -1266,6 +3030,13 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "unit_cost_snapshot": cost, "batch_no": item.batch_no,
                 "expiry_date": item.expiry_date, "rejection_reason": item.rejection_reason,
             })
+        try:
+            validate_po_receipt(operational_session,
+                purchase_reference=payload.purchase_reference,
+                supplier_code=payload.supplier_code, location_code=payload.location_code,
+                lines=prepared, exclude_receipt_id=exclude_receipt_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         return supplier[0], prepared
 
     @app.get("/api/v1/goods-receipts")
@@ -1312,7 +3083,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             OperationalGoodsReceipt.receipt_key == receipt_key).with_for_update())
         if not receipt or not location_allowed(user, receipt.location_code):
             raise HTTPException(status_code=404, detail="Goods receipt not found")
-        supplier_name, lines = prepare_goods_receipt(payload, clone_session, operational_session, user)
+        supplier_name, lines = prepare_goods_receipt(payload, clone_session, operational_session, user,
+                                                     exclude_receipt_id=receipt.id)
         try:
             receipt = replace_goods_receipt(
                 operational_session, receipt, expected_revision=expected_revision,
@@ -1375,15 +3147,671 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    def sales_return_payload(document: OperationalSalesReturn) -> dict:
+    def sales_quotation_payload(document: OperationalSalesQuotation) -> dict:
+        return {"quotation_key": document.quotation_key, "quotation_no": document.quotation_no,
+                "customer_code": document.customer_code, "customer_name": document.customer_name_snapshot,
+                "location_code": document.location_code, "quotation_date": document.quotation_date,
+                "valid_until": document.valid_until, "currency_code": document.currency_code,
+                "subtotal": document.subtotal, "discount_amount": document.discount_amount,
+                "tax_amount": document.tax_amount, "total_amount": document.total_amount,
+                "payment_terms": document.payment_terms, "delivery_terms": document.delivery_terms,
+                "notes": document.notes, "status": document.status,
+                "customer_price_group": document.customer_price_group, "price_list_key": document.price_list_key,
+                "promotion_key": document.promotion_key,
+                "posting_enabled": False, "stock_reservation_enabled": False,
+                "created_by": document.created_by, "created_at": document.created_at,
+                "approved_by": document.approved_by, "approval_note": document.approval_note,
+                "acceptance_reference": document.acceptance_reference,
+                "accepted_by": document.accepted_by, "accepted_at": document.accepted_at,
+                "revision": document.revision, "state_changed_at": document.state_changed_at,
+                "state_changed_by": document.state_changed_by,
+                "sales_order_no": document.order.order_no if document.order else None,
+                "lines": [{"line_no": line.line_no, "sku": line.sku,
+                           "product_name": line.product_name_snapshot, "quantity": line.quantity,
+                           "uom": line.uom, "canonical_uom": line.canonical_uom,
+                           "factor_to_base_snapshot": line.factor_to_base_snapshot,
+                           "quantity_base": line.quantity_base, "unit_price": line.unit_price,
+                           "tax_rate": line.tax_rate, "net_amount": line.net_amount,
+                           "tax_amount": line.tax_amount, "gross_amount": line.gross_amount}
+                          for line in document.lines]}
+
+    def sales_order_payload(document: OperationalSalesOrder) -> dict:
+        return {"order_key": document.order_key, "order_no": document.order_no,
+                "quotation_key": document.quotation.quotation_key,
+                "quotation_no": document.quotation.quotation_no,
+                "customer_code": document.customer_code, "customer_name": document.customer_name_snapshot,
+                "location_code": document.location_code,
+                "requested_delivery_date": document.requested_delivery_date,
+                "currency_code": document.currency_code, "subtotal": document.subtotal,
+                "discount_amount": document.discount_amount, "tax_amount": document.tax_amount,
+                "total_amount": document.total_amount, "status": document.status,
+                "posting_enabled": False, "stock_reservation_enabled": False,
+                "created_by": document.created_by, "created_at": document.created_at,
+                "lines": [{"line_no": line.line_no, "sku": line.sku,
+                           "product_name": line.product_name_snapshot, "quantity": line.quantity,
+                           "uom": line.uom, "canonical_uom": line.canonical_uom,
+                           "factor_to_base_snapshot": line.factor_to_base_snapshot,
+                           "quantity_base": line.quantity_base, "unit_price": line.unit_price,
+                           "tax_rate": line.tax_rate, "net_amount": line.net_amount,
+                           "tax_amount": line.tax_amount, "gross_amount": line.gross_amount}
+                          for line in document.lines]}
+
+    def prepare_sales_quotation(payload: SalesQuotationRequest, clone_session: Session,
+                                operational_session: Session, user):
+        draft_payload = DraftRequest(document_type="sale", party_code=payload.customer_code,
+            location_code=payload.location_code, discount_amount=payload.discount_amount,
+            notes=payload.notes, lines=payload.lines)
+        location, customer, lines = prepare_draft(draft_payload, clone_session, operational_session, user)
+        return location, customer, lines
+
+    @app.get("/api/v1/pos")
+    def pos_workspace(request: Request, operational_session: Session = Depends(operational_session_dependency)):
+        user = require_user(request, "pos.read")
+        return pos_workspace_payload(operational_session, user.allowed_locations if user else ("*",))
+
+    @app.post("/api/v1/pos/tills", status_code=201)
+    def pos_create_till(payload: PosTillRequest, request: Request,
+                        operational_session: Session = Depends(operational_session_dependency)):
+        user = require_user(request, "pos.manage")
+        if user and not location_allowed(user, payload.location_code):
+            raise HTTPException(status_code=403, detail="POS till location is outside your assigned scope")
+        try:
+            row = create_till(operational_session, actor=user.username if user else "test-user", **payload.model_dump())
+            return {"till_key": row.till_key, "till_code": row.till_code, "posting_performed": False}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/pos/shifts", status_code=201)
+    def pos_open_shift(payload: PosShiftOpenRequest, request: Request,
+                       operational_session: Session = Depends(operational_session_dependency)):
+        user = require_user(request, "pos.sale")
+        till = operational_session.scalar(select(OperationalPosTill).where(OperationalPosTill.till_key == payload.till_key))
+        if till and user and not location_allowed(user, till.location_code):
+            raise HTTPException(status_code=403, detail="POS till location is outside your assigned scope")
+        try:
+            row = open_shift(operational_session, actor=user.username if user else "test-user", **payload.model_dump())
+            return {"shift_key": row.shift_key, "shift_no": row.shift_no, "status": row.status, "posting_performed": False}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/pos/sales", status_code=201)
+    def pos_record_sale(payload: PosSaleRequest, request: Request,
+                        operational_session: Session = Depends(operational_session_dependency)):
+        user = require_user(request, "pos.sale")
+        shift = operational_session.scalar(select(OperationalPosShift).where(OperationalPosShift.shift_key == payload.shift_key))
+        if shift and user and not location_allowed(user, shift.till.location_code):
+            raise HTTPException(status_code=403, detail="POS shift location is outside your assigned scope")
+        try:
+            values = payload.model_dump(); values["lines"] = [line.model_dump() for line in payload.lines]
+            row = record_sale(operational_session, actor=user.username if user else "test-user", **values)
+            return {"sale_key": row.sale_key, "receipt_no": row.receipt_no, "total_amount": row.total_amount,
+                    "change_amount": row.change_amount, "posting_performed": False, "stock_posting_performed": False}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/pos/shifts/{shift_key}/submit-close")
+    def pos_submit_close(shift_key: str, payload: PosCloseRequest, request: Request,
+                         operational_session: Session = Depends(operational_session_dependency)):
+        user = require_user(request, "cash.close.prepare")
+        try:
+            row = submit_close(operational_session, shift_key=shift_key,
+                actor=user.username if user else "test-user", **payload.model_dump())
+            return {"shift_key": row.shift_key, "status": row.status, "variance": row.variance, "posting_performed": False}
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/pos/shifts/{shift_key}/approve-close")
+    def pos_approve_close(shift_key: str, payload: PosCloseApprovalRequest, request: Request,
+                          operational_session: Session = Depends(operational_session_dependency)):
+        user = require_user(request, "cash.close.approve")
+        try:
+            row = approve_close(operational_session, shift_key=shift_key,
+                actor=user.username if user else "test-approver", **payload.model_dump())
+            return {"shift_key": row.shift_key, "status": row.status, "variance": row.variance, "posting_performed": False}
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/van-sales")
+    def van_sales_workspace(request: Request, operational_session: Session = Depends(operational_session_dependency)):
+        require_user(request, "van.read")
+        return van_workspace_payload(operational_session)
+
+    @app.post("/api/v1/van-sales/routes", status_code=201)
+    def van_create_route(payload: VanRouteRequest, request: Request,
+                         operational_session: Session = Depends(operational_session_dependency)):
+        user=require_user(request,"van.route.prepare")
+        try:
+            row=create_route(operational_session,actor=user.username if user else "test-user",**payload.model_dump())
+            return {"route_key":row.route_key,"route_no":row.route_no,"status":row.status,"posting_performed":False}
+        except ValueError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
+
+    @app.post("/api/v1/van-sales/routes/{route_key}/load")
+    def van_submit_load(route_key: str, payload: VanLoadRequest, request: Request,
+                        operational_session: Session = Depends(operational_session_dependency)):
+        user=require_user(request,"van.route.prepare")
+        try:
+            values=payload.model_dump(); values["lines"]=[line.model_dump() for line in payload.lines]
+            row=submit_load(operational_session,route_key=route_key,actor=user.username if user else "test-user",**values)
+            return {"route_key":row.route_key,"status":row.status,"revision":row.revision,"stock_posting_performed":False}
+        except ValueError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
+
+    @app.post("/api/v1/van-sales/routes/{route_key}/{action}")
+    def van_transition(route_key: str, action: str, payload: VanTransitionRequest, request: Request,
+                       operational_session: Session = Depends(operational_session_dependency)):
+        permissions={"approve_load":"van.shift.approve","start":"van.shift","submit_close":"van.close.prepare","approve_close":"van.close.approve"}
+        if action not in permissions: raise HTTPException(status_code=404,detail="Unsupported van-route action")
+        user=require_user(request,permissions[action])
+        try:
+            row=transition_route(operational_session,route_key=route_key,action=action,
+                actor=user.username if user else "test-user",**payload.model_dump())
+            return {"route_key":row.route_key,"status":row.status,"revision":row.revision,
+                    "variance":row.variance,"posting_performed":False}
+        except PermissionError as exc: raise HTTPException(status_code=403,detail=str(exc)) from exc
+        except ValueError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
+
+    @app.post("/api/v1/van-sales/offline-events")
+    def van_sync_event(payload: VanOfflineEventRequest, request: Request,
+                       operational_session: Session = Depends(operational_session_dependency)):
+        user=require_user(request,"van.offline_sync")
+        try:
+            values=payload.model_dump(); values["lines"]=[line.model_dump() for line in payload.lines]
+            row,replay=sync_offline_event(operational_session,actor=user.username if user else "test-user",**values)
+            return {"event_key":row.event_key,"client_reference":row.client_reference,"amount":row.amount,
+                    "tax_amount":row.tax_amount,"idempotent_replay":replay,"posting_performed":False}
+        except ValueError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
+
+    @app.get("/api/v1/crm")
+    def crm_workspace(request: Request, operational_session: Session = Depends(operational_session_dependency)):
+        require_user(request, "crm.read")
+        return crm_workspace_payload(operational_session)
+
+    @app.post("/api/v1/crm/leads", status_code=201)
+    def crm_create_lead(payload: CrmLeadRequest, request: Request, operational_session: Session = Depends(operational_session_dependency)):
+        user=require_user(request, "crm.lead.prepare")
+        row=create_lead(operational_session, actor=user.username, **payload.model_dump())
+        return {"lead_key":row.lead_key,"lead_no":row.lead_no,"status":row.status,"posting_performed":False}
+
+    @app.post("/api/v1/crm/leads/{lead_key}/activities", status_code=201)
+    def crm_add_activity(lead_key: str, payload: CrmActivityRequest, request: Request, operational_session: Session = Depends(operational_session_dependency)):
+        user=require_user(request, "crm.activity.prepare")
+        try:
+            row=add_activity(operational_session, lead_key=lead_key, actor=user.username, **payload.model_dump())
+            return {"activity_key":row.activity_key,"posting_performed":False}
+        except ValueError as exc: raise HTTPException(status_code=404,detail=str(exc)) from exc
+
+    @app.post("/api/v1/crm/leads/{lead_key}/proposals", status_code=201)
+    def crm_create_proposal(lead_key: str, payload: CrmProposalRequest, request: Request, operational_session: Session = Depends(operational_session_dependency)):
+        user=require_user(request, "crm.proposal.prepare")
+        try:
+            row=create_proposal(operational_session, lead_key=lead_key, actor=user.username, **payload.model_dump())
+            return {"proposal_key":row.proposal_key,"status":row.status,"revision":row.revision,"posting_performed":False}
+        except ValueError as exc: raise HTTPException(status_code=404,detail=str(exc)) from exc
+
+    @app.post("/api/v1/crm/proposals/{proposal_key}/{decision}")
+    def crm_decide_proposal(proposal_key: str, decision: str, payload: CrmProposalDecisionRequest, request: Request, operational_session: Session = Depends(operational_session_dependency)):
+        if decision not in {"approved","rejected"}: raise HTTPException(status_code=404,detail="Unsupported proposal decision")
+        user=require_user(request, "crm.proposal.approve")
+        try:
+            row=decide_proposal(operational_session, proposal_key=proposal_key, decision=decision, actor=user.username, **payload.model_dump())
+            return {"proposal_key":row.proposal_key,"status":row.status,"revision":row.revision,"posting_performed":False}
+        except PermissionError as exc: raise HTTPException(status_code=403,detail=str(exc)) from exc
+        except ValueError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
+
+    @app.get("/api/v1/commercial-pricing")
+    def commercial_pricing_workspace(request: Request, operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        if not user: raise HTTPException(status_code=401, detail="Authentication required")
+        lists = operational_session.scalars(select(OperationalPriceList).order_by(OperationalPriceList.effective_from.desc())).all()
+        return {"posting_enabled": False,
+                "groups": [{"group_code": row.group_code, "name": row.name, "status": row.status} for row in operational_session.scalars(select(OperationalCustomerPriceGroup).order_by(OperationalCustomerPriceGroup.group_code))],
+                "assignments": [{"customer_code": row.customer_code, "group_code": row.group_code} for row in operational_session.scalars(select(OperationalCustomerPriceGroupAssignment).order_by(OperationalCustomerPriceGroupAssignment.customer_code))],
+                "price_lists": [{"price_list_key": row.price_list_key, "name": row.name, "customer_group": row.customer_group, "effective_from": row.effective_from, "effective_to": row.effective_to, "max_discount_percent": row.max_discount_percent, "status": row.status, "created_by": row.created_by, "approved_by": row.approved_by, "items": [{"sku": item.sku, "unit_price": item.unit_price} for item in operational_session.scalars(select(OperationalPriceListItem).where(OperationalPriceListItem.price_list_id == row.id))]} for row in lists],
+                "promotions": [{"promotion_key": row.promotion_key, "promotion_code": row.promotion_code, "name": row.name, "customer_group": row.customer_group, "sku": row.sku, "discount_percent": row.discount_percent, "effective_from": row.effective_from, "effective_to": row.effective_to, "status": row.status, "created_by": row.created_by, "approved_by": row.approved_by} for row in operational_session.scalars(select(OperationalPromotion).order_by(OperationalPromotion.effective_from.desc()))]}
+
+    @app.post("/api/v1/commercial-pricing/groups", status_code=201)
+    def commercial_price_group(payload: CustomerPriceGroupRequest, request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "price_list.manage")
+        try: return {"group_code": create_customer_price_group(operational_session, actor=user.username, **payload.model_dump()).group_code}
+        except ValueError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.put("/api/v1/commercial-pricing/customers/{customer_code}/group")
+    def commercial_customer_group(customer_code: str, payload: CustomerPriceGroupAssignmentRequest, request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "price_list.manage")
+        try: return {"customer_code": assign_customer_price_group(operational_session, customer_code=customer_code, group_code=payload.group_code, actor=user.username).customer_code}
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/commercial-pricing/price-lists", status_code=201)
+    def commercial_price_list(payload: PriceListRequest, request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "price_list.manage")
+        try:
+            values = payload.model_dump(); values["items"] = [item.model_dump() for item in payload.items]
+            return {"price_list_key": create_price_list(operational_session, actor=user.username, **values).price_list_key, "posting_enabled": False}
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/commercial-pricing/price-lists/{price_list_key}/approve")
+    def commercial_price_list_approval(price_list_key: str, request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "discount.approve")
+        try: return {"price_list_key": approve_price_list(operational_session, key=price_list_key, actor=user.username).price_list_key, "status": "approved", "posting_enabled": False}
+        except PermissionError as exc: raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/commercial-pricing/promotions", status_code=201)
+    def commercial_promotion(payload: PromotionRequest, request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "price_list.manage")
+        try: return {"promotion_key": create_promotion(operational_session, actor=user.username, **payload.model_dump()).promotion_key, "posting_enabled": False}
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/commercial-pricing/promotions/{promotion_key}/approve")
+    def commercial_promotion_approval(promotion_key: str, request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "discount.approve")
+        try: return {"promotion_key": approve_promotion(operational_session, promotion_key=promotion_key, actor=user.username).promotion_key, "status": "approved", "posting_enabled": False}
+        except PermissionError as exc: raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/v1/sales-orders")
+    def sales_orders_workspace(request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        locations = user.allowed_locations if user else ()
+        quotations = list_sales_quotations(operational_session, allowed_locations=locations)
+        orders = list_sales_orders(operational_session, allowed_locations=locations)
+        return {"quotations": [sales_quotation_payload(row) for row in quotations],
+                "orders": [sales_order_payload(row) for row in orders],
+                "controls": sales_order_control_counts(operational_session)}
+
+    @app.get("/api/v1/sales-orders/quotations/{quotation_key}")
+    def sales_quotation_detail(quotation_key: str, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        document = operational_session.scalar(select(OperationalSalesQuotation).where(
+            OperationalSalesQuotation.quotation_key == quotation_key))
+        if not document or not user or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Sales quotation not found")
+        return sales_quotation_payload(document)
+
+    @app.post("/api/v1/sales-orders/quotations", status_code=201)
+    def new_sales_quotation(payload: SalesQuotationRequest, request: Request,
+                            clone_session: Session = Depends(session_dependency),
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "draft.create")
+        location, customer, lines = prepare_sales_quotation(payload, clone_session, operational_session, user)
+        try:
+            pricing = enforce_quotation_pricing(operational_session, customer_code=customer[0], quotation_date=payload.quotation_date, lines=lines, discount_amount=payload.discount_amount, promotion_code=payload.promotion_code)
+            document = create_sales_quotation(operational_session,
+                customer_code=customer[0], customer_name_snapshot=customer[1], location_code=location[0],
+                quotation_date=payload.quotation_date, valid_until=payload.valid_until,
+                discount_amount=payload.discount_amount, payment_terms=payload.payment_terms,
+                delivery_terms=payload.delivery_terms, notes=payload.notes,
+                actor=user.username, lines=lines, pricing=pricing)
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return sales_quotation_payload(document)
+
+    @app.put("/api/v1/sales-orders/quotations/{quotation_key}")
+    def edit_sales_quotation(quotation_key: str, payload: SalesQuotationRequest, request: Request,
+                             expected_revision: int = Query(ge=1),
+                             clone_session: Session = Depends(session_dependency),
+                             operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "draft.edit")
+        document = operational_session.scalar(select(OperationalSalesQuotation).where(
+            OperationalSalesQuotation.quotation_key == quotation_key).with_for_update())
+        if not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Sales quotation not found")
+        location, customer, lines = prepare_sales_quotation(payload, clone_session, operational_session, user)
+        try:
+            pricing = enforce_quotation_pricing(operational_session, customer_code=customer[0], quotation_date=payload.quotation_date, lines=lines, discount_amount=payload.discount_amount, promotion_code=payload.promotion_code)
+            document = replace_sales_quotation(operational_session, document,
+                expected_revision=expected_revision, customer_code=customer[0],
+                customer_name_snapshot=customer[1], location_code=location[0],
+                quotation_date=payload.quotation_date, valid_until=payload.valid_until,
+                discount_amount=payload.discount_amount, payment_terms=payload.payment_terms,
+                delivery_terms=payload.delivery_terms, notes=payload.notes,
+                actor=user.username, lines=lines, pricing=pricing)
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return sales_quotation_payload(document)
+
+    def sales_quotation_action(quotation_key: str, action: str, payload: DraftTransitionRequest,
+                               request: Request, operational_session: Session):
+        permission = "draft.approve" if action in {"approve", "reject"} else f"draft.{action}"
+        user = require_csrf(request, permission)
+        document = operational_session.scalar(select(OperationalSalesQuotation).where(
+            OperationalSalesQuotation.quotation_key == quotation_key).with_for_update())
+        if not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Sales quotation not found")
+        try:
+            document = transition_sales_quotation(operational_session, document,
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username, note=payload.note)
+        except PermissionError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return sales_quotation_payload(document)
+
+    @app.post("/api/v1/sales-orders/quotations/{quotation_key}/submit")
+    def submit_sales_quotation(quotation_key: str, payload: DraftTransitionRequest, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        return sales_quotation_action(quotation_key, "submit", payload, request, operational_session)
+
+    @app.post("/api/v1/sales-orders/quotations/{quotation_key}/cancel")
+    def cancel_sales_quotation(quotation_key: str, payload: DraftTransitionRequest, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        return sales_quotation_action(quotation_key, "cancel", payload, request, operational_session)
+
+    @app.post("/api/v1/sales-orders/quotations/{quotation_key}/approve")
+    def approve_sales_quotation(quotation_key: str, payload: DraftTransitionRequest, request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        return sales_quotation_action(quotation_key, "approve", payload, request, operational_session)
+
+    @app.post("/api/v1/sales-orders/quotations/{quotation_key}/reject")
+    def reject_sales_quotation(quotation_key: str, payload: DraftTransitionRequest, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        return sales_quotation_action(quotation_key, "reject", payload, request, operational_session)
+
+    @app.post("/api/v1/sales-orders/quotations/{quotation_key}/accept")
+    def record_sales_quotation_acceptance(quotation_key: str, payload: SalesQuotationAcceptanceRequest,
+                                          request: Request,
+                                          operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"draft.create", "draft.approve"})
+        document = operational_session.scalar(select(OperationalSalesQuotation).where(
+            OperationalSalesQuotation.quotation_key == quotation_key).with_for_update())
+        if not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Sales quotation not found")
+        try:
+            document = accept_sales_quotation(operational_session, document,
+                expected_revision=payload.expected_revision, actor=user.username,
+                acceptance_reference=payload.acceptance_reference)
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return sales_quotation_payload(document)
+
+    @app.post("/api/v1/sales-orders/quotations/{quotation_key}/convert")
+    def convert_sales_quotation_to_order(quotation_key: str, payload: SalesOrderConversionRequest,
+                                         request: Request,
+                                         operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"draft.create", "draft.approve"})
+        document = operational_session.scalar(select(OperationalSalesQuotation).where(
+            OperationalSalesQuotation.quotation_key == quotation_key).with_for_update())
+        if not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Sales quotation not found")
+        try:
+            order = convert_sales_quotation(operational_session, document,
+                expected_revision=payload.expected_revision, actor=user.username,
+                requested_delivery_date=payload.requested_delivery_date,
+                conversion_note=payload.conversion_note)
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return sales_order_payload(order)
+
+    def delivery_payload(document: OperationalDeliveryFulfillment) -> dict:
+        return {"fulfillment_key": document.fulfillment_key,
+                "fulfillment_no": document.fulfillment_no,
+                "sales_order_key": document.sales_order.order_key,
+                "sales_order_no": document.sales_order.order_no,
+                "customer_name": document.sales_order.customer_name_snapshot,
+                "location_code": document.location_code, "status": document.status,
+                "revision": document.revision, "posting_enabled": False,
+                "invoice_eligible": document.status == "delivered",
+                "allocation_note": document.allocation_note,
+                "delivery_note_no": document.delivery_note_no,
+                "vehicle_number": document.vehicle_number, "driver_name": document.driver_name,
+                "dispatched_at": document.dispatched_at, "dispatched_by": document.dispatched_by,
+                "received_by": document.received_by, "pod_reference": document.pod_reference,
+                "pod_note": document.pod_note, "delivered_at": document.delivered_at,
+                "delivered_by": document.delivered_by, "created_by": document.created_by,
+                "created_at": document.created_at, "state_changed_at": document.state_changed_at,
+                "state_changed_by": document.state_changed_by,
+                "total_amount": document.sales_order.total_amount,
+                "lines": [{"line_no": line.line_no, "sku": line.sku,
+                           "product_name": line.product_name_snapshot,
+                           "ordered_quantity": line.ordered_quantity, "uom": line.uom,
+                           "canonical_uom": line.canonical_uom,
+                           "factor_to_base_snapshot": line.factor_to_base_snapshot,
+                           "ordered_quantity_base": line.ordered_quantity_base,
+                           "allocated_quantity_base": line.allocated_quantity_base,
+                           "picked_quantity_base": line.picked_quantity_base,
+                           "dispatched_quantity_base": line.dispatched_quantity_base,
+                           "delivered_quantity_base": line.delivered_quantity_base}
+                          for line in document.lines]}
+
+    @app.get("/api/v1/deliveries")
+    def deliveries_workspace(request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        user=current_user(request); locations=user.allowed_locations if user else ()
+        allocated_order_ids=select(OperationalDeliveryFulfillment.sales_order_id)
+        order_query=select(OperationalSalesOrder).where(
+            OperationalSalesOrder.status == "confirmed",
+            OperationalSalesOrder.id.not_in(allocated_order_ids))
+        if "*" not in locations:
+            order_query=order_query.where(OperationalSalesOrder.location_code.in_(locations))
+        orders=list(operational_session.scalars(order_query.order_by(OperationalSalesOrder.created_at.desc()).limit(100)))
+        deliveries=list_delivery_fulfillments(operational_session, allowed_locations=locations)
+        return {"ready_orders": [sales_order_payload(row) for row in orders],
+                "deliveries": [delivery_payload(row) for row in deliveries],
+                "controls": delivery_control_counts(operational_session)}
+
+    @app.post("/api/v1/deliveries/orders/{order_key}/allocate", status_code=201)
+    def allocate_delivery(order_key: str, payload: DeliveryAllocationRequest, request: Request,
+                          operational_session=Depends(operational_session_dependency)):
+        user=require_any_csrf(request, {"delivery.allocate", "inventory.create"})
+        order=operational_session.scalar(select(OperationalSalesOrder).where(
+            OperationalSalesOrder.order_key == order_key).with_for_update())
+        if not order or not location_allowed(user, order.location_code):
+            raise HTTPException(status_code=404, detail="Sales order not found")
+        try:
+            document=allocate_sales_order(operational_session, order, actor=user.username, note=payload.note)
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return delivery_payload(document)
+
+    def delivery_action(fulfillment_key: str, action: str, payload, request: Request,
+                        operational_session: Session):
+        permissions={"pick": {"delivery.pick", "inventory.edit"},
+                     "dispatch": {"delivery.dispatch", "inventory.submit"},
+                     "deliver": {"delivery.pod", "inventory.approve"},
+                     "cancel": {"delivery.cancel", "inventory.cancel"}}[action]
+        user=require_any_csrf(request, permissions)
+        document=operational_session.scalar(select(OperationalDeliveryFulfillment).where(
+            OperationalDeliveryFulfillment.fulfillment_key == fulfillment_key).with_for_update())
+        if not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Delivery fulfillment not found")
+        try:
+            document=transition_delivery(operational_session, document,
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username, note=payload.note,
+                vehicle_number=getattr(payload, "vehicle_number", None),
+                driver_name=getattr(payload, "driver_name", None),
+                received_by=getattr(payload, "received_by", None),
+                pod_reference=getattr(payload, "pod_reference", None),
+                occurred_at=(getattr(payload, "dispatched_at", None)
+                             or getattr(payload, "delivered_at", None)))
+        except (RuntimeError, ValueError) as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return delivery_payload(document)
+
+    @app.post("/api/v1/deliveries/{fulfillment_key}/pick")
+    def pick_delivery(fulfillment_key: str, payload: DeliveryActionRequest, request: Request,
+                      operational_session=Depends(operational_session_dependency)):
+        return delivery_action(fulfillment_key, "pick", payload, request, operational_session)
+
+    @app.post("/api/v1/deliveries/{fulfillment_key}/cancel")
+    def cancel_delivery(fulfillment_key: str, payload: DeliveryActionRequest, request: Request,
+                        operational_session=Depends(operational_session_dependency)):
+        return delivery_action(fulfillment_key, "cancel", payload, request, operational_session)
+
+    @app.post("/api/v1/deliveries/{fulfillment_key}/dispatch")
+    def dispatch_delivery(fulfillment_key: str, payload: DeliveryDispatchRequest, request: Request,
+                          operational_session=Depends(operational_session_dependency)):
+        return delivery_action(fulfillment_key, "dispatch", payload, request, operational_session)
+
+    @app.post("/api/v1/deliveries/{fulfillment_key}/proof-of-delivery")
+    def complete_delivery(fulfillment_key: str, payload: ProofOfDeliveryRequest, request: Request,
+                          operational_session=Depends(operational_session_dependency)):
+        return delivery_action(fulfillment_key, "deliver", payload, request, operational_session)
+
+    def customer_invoice_payload(document: OperationalCustomerInvoice,
+                                 operational_session: Session) -> dict:
+        rehearsal = operational_session.scalar(select(OperationalCustomerInvoicePostingRehearsal).where(
+            OperationalCustomerInvoicePostingRehearsal.invoice_id == document.id).order_by(
+                OperationalCustomerInvoicePostingRehearsal.generated_at.desc()))
+        settlement = customer_invoice_settlement(operational_session, document)
+        return {
+            "invoice_key": document.invoice_key, "invoice_no": document.invoice_no,
+            "sales_order_no": document.sales_order_no_snapshot,
+            "delivery_note_no": document.delivery_note_no_snapshot,
+            "pod_reference": document.pod_reference_snapshot,
+            "customer_code": document.customer_code,
+            "customer_name": document.customer_name_snapshot,
+            "location_code": document.location_code, "invoice_date": document.invoice_date,
+            "due_date": document.due_date, "currency_code": document.currency_code,
+            "subtotal": document.subtotal, "discount_amount": document.discount_amount,
+            "tax_amount": document.tax_amount, "total_amount": document.total_amount,
+            "status": document.status, "posting_enabled": False, "notes": document.notes,
+            "created_by": document.created_by, "created_at": document.created_at,
+            "approved_by": document.approved_by, "approval_note": document.approval_note,
+            "revision": document.revision, "state_changed_at": document.state_changed_at,
+            "state_changed_by": document.state_changed_by,
+            **settlement,
+            "posting_rehearsal": (customer_invoice_rehearsal_payload(rehearsal, document)
+                                   if rehearsal else None),
+            "lines": [{"line_no": line.line_no, "sku": line.sku,
+                       "product_name": line.product_name_snapshot, "quantity": line.quantity,
+                       "uom": line.uom, "canonical_uom": line.canonical_uom,
+                       "factor_to_base_snapshot": line.factor_to_base_snapshot,
+                       "quantity_base": line.quantity_base, "unit_price": line.unit_price,
+                       "tax_rate": line.tax_rate, "net_amount": line.net_amount,
+                       "tax_amount": line.tax_amount, "gross_amount": line.gross_amount}
+                      for line in document.lines],
+        }
+
+    @app.get("/api/v1/customer-invoices")
+    def customer_invoices_workspace(request: Request,
+                                    operational_session=Depends(operational_session_dependency)):
+        user = current_user(request); locations = user.allowed_locations if user else ()
+        invoiced_fulfillment_ids = select(OperationalCustomerInvoice.fulfillment_id)
+        ready_query = select(OperationalDeliveryFulfillment).where(
+            OperationalDeliveryFulfillment.status == "delivered",
+            OperationalDeliveryFulfillment.id.not_in(invoiced_fulfillment_ids))
+        if "*" not in locations:
+            ready_query = ready_query.where(OperationalDeliveryFulfillment.location_code.in_(locations))
+        ready = list(operational_session.scalars(ready_query.order_by(
+            OperationalDeliveryFulfillment.delivered_at.desc()).limit(100)))
+        invoices = list_customer_invoices(operational_session, allowed_locations=locations)
+        return {"ready_deliveries": [delivery_payload(row) for row in ready],
+                "invoices": [customer_invoice_payload(row, operational_session) for row in invoices],
+                "controls": customer_invoice_control_counts(operational_session)}
+
+    @app.post("/api/v1/customer-invoices/deliveries/{fulfillment_key}", status_code=201)
+    def new_customer_invoice(fulfillment_key: str, payload: CustomerInvoiceCreateRequest,
+                             request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"customer_invoice.create", "draft.create"})
+        fulfillment = operational_session.scalar(select(OperationalDeliveryFulfillment).where(
+            OperationalDeliveryFulfillment.fulfillment_key == fulfillment_key).with_for_update())
+        if not fulfillment or not location_allowed(user, fulfillment.location_code):
+            raise HTTPException(status_code=404, detail="Delivered order not found")
+        try:
+            document = create_customer_invoice(operational_session, fulfillment,
+                actor=user.username, invoice_date=payload.invoice_date,
+                due_date=payload.due_date, notes=payload.notes)
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return customer_invoice_payload(document, operational_session)
+
+    def customer_invoice_action(invoice_key: str, action: str,
+                                payload: DraftTransitionRequest, request: Request,
+                                operational_session: Session):
+        permissions = ({"customer_invoice.approve", "draft.approve"}
+                       if action in {"approve", "reject"}
+                       else {f"customer_invoice.{action}", f"draft.{action}"})
+        user = require_any_csrf(request, permissions)
+        document = operational_session.scalar(select(OperationalCustomerInvoice).where(
+            OperationalCustomerInvoice.invoice_key == invoice_key).with_for_update())
+        if not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Customer invoice not found")
+        try:
+            document = transition_customer_invoice(operational_session, document,
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username, note=payload.note)
+        except PermissionError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return customer_invoice_payload(document, operational_session)
+
+    @app.post("/api/v1/customer-invoices/{invoice_key}/submit")
+    def submit_customer_invoice(invoice_key: str, payload: DraftTransitionRequest,
+                                request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        return customer_invoice_action(invoice_key, "submit", payload, request, operational_session)
+
+    @app.post("/api/v1/customer-invoices/{invoice_key}/cancel")
+    def cancel_customer_invoice(invoice_key: str, payload: DraftTransitionRequest,
+                                request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        return customer_invoice_action(invoice_key, "cancel", payload, request, operational_session)
+
+    @app.post("/api/v1/customer-invoices/{invoice_key}/approve")
+    def approve_customer_invoice(invoice_key: str, payload: DraftTransitionRequest,
+                                 request: Request,
+                                 operational_session=Depends(operational_session_dependency)):
+        return customer_invoice_action(invoice_key, "approve", payload, request, operational_session)
+
+    @app.post("/api/v1/customer-invoices/{invoice_key}/reject")
+    def reject_customer_invoice(invoice_key: str, payload: DraftTransitionRequest,
+                                request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        return customer_invoice_action(invoice_key, "reject", payload, request, operational_session)
+
+    @app.post("/api/v1/customer-invoices/{invoice_key}/posting-rehearsal")
+    def rehearse_delivery_backed_customer_invoice(
+            invoice_key: str, request: Request,
+            operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"customer_invoice.rehearse", "draft.approve"})
+        document = operational_session.scalar(select(OperationalCustomerInvoice).where(
+            OperationalCustomerInvoice.invoice_key == invoice_key).with_for_update())
+        if not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Customer invoice not found")
+        try:
+            result = rehearse_customer_invoice(operational_session, document, actor=user.username)
+        except (RuntimeError, ValueError) as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return result
+
+    def sales_return_payload(document: OperationalSalesReturn, operational_session: Session) -> dict:
+        rehearsal = operational_session.scalar(select(OperationalSalesReturnPostingRehearsal).where(
+            OperationalSalesReturnPostingRehearsal.sales_return_id == document.id).order_by(
+                OperationalSalesReturnPostingRehearsal.generated_at.desc()))
+        posting = operational_session.scalar(select(OperationalIntegratedPostingBatch).where(
+            OperationalIntegratedPostingBatch.resource_type == "sales_return",
+            OperationalIntegratedPostingBatch.resource_key == document.return_key,
+            OperationalIntegratedPostingBatch.batch_kind == "posting"))
         return {"return_key": document.return_key, "return_no": document.return_no,
                 "customer_code": document.customer_code, "customer_name": document.customer_name_snapshot,
                 "location_code": document.location_code,
                 "original_invoice_reference": document.original_invoice_reference,
+                "original_invoice_source_record_id": document.original_invoice_source_record_id,
+                "original_invoice_total_snapshot": document.original_invoice_total_snapshot,
+                "original_invoice_evidence_hash": document.original_invoice_evidence_hash,
                 "return_date": document.return_date, "reason_code": document.reason_code,
                 "currency_code": document.currency_code, "subtotal": document.subtotal,
                 "tax_amount": document.tax_amount, "total_amount": document.total_amount,
-                "status": document.status, "posting_enabled": document.posting_enabled,
+                "status": document.status, "posting_enabled": app.state.posting_enabled,
                 "notes": document.notes, "created_by": document.created_by, "created_at": document.created_at,
                 "revision": document.revision, "state_changed_at": document.state_changed_at,
                 "state_changed_by": document.state_changed_by,
@@ -1393,6 +3821,11 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                                  "posting_enabled": document.credit_note.posting_enabled,
                                  "total_amount": document.credit_note.total_amount}
                                 if document.credit_note else None),
+                "posting_rehearsal": (_sales_return_rehearsal_payload(rehearsal, document)
+                                      if rehearsal else None),
+                "posting": ({"batch_key": posting.batch_key, "status": posting.status,
+                    "posted_at": posting.posted_at, "posted_by": posting.posted_by,
+                    "posting_fingerprint": posting.posting_fingerprint} if posting else None),
                 "lines": [{"line_no": line.line_no, "sku": line.sku,
                            "product_name": line.product_name_snapshot, "quantity": line.quantity,
                            "restock_quantity": line.restock_quantity,
@@ -1406,7 +3839,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                            "disposition_reason": line.disposition_reason} for line in document.lines]}
 
     def prepare_sales_return(payload: SalesReturnRequest, clone_session: Session,
-                             operational_session: Session, user) -> tuple[str, list[dict]]:
+                             operational_session: Session, user) -> tuple[str, dict, list[dict]]:
         snapshot = clone_session.scalar(select(SourceSnapshot).where(SourceSnapshot.name == selected_snapshot))
         if not snapshot:
             raise HTTPException(status_code=404, detail="Configured BizModo clone snapshot is unavailable")
@@ -1434,15 +3867,21 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             ErpParty.party_kind.in_(("customer", "both")))).first()
         if not customer:
             raise HTTPException(status_code=422, detail="Customer is not present in the cloned customer master")
-        invoice = clone_session.scalar(select(ErpTransactionDocument.id).where(
+        invoice = clone_session.scalar(select(ErpTransactionDocument).where(
             ErpTransactionDocument.snapshot_id == snapshot.id,
             ErpTransactionDocument.source_kind == "sale",
             ErpTransactionDocument.document_no == payload.original_invoice_reference,
             ErpTransactionDocument.party_id == customer.id))
         if not invoice:
             raise HTTPException(status_code=422, detail="Original invoice was not found for the selected customer in the cloned sales register")
+        invoice_total = Decimal(str(invoice.total_amount or 0))
+        if invoice_total <= 0 or not invoice.source_raw_record_id:
+            raise HTTPException(status_code=422, detail="Original invoice total or immutable source evidence is unavailable")
         prepared: list[dict] = []
+        invoice_line_evidence: list[dict] = []
         for item in payload.lines:
+            clone_product_id = clone_session.scalar(select(ErpProductMaster.id).where(
+                ErpProductMaster.snapshot_id == snapshot.id, ErpProductMaster.sku == item.sku))
             if operational_masters_present(operational_session, OperationalProductMaster):
                 master = operational_session.scalar(select(OperationalProductMaster).where(
                     OperationalProductMaster.sku == item.sku, OperationalProductMaster.status == "active"))
@@ -1458,13 +3897,32 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                     ErpProductMaster.snapshot_id == snapshot.id, ErpProductMaster.sku == item.sku)).first()
             if not product:
                 raise HTTPException(status_code=422, detail=f"Product SKU {item.sku} is not active in the operational master")
+            if not clone_product_id:
+                raise HTTPException(status_code=422, detail=f"Original invoice product evidence is unavailable for SKU {item.sku}")
             source_uom, canonical_uom = str(product[3] or ""), str(product[4] or "")
             if product[6] == "unobserved" or item.uom.casefold() not in {source_uom.casefold(), canonical_uom.casefold()}:
                 raise HTTPException(status_code=422, detail=f"UOM {item.uom} is not an approved base-unit mapping for SKU {item.sku}")
             position = operational_session.scalar(select(OperationalStockPosition).where(
                 OperationalStockPosition.location_code == payload.location_code,
                 OperationalStockPosition.sku == item.sku))
-            price = item.unit_price if item.unit_price is not None else product[2]
+            source_lines = clone_session.execute(select(ErpTransactionLine.entered_quantity,
+                ErpTransactionLine.entered_uom, ErpTransactionLine.unit_price,
+                ErpTransactionLine.source_raw_record_id).where(
+                    ErpTransactionLine.document_id == invoice.id,
+                    ErpTransactionLine.product_id == clone_product_id)).all()
+            compatible = [row for row in source_lines if str(row.entered_uom or "").casefold()
+                          in {source_uom.casefold(), canonical_uom.casefold()}]
+            invoice_quantity = sum((Decimal(str(row.entered_quantity or 0)) for row in compatible), Decimal("0"))
+            invoice_prices = {Decimal(str(row.unit_price)) for row in compatible if row.unit_price is not None}
+            if invoice_quantity <= 0 or len(invoice_prices) != 1:
+                raise HTTPException(status_code=422,
+                    detail=f"Unique original invoice quantity and price evidence is unavailable for SKU {item.sku}")
+            invoice_price = next(iter(invoice_prices))
+            if item.quantity > invoice_quantity:
+                raise HTTPException(status_code=422, detail=f"Return quantity exceeds original invoice quantity for SKU {item.sku}")
+            if item.unit_price is not None and Decimal(str(item.unit_price)) != invoice_price:
+                raise HTTPException(status_code=422, detail=f"Return price must match the original invoice price for SKU {item.sku}")
+            price = invoice_price
             cost = item.unit_cost
             if cost is None and position is not None:
                 cost = position.average_unit_cost
@@ -1477,16 +3935,33 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "writeoff_quantity": item.writeoff_quantity, "uom": item.uom,
                 "canonical_uom": canonical_uom, "factor_to_base_snapshot": Decimal(str(product[5])),
                 "unit_price": price, "tax_rate": item.tax_rate, "unit_cost_snapshot": cost,
+                "original_invoice_quantity_snapshot": invoice_quantity,
+                "original_invoice_unit_price_snapshot": invoice_price,
                 "disposition_reason": item.disposition_reason})
+            invoice_line_evidence.append({"sku": item.sku, "quantity": str(invoice_quantity),
+                "unit_price": str(invoice_price),
+                "source_record_ids": sorted({int(row.source_raw_record_id) for row in compatible})})
+        evidence_source = json.dumps({"snapshot": snapshot.name,
+            "source_record_id": invoice.source_raw_record_id,
+            "document_no": invoice.document_no, "customer_code": payload.customer_code,
+            "total": str(invoice_total), "lines": sorted(invoice_line_evidence, key=lambda row: row["sku"])},
+            sort_keys=True, separators=(",", ":"))
+        evidence = {"source_record_id": invoice.source_raw_record_id,
+            "total_amount": invoice_total,
+            "evidence_hash": hashlib.sha256(evidence_source.encode()).hexdigest()}
         return (operational_customer.legal_or_business_name if operational_customer
-                else customer.legal_or_business_name), prepared
+                else customer.legal_or_business_name), evidence, prepared
 
     @app.get("/api/v1/sales-returns")
     def sales_returns(request: Request, operational_session=Depends(operational_session_dependency)):
         user = current_user(request)
         rows = list_sales_returns(operational_session, allowed_locations=user.allowed_locations if user else ())
-        return {"items": [sales_return_payload(row) for row in rows], "total": len(rows),
-                "posting_enabled": False, "controls": sales_return_control_counts(operational_session)}
+        controls = sales_return_control_counts(operational_session)
+        controls.update({"posting_enabled": app.state.posting_enabled,
+            "posting_rehearsals": operational_session.scalar(select(func.count(
+                OperationalSalesReturnPostingRehearsal.id))) or 0})
+        return {"items": [sales_return_payload(row, operational_session) for row in rows],
+                "total": len(rows), "posting_enabled": app.state.posting_enabled, "controls": controls}
 
     @app.get("/api/v1/sales-returns/{return_key}")
     def sales_return_detail(return_key: str, request: Request,
@@ -1495,22 +3970,25 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         user = current_user(request)
         if not document or not user or not location_allowed(user, document.location_code):
             raise HTTPException(status_code=404, detail="Sales return not found")
-        return sales_return_payload(document)
+        return sales_return_payload(document, operational_session)
 
     @app.post("/api/v1/sales-returns", status_code=201)
     def new_sales_return(payload: SalesReturnRequest, request: Request,
                          clone_session: Session = Depends(session_dependency),
                          operational_session=Depends(operational_session_dependency)):
         user = require_csrf(request, "sales_return.create")
-        customer_name, lines = prepare_sales_return(payload, clone_session, operational_session, user)
+        customer_name, evidence, lines = prepare_sales_return(payload, clone_session, operational_session, user)
         try:
             document = create_sales_return(operational_session, customer_code=payload.customer_code,
                 customer_name_snapshot=customer_name, location_code=payload.location_code,
                 original_invoice_reference=payload.original_invoice_reference, return_date=payload.return_date,
-                reason_code=payload.reason_code, notes=payload.notes, actor=user.username, lines=lines)
+                reason_code=payload.reason_code, notes=payload.notes, actor=user.username, lines=lines,
+                original_invoice_source_record_id=evidence["source_record_id"],
+                original_invoice_total_snapshot=evidence["total_amount"],
+                original_invoice_evidence_hash=evidence["evidence_hash"])
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return sales_return_payload(document)
+        return sales_return_payload(document, operational_session)
 
     @app.put("/api/v1/sales-returns/{return_key}")
     def edit_sales_return(return_key: str, payload: SalesReturnRequest, request: Request,
@@ -1522,16 +4000,19 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             OperationalSalesReturn.return_key == return_key).with_for_update())
         if not document or not location_allowed(user, document.location_code):
             raise HTTPException(status_code=404, detail="Sales return not found")
-        customer_name, lines = prepare_sales_return(payload, clone_session, operational_session, user)
+        customer_name, evidence, lines = prepare_sales_return(payload, clone_session, operational_session, user)
         try:
             document = replace_sales_return(operational_session, document, expected_revision=expected_revision,
                 customer_code=payload.customer_code, customer_name_snapshot=customer_name,
                 location_code=payload.location_code, original_invoice_reference=payload.original_invoice_reference,
                 return_date=payload.return_date, reason_code=payload.reason_code, notes=payload.notes,
-                actor=user.username, lines=lines)
+                actor=user.username, lines=lines,
+                original_invoice_source_record_id=evidence["source_record_id"],
+                original_invoice_total_snapshot=evidence["total_amount"],
+                original_invoice_evidence_hash=evidence["evidence_hash"])
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return sales_return_payload(document)
+        return sales_return_payload(document, operational_session)
 
     def sales_return_action(return_key: str, action: str, payload: DraftTransitionRequest,
                             request: Request, operational_session: Session):
@@ -1544,7 +4025,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             raise HTTPException(status_code=404, detail="Sales return not found")
         try:
             return sales_return_payload(transition_sales_return(operational_session, document,
-                expected_revision=payload.expected_revision, action=action, actor=user.username, note=payload.note))
+                expected_revision=payload.expected_revision, action=action, actor=user.username, note=payload.note),
+                operational_session)
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1578,20 +4060,39 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    def purchase_return_payload(document: OperationalPurchaseReturn) -> dict:
+    def purchase_return_payload(document: OperationalPurchaseReturn, operational_session: Session) -> dict:
+        rehearsal = operational_session.scalar(select(OperationalPurchaseReturnPostingRehearsal).where(
+            OperationalPurchaseReturnPostingRehearsal.purchase_return_id == document.id).order_by(
+                OperationalPurchaseReturnPostingRehearsal.generated_at.desc()))
+        posting = operational_session.scalar(select(OperationalIntegratedPostingBatch).where(
+            OperationalIntegratedPostingBatch.resource_type == "purchase_return",
+            OperationalIntegratedPostingBatch.resource_key == document.return_key,
+            OperationalIntegratedPostingBatch.batch_kind == "posting"))
+        linked_invoice = None
+        if rehearsal:
+            linked_invoice = operational_session.get(OperationalSupplierInvoice,
+                                                     rehearsal.original_supplier_invoice_id)
         return {"return_key":document.return_key,"return_no":document.return_no,
                 "supplier_code":document.supplier_code,"supplier_name":document.supplier_name_snapshot,
                 "location_code":document.location_code,"source_reference_type":document.source_reference_type,
                 "source_reference_key":document.source_reference_key,"return_date":document.return_date,
                 "reason_code":document.reason_code,"currency_code":document.currency_code,
                 "subtotal":document.subtotal,"tax_amount":document.tax_amount,"total_amount":document.total_amount,
-                "status":document.status,"posting_enabled":document.posting_enabled,"notes":document.notes,
+                "status":document.status,"posting_enabled":app.state.posting_enabled,"notes":document.notes,
                 "created_by":document.created_by,"created_at":document.created_at,"revision":document.revision,
                 "state_changed_at":document.state_changed_at,"state_changed_by":document.state_changed_by,
                 "debit_note":({"debit_note_key":document.debit_note.debit_note_key,
                                "debit_note_no":document.debit_note.debit_note_no,
                                "status":document.debit_note.status,"posting_enabled":document.debit_note.posting_enabled,
                                "total_amount":document.debit_note.total_amount} if document.debit_note else None),
+                "linked_supplier_invoice":({"invoice_key":linked_invoice.invoice_key,
+                    "supplier_invoice_no":linked_invoice.supplier_invoice_no,
+                    "status":linked_invoice.status} if linked_invoice else None),
+                "posting_rehearsal":(_purchase_return_rehearsal_payload(
+                    rehearsal, document, linked_invoice) if rehearsal and linked_invoice else None),
+                "posting":({"batch_key":posting.batch_key,"status":posting.status,
+                    "posted_at":posting.posted_at,"posted_by":posting.posted_by,
+                    "posting_fingerprint":posting.posting_fingerprint} if posting else None),
                 "lines":[{"line_no":line.line_no,"sku":line.sku,"product_name":line.product_name_snapshot,
                           "source_received_quantity":line.source_received_quantity,"quantity":line.quantity,
                           "supplier_return_quantity":line.supplier_return_quantity,
@@ -1663,20 +4164,25 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     @app.get("/api/v1/purchase-returns")
     def purchase_returns(request:Request,operational_session=Depends(operational_session_dependency)):
         user=current_user(request); rows=list_purchase_returns(operational_session,allowed_locations=user.allowed_locations if user else ())
-        return {"items":[purchase_return_payload(row) for row in rows],"total":len(rows),"posting_enabled":False,"controls":purchase_return_control_counts(operational_session)}
+        controls=purchase_return_control_counts(operational_session)
+        controls.update({"posting_enabled":app.state.posting_enabled,
+            "posting_rehearsals":operational_session.scalar(select(func.count(
+                OperationalPurchaseReturnPostingRehearsal.id))) or 0})
+        return {"items":[purchase_return_payload(row,operational_session) for row in rows],
+            "total":len(rows),"posting_enabled":app.state.posting_enabled,"controls":controls}
 
     @app.get("/api/v1/purchase-returns/{return_key}")
     def purchase_return_detail(return_key:str,request:Request,operational_session=Depends(operational_session_dependency)):
         document=operational_session.scalar(select(OperationalPurchaseReturn).where(OperationalPurchaseReturn.return_key==return_key)); user=current_user(request)
         if not document or not user or not location_allowed(user,document.location_code): raise HTTPException(status_code=404,detail="Purchase return not found")
-        return purchase_return_payload(document)
+        return purchase_return_payload(document,operational_session)
 
     @app.post("/api/v1/purchase-returns",status_code=201)
     def new_purchase_return(payload:PurchaseReturnRequest,request:Request,clone_session:Session=Depends(session_dependency),operational_session=Depends(operational_session_dependency)):
         user=require_csrf(request,"purchase_return.create"); supplier_name,lines=prepare_purchase_return(payload,clone_session,operational_session,user)
         try: document=create_purchase_return(operational_session,supplier_code=payload.supplier_code,supplier_name_snapshot=supplier_name,location_code=payload.location_code,source_reference_type=payload.source_reference_type,source_reference_key=payload.source_reference_key,return_date=payload.return_date,reason_code=payload.reason_code,notes=payload.notes,actor=user.username,lines=lines)
         except ValueError as exc: raise HTTPException(status_code=422,detail=str(exc)) from exc
-        return purchase_return_payload(document)
+        return purchase_return_payload(document,operational_session)
 
     @app.put("/api/v1/purchase-returns/{return_key}")
     def edit_purchase_return(return_key:str,payload:PurchaseReturnRequest,request:Request,expected_revision:int=Query(ge=1),clone_session:Session=Depends(session_dependency),operational_session=Depends(operational_session_dependency)):
@@ -1685,12 +4191,12 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         supplier_name,lines=prepare_purchase_return(payload,clone_session,operational_session,user)
         try: document=replace_purchase_return(operational_session,document,expected_revision=expected_revision,supplier_code=payload.supplier_code,supplier_name_snapshot=supplier_name,location_code=payload.location_code,source_reference_type=payload.source_reference_type,source_reference_key=payload.source_reference_key,return_date=payload.return_date,reason_code=payload.reason_code,notes=payload.notes,actor=user.username,lines=lines)
         except ValueError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
-        return purchase_return_payload(document)
+        return purchase_return_payload(document,operational_session)
 
     def purchase_return_action(return_key:str,action:str,payload:DraftTransitionRequest,request:Request,operational_session:Session):
         permission={"submit":"purchase_return.submit","cancel":"purchase_return.cancel","approve":"purchase_return.approve"}[action]; user=require_csrf(request,permission); document=operational_session.scalar(select(OperationalPurchaseReturn).where(OperationalPurchaseReturn.return_key==return_key).with_for_update())
         if not document or not location_allowed(user,document.location_code): raise HTTPException(status_code=404,detail="Purchase return not found")
-        try: return purchase_return_payload(transition_purchase_return(operational_session,document,expected_revision=payload.expected_revision,action=action,actor=user.username,note=payload.note))
+        try: return purchase_return_payload(transition_purchase_return(operational_session,document,expected_revision=payload.expected_revision,action=action,actor=user.username,note=payload.note),operational_session)
         except PermissionError as exc: raise HTTPException(status_code=403,detail=str(exc)) from exc
         except ValueError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
 
@@ -1707,7 +4213,10 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         try: return rehearse_purchase_return_posting(operational_session,document,actor=user.username)
         except ValueError as exc: raise HTTPException(status_code=409,detail=str(exc)) from exc
 
-    def payment_payload(payment: OperationalPayment) -> dict:
+    def payment_payload(payment: OperationalPayment, operational_session: Session) -> dict:
+        rehearsal = operational_session.scalar(select(OperationalPaymentPostingRehearsal).where(
+            OperationalPaymentPostingRehearsal.payment_id == payment.id).order_by(
+                OperationalPaymentPostingRehearsal.generated_at.desc()))
         return {"payment_key": payment.payment_key, "payment_no": payment.payment_no,
                 "payment_type": payment.payment_type, "party_code": payment.party_code,
                 "party_name": payment.party_name_snapshot, "location_code": payment.location_code,
@@ -1720,6 +4229,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "created_by": payment.created_by, "created_at": payment.created_at,
                 "revision": payment.revision, "state_changed_at": payment.state_changed_at,
                 "state_changed_by": payment.state_changed_by,
+                "posting_rehearsal": (payment_rehearsal_payload(rehearsal, payment)
+                                       if rehearsal else None),
                 "allocations": [{"line_no": line.line_no, "source_type": line.source_type,
                     "source_reference_key": line.source_reference_key,
                     "source_document_date": line.source_document_date,
@@ -1745,7 +4256,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             ErpParty.party_kind.in_((party_kind, "both")))).first()
         if not party:
             raise HTTPException(status_code=422, detail=f"{party_kind.title()} is not present in the cloned master")
-        items = []
+        items = (customer_invoice_open_items(operational_session, party_code)
+                 if payment_type == "customer_receipt" else [])
         invoices = clone_session.execute(select(
             ErpTransactionDocument.document_no, ErpTransactionDocument.occurred_at,
             ErpTransactionDocument.total_amount, ErpTransactionDocument.paid_amount,
@@ -1760,14 +4272,15 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             if outstanding > 0:
                 items.append({"source_type": "invoice", "source_reference_key": invoice.document_no,
                               "source_document_date": invoice.occurred_at.date() if invoice.occurred_at else None,
-                              "source_outstanding": outstanding})
+                              "source_outstanding": outstanding, "source_origin": "bizmodo_clone"})
         openings = operational_session.scalars(select(OperationalOpeningPartyBalance).where(
             OperationalOpeningPartyBalance.party_type == party_kind,
             OperationalOpeningPartyBalance.party_code == party_code,
             OperationalOpeningPartyBalance.balance_type == balance_type)).all()
         for opening in openings:
             items.append({"source_type": "opening_balance", "source_reference_key": f"OB:{opening.id}",
-                          "source_document_date": None, "source_outstanding": opening.amount})
+                          "source_document_date": None, "source_outstanding": opening.amount,
+                          "source_origin": "opening_control"})
         for item in items:
             claimed = operational_session.scalar(select(func.coalesce(func.sum(OperationalPaymentAllocationClaim.amount), 0)).where(
                 OperationalPaymentAllocationClaim.party_code == party_code,
@@ -1801,6 +4314,13 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 ErpLocation.snapshot_id == snapshot.id, ErpLocation.code == payload.location_code))
         if not location_exists:
             raise HTTPException(status_code=422, detail="Payment location is not active in the operational master")
+        active_cash_accounts = operational_session.scalar(select(func.count(OperationalCashAccount.id)).where(
+            OperationalCashAccount.status == "active")) or 0
+        if active_cash_accounts and not operational_session.scalar(select(OperationalCashAccount.id).where(
+                OperationalCashAccount.account_code == payload.cash_bank_account_code,
+                OperationalCashAccount.status == "active",
+                OperationalCashAccount.location_code.in_((payload.location_code.upper(), "MAIN")))):
+            raise HTTPException(status_code=422, detail="Select an approved cash/bank account for this location")
         party, items = payment_open_items(payload.payment_type, payload.party_code, clone_session, operational_session)
         operational_party = (operational_session.scalar(select(OperationalPartyMaster).where(
             OperationalPartyMaster.party_code == payload.party_code))
@@ -1825,7 +4345,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     def payments(request: Request, operational_session=Depends(operational_session_dependency)):
         user = current_user(request)
         rows = list_payments(operational_session, allowed_locations=user.allowed_locations if user else ())
-        return {"items": [payment_payload(row) for row in rows], "total": len(rows),
+        return {"items": [payment_payload(row, operational_session) for row in rows], "total": len(rows),
                 "posting_enabled": False, "controls": payment_control_counts(operational_session)}
 
     @app.get("/api/v1/payments/{payment_key}")
@@ -1835,7 +4355,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         user = current_user(request)
         if not payment or not user or not location_allowed(user, payment.location_code):
             raise HTTPException(status_code=404, detail="Payment not found")
-        return payment_payload(payment)
+        return payment_payload(payment, operational_session)
 
     @app.post("/api/v1/payments", status_code=201)
     def new_payment(payload: PaymentRequest, request: Request,
@@ -1852,7 +4372,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 amount=payload.amount, notes=payload.notes, lines=allocations)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return payment_payload(payment)
+        return payment_payload(payment, operational_session)
 
     @app.put("/api/v1/payments/{payment_key}")
     def edit_payment(payment_key: str, payload: PaymentRequest, request: Request,
@@ -1874,7 +4394,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 amount=payload.amount, notes=payload.notes, lines=allocations)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return payment_payload(payment)
+        return payment_payload(payment, operational_session)
 
     def payment_action(payment_key: str, action: str, payload: DraftTransitionRequest,
                        request: Request, operational_session: Session):
@@ -1886,7 +4406,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             raise HTTPException(status_code=404, detail="Payment not found")
         try:
             return payment_payload(transition_payment(operational_session, payment,
-                expected_revision=payload.expected_revision, action=action, actor=user.username, note=payload.note))
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username, note=payload.note), operational_session)
         except PermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1919,6 +4440,708 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             return rehearse_payment_posting(operational_session, payment, actor=user.username)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/cash-management")
+    def cash_management(request: Request,
+                        operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        payload = cash_management_payload(operational_session)
+        if user and "*" not in user.allowed_locations:
+            allowed = set(user.allowed_locations)
+            payload["accounts"] = [row for row in payload["accounts"] if row["location_code"] in allowed]
+            allowed_keys = {row["account_key"] for row in payload["accounts"]}
+            payload["statements"] = [row for row in payload["statements"] if row["account_key"] in allowed_keys]
+        return payload
+
+    @app.post("/api/v1/cash-management/accounts", status_code=201)
+    def request_cash_account(payload: CashAccountRequest, request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "cash.account.prepare")
+        if not location_allowed(user, payload.location_code):
+            raise HTTPException(status_code=403, detail="Cash/bank account location is outside the user's scope")
+        try:
+            row = create_cash_account(operational_session, actor=user.username, **payload.model_dump())
+            return cash_account_payload(row)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/cash-management/accounts/{account_key}/{action}")
+    def decide_cash_account_route(account_key: str, action: str, payload: CashDecisionRequest,
+                                  request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        if action not in {"approve", "reject"}:
+            raise HTTPException(status_code=404, detail="Cash/bank account action not found")
+        user = require_csrf(request, "cash.account.approve")
+        row = operational_session.scalar(select(OperationalCashAccount).where(
+            OperationalCashAccount.account_key == account_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Cash/bank account not found")
+        try:
+            return cash_account_payload(decide_cash_account(operational_session, row,
+                action=action, expected_revision=payload.expected_revision,
+                actor=user.username, note=payload.note))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/cash-management/statements", status_code=201)
+    def import_bank_statement(payload: StatementBatchRequest, request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "bank.statement.import")
+        account = operational_session.scalar(select(OperationalCashAccount).where(
+            OperationalCashAccount.account_key == payload.account_key).with_for_update())
+        if not account or not location_allowed(user, account.location_code):
+            raise HTTPException(status_code=404, detail="Approved bank account not found")
+        try:
+            batch = create_statement_batch(operational_session, account=account,
+                statement_reference=payload.statement_reference,
+                statement_start=payload.statement_start, statement_end=payload.statement_end,
+                opening_balance=payload.opening_balance, closing_balance=payload.closing_balance,
+                source_file_name=payload.source_file_name, actor=user.username,
+                lines=[line.model_dump() for line in payload.lines])
+            return statement_payload(operational_session, batch)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    def statement_and_line(batch_key: str, line_no: int, operational_session: Session):
+        batch = operational_session.scalar(select(OperationalStatementBatch).where(
+            OperationalStatementBatch.batch_key == batch_key).with_for_update())
+        line = operational_session.scalar(select(OperationalStatementLine).where(
+            OperationalStatementLine.batch_id == batch.id,
+            OperationalStatementLine.line_no == line_no).with_for_update()) if batch else None
+        return batch, line
+
+    @app.post("/api/v1/cash-management/statements/{batch_key}/lines/{line_no}/match")
+    def match_bank_statement_line(batch_key: str, line_no: int, payload: StatementMatchRequest,
+                                  request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "bank.reconcile.prepare")
+        batch, line = statement_and_line(batch_key, line_no, operational_session)
+        if not batch or not line or not location_allowed(user, batch.account.location_code):
+            raise HTTPException(status_code=404, detail="Statement line not found")
+        payment = operational_session.scalar(select(OperationalPayment).where(
+            OperationalPayment.payment_key == payload.payment_key).with_for_update())
+        if not payment:
+            raise HTTPException(status_code=404, detail="Receipt/payment not found")
+        try:
+            match_statement_line(operational_session, batch, line, payment, actor=user.username)
+            return statement_payload(operational_session, batch)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/cash-management/statements/{batch_key}/lines/{line_no}/exception")
+    def explain_bank_statement_line(batch_key: str, line_no: int,
+                                    payload: StatementExceptionRequest, request: Request,
+                                    operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "bank.reconcile.prepare")
+        batch, line = statement_and_line(batch_key, line_no, operational_session)
+        if not batch or not line or not location_allowed(user, batch.account.location_code):
+            raise HTTPException(status_code=404, detail="Statement line not found")
+        try:
+            explain_statement_line(operational_session, batch, line, category=payload.category,
+                                   reason=payload.reason, actor=user.username)
+            return statement_payload(operational_session, batch)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/cash-management/statements/{batch_key}/actions/{action}")
+    def transition_bank_statement(batch_key: str, action: str,
+                                  payload: StatementDecisionRequest, request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        permissions = {"submit": "bank.reconcile.prepare", "approve": "bank.reconcile.approve",
+                       "reject": "bank.reconcile.approve"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="Reconciliation action not found")
+        user = require_csrf(request, permissions[action])
+        batch = operational_session.scalar(select(OperationalStatementBatch).where(
+            OperationalStatementBatch.batch_key == batch_key).with_for_update())
+        if not batch or not location_allowed(user, batch.account.location_code):
+            raise HTTPException(status_code=404, detail="Statement reconciliation not found")
+        try:
+            transition_statement_batch(operational_session, batch, action=action,
+                expected_revision=payload.expected_revision, actor=user.username, note=payload.note)
+            return statement_payload(operational_session, batch)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/cash-management/statements/{batch_key}/rehearsal")
+    def rehearse_bank_statement(batch_key: str, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "bank.reconcile.rehearse")
+        batch = operational_session.scalar(select(OperationalStatementBatch).where(
+            OperationalStatementBatch.batch_key == batch_key).with_for_update())
+        if not batch or not location_allowed(user, batch.account.location_code):
+            raise HTTPException(status_code=404, detail="Statement reconciliation not found")
+        try:
+            return rehearse_reconciliation(operational_session, batch, actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/expense-management/workspace")
+    def expenses_workspace(request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        payload = expense_workspace_payload(operational_session)
+        if user and "*" not in user.allowed_locations:
+            allowed = set(user.allowed_locations)
+            payload["accounts"] = [row for row in payload["accounts"] if row["location_code"] in allowed]
+            payload["claims"] = [row for row in payload["claims"] if row["location_code"] in allowed]
+            payload["advances"] = [row for row in payload["advances"] if row["location_code"] in allowed]
+        return payload
+
+    @app.post("/api/v1/expense-management/claims", status_code=201)
+    def create_expense_claim_route(payload: ExpenseClaimRequest, request: Request,
+                                   operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "expense.prepare")
+        if not location_allowed(user, payload.location_code):
+            raise HTTPException(status_code=403, detail="Expense location is outside the user's scope")
+        try:
+            row = create_expense_claim(operational_session, actor=user.username, **payload.model_dump())
+            return expense_claim_payload(operational_session, row)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/expense-management/claims/{claim_key}/actions/{action}")
+    def expense_claim_action(claim_key: str, action: str, payload: ExpenseActionRequest,
+                             request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        permissions = {"submit": "expense.submit", "cancel": "expense.submit",
+                       "approve": "expense.approve", "reject": "expense.approve"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="Expense action not found")
+        user = require_csrf(request, permissions[action])
+        row = operational_session.scalar(select(OperationalExpenseClaim).where(
+            OperationalExpenseClaim.claim_key == claim_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Expense claim not found")
+        try:
+            transition_expense_claim(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, actor=user.username, note=payload.note)
+            return expense_claim_payload(operational_session, row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/expense-management/claims/{claim_key}/rehearsal")
+    def expense_claim_rehearsal(claim_key: str, request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "expense.rehearse")
+        row = operational_session.scalar(select(OperationalExpenseClaim).where(
+            OperationalExpenseClaim.claim_key == claim_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Expense claim not found")
+        try:
+            return rehearse_expense(operational_session, row, actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/expense-management/petty-cash", status_code=201)
+    def create_petty_cash_route(payload: PettyCashAdvanceRequest, request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "petty_cash.prepare")
+        if not location_allowed(user, payload.location_code):
+            raise HTTPException(status_code=403, detail="Petty-cash location is outside the user's scope")
+        try:
+            row = create_petty_cash_advance(operational_session, actor=user.username, **payload.model_dump())
+            return petty_advance_payload(operational_session, row)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/expense-management/petty-cash/{advance_key}/actions/{action}")
+    def petty_cash_action(advance_key: str, action: str, payload: PettyCashActionRequest,
+                          request: Request,
+                          operational_session=Depends(operational_session_dependency)):
+        permissions = {"approve": "petty_cash.approve", "reject": "petty_cash.approve",
+                       "cancel": "petty_cash.manage", "issue": "petty_cash.manage",
+                       "settle": "petty_cash.manage"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="Petty-cash action not found")
+        user = require_csrf(request, permissions[action])
+        row = operational_session.scalar(select(OperationalPettyCashAdvance).where(
+            OperationalPettyCashAdvance.advance_key == advance_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Petty-cash advance not found")
+        try:
+            transition_petty_cash_advance(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, actor=user.username,
+                note=payload.note, spent_amount=payload.spent_amount,
+                returned_amount=payload.returned_amount, category_code=payload.category_code,
+                receipt_reference=payload.receipt_reference)
+            return petty_advance_payload(operational_session, row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/expense-management/petty-cash/{advance_key}/rehearsal")
+    def petty_cash_rehearsal(advance_key: str, request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"expense.rehearse", "petty_cash.manage"})
+        row = operational_session.scalar(select(OperationalPettyCashAdvance).where(
+            OperationalPettyCashAdvance.advance_key == advance_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Petty-cash advance not found")
+        try:
+            return rehearse_petty_cash(operational_session, row, actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/fixed-assets/workspace")
+    def fixed_assets_workspace(request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        payload = fixed_asset_workspace_payload(operational_session)
+        if user and "*" not in user.allowed_locations:
+            allowed = set(user.allowed_locations)
+            payload["assets"] = [row for row in payload["assets"] if row["location_code"] in allowed]
+        return payload
+
+    @app.post("/api/v1/fixed-assets", status_code=201)
+    def create_fixed_asset_route(payload: FixedAssetCreateRequest, request: Request,
+                                 operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "fixed_asset.prepare")
+        if not location_allowed(user, payload.location_code):
+            raise HTTPException(status_code=403, detail="Asset location is outside the user's scope")
+        try:
+            row = create_fixed_asset(operational_session, actor=user.username, **payload.model_dump())
+            return fixed_asset_payload(operational_session, row)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/fixed-assets/{asset_key}/actions/{action}")
+    def fixed_asset_action(asset_key: str, action: str, payload: FixedAssetActionRequest,
+                           request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        permissions = {"submit": "fixed_asset.submit", "cancel": "fixed_asset.submit",
+                       "approve": "fixed_asset.approve", "reject": "fixed_asset.approve"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="Fixed-asset action not found")
+        user = require_csrf(request, permissions[action])
+        row = operational_session.scalar(select(OperationalFixedAsset).where(
+            OperationalFixedAsset.asset_key == asset_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Fixed asset not found")
+        try:
+            transition_fixed_asset(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, actor=user.username, note=payload.note)
+            return fixed_asset_payload(operational_session, row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/fixed-assets/{asset_key}/disposal/request")
+    def fixed_asset_disposal_request(asset_key: str, payload: FixedAssetDisposalRequest,
+                                     request: Request,
+                                     operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "fixed_asset.disposal.prepare")
+        row = operational_session.scalar(select(OperationalFixedAsset).where(
+            OperationalFixedAsset.asset_key == asset_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Fixed asset not found")
+        try:
+            request_asset_disposal(operational_session, row, actor=user.username,
+                **payload.model_dump())
+            return fixed_asset_payload(operational_session, row)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/fixed-assets/{asset_key}/disposal/{action}")
+    def fixed_asset_disposal_decision(asset_key: str, action: str,
+                                      payload: FixedAssetActionRequest, request: Request,
+                                      operational_session=Depends(operational_session_dependency)):
+        if action not in {"approve", "reject"}:
+            raise HTTPException(status_code=404, detail="Fixed-asset disposal action not found")
+        user = require_csrf(request, "fixed_asset.disposal.approve")
+        row = operational_session.scalar(select(OperationalFixedAsset).where(
+            OperationalFixedAsset.asset_key == asset_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Fixed asset not found")
+        try:
+            decide_asset_disposal(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, actor=user.username,
+                note=payload.note or "")
+            return fixed_asset_payload(operational_session, row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/fixed-assets/{asset_key}/rehearsal")
+    def fixed_asset_rehearsal(asset_key: str, payload: FixedAssetRehearsalRequest,
+                              request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "fixed_asset.rehearse")
+        row = operational_session.scalar(select(OperationalFixedAsset).where(
+            OperationalFixedAsset.asset_key == asset_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Fixed asset not found")
+        try:
+            return rehearse_fixed_asset(operational_session, row, actor=user.username,
+                **payload.model_dump())
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/vat-control/workspace")
+    def vat_control_workspace(operational_session=Depends(operational_session_dependency)):
+        return vat_workspace_payload(operational_session)
+
+    @app.post("/api/v1/vat-control/periods", status_code=201)
+    def create_vat_period_route(payload: VatPeriodCreateRequest, request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "vat.period.prepare")
+        try:
+            row = create_vat_period(operational_session, actor=user.username, **payload.model_dump())
+            return vat_period_payload(operational_session, row)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/vat-control/periods/{period_key}/actions/{action}")
+    def vat_period_action(period_key: str, action: str, payload: VatWorkflowRequest,
+                          request: Request,
+                          operational_session=Depends(operational_session_dependency)):
+        permissions = {"submit": "vat.period.submit", "cancel": "vat.period.submit",
+                       "approve": "vat.period.approve", "reject": "vat.period.approve"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="VAT-period action not found")
+        user = require_csrf(request, permissions[action])
+        row = operational_session.scalar(select(OperationalVatPeriod).where(
+            OperationalVatPeriod.period_key == period_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="VAT period not found")
+        try:
+            transition_vat_period(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, actor=user.username, note=payload.note)
+            return vat_period_payload(operational_session, row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/vat-control/periods/{period_key}/adjustments", status_code=201)
+    def create_vat_adjustment_route(period_key: str, payload: VatAdjustmentCreateRequest,
+                                    request: Request,
+                                    operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "vat.adjustment.prepare")
+        period = operational_session.scalar(select(OperationalVatPeriod).where(
+            OperationalVatPeriod.period_key == period_key).with_for_update())
+        if not period:
+            raise HTTPException(status_code=404, detail="VAT period not found")
+        try:
+            row = create_vat_adjustment(operational_session, period, actor=user.username,
+                                        **payload.model_dump())
+            return vat_adjustment_payload(row)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/vat-control/adjustments/{adjustment_key}/{action}")
+    def vat_adjustment_action(adjustment_key: str, action: str,
+                              payload: VatWorkflowRequest, request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        permissions = {"approve": "vat.adjustment.approve", "reject": "vat.adjustment.approve",
+                       "cancel": "vat.adjustment.prepare"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="VAT-adjustment action not found")
+        user = require_csrf(request, permissions[action])
+        row = operational_session.scalar(select(OperationalVatAdjustment).where(
+            OperationalVatAdjustment.adjustment_key == adjustment_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="VAT adjustment not found")
+        try:
+            decide_vat_adjustment(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, actor=user.username,
+                note=payload.note or "")
+            return vat_adjustment_payload(row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/vat-control/periods/{period_key}/rehearsal")
+    def vat_return_rehearsal(period_key: str, request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "vat.rehearse")
+        row = operational_session.scalar(select(OperationalVatPeriod).where(
+            OperationalVatPeriod.period_key == period_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="VAT period not found")
+        try:
+            return rehearse_vat_return(operational_session, row, actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/period-close/workspace")
+    def period_close_workspace(operational_session=Depends(operational_session_dependency)):
+        return period_close_workspace_payload(operational_session)
+
+    @app.post("/api/v1/period-close", status_code=201)
+    def create_period_close_route(payload: PeriodCloseCreateRequest, request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "close.prepare")
+        try:
+            row = create_period_close(operational_session, actor=user.username, **payload.model_dump())
+            return period_close_payload(operational_session, row)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/period-close/{close_key}/actions/{action}")
+    def period_close_action(close_key: str, action: str, payload: PeriodCloseWorkflowRequest,
+                            request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        permissions = {"submit": "close.submit", "cancel": "close.submit",
+                       "approve": "close.approve", "reject": "close.approve"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="Period-close action not found")
+        user = require_csrf(request, permissions[action])
+        row = operational_session.scalar(select(OperationalPeriodClose).where(
+            OperationalPeriodClose.close_key == close_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Period-close package not found")
+        try:
+            transition_period_close(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, actor=user.username,
+                note=payload.note or "")
+            return period_close_payload(operational_session, row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/period-close/{close_key}/adjustments", status_code=201)
+    def create_close_adjustment_route(close_key: str, payload: CloseAdjustmentCreateRequest,
+                                      request: Request,
+                                      operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "close.adjustment.prepare")
+        row = operational_session.scalar(select(OperationalPeriodClose).where(
+            OperationalPeriodClose.close_key == close_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Period-close package not found")
+        try:
+            item = create_close_adjustment(operational_session, row, actor=user.username,
+                                           **payload.model_dump())
+            return close_adjustment_payload(item)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/period-close/adjustments/{adjustment_key}/{action}")
+    def close_adjustment_action(adjustment_key: str, action: str,
+                                payload: PeriodCloseWorkflowRequest, request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        permissions = {"approve": "close.adjustment.approve", "reject": "close.adjustment.approve",
+                       "cancel": "close.adjustment.prepare"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="Close-adjustment action not found")
+        user = require_csrf(request, permissions[action])
+        row = operational_session.scalar(select(OperationalCloseAdjustment).where(
+            OperationalCloseAdjustment.adjustment_key == adjustment_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Close adjustment not found")
+        try:
+            decide_close_adjustment(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, actor=user.username,
+                note=payload.note or "")
+            return close_adjustment_payload(row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/period-close/{close_key}/rehearsal")
+    def period_close_rehearsal(close_key: str, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "close.rehearse")
+        row = operational_session.scalar(select(OperationalPeriodClose).where(
+            OperationalPeriodClose.close_key == close_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Period-close package not found")
+        try:
+            return rehearse_period_close(operational_session, row, actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/close-reporting/workspace")
+    def close_reporting_workspace(operational_session=Depends(operational_session_dependency)):
+        return reporting_workspace_payload(operational_session)
+
+    @app.post("/api/v1/close-reporting/{close_key}/generate", status_code=201)
+    def generate_close_reporting_package(close_key: str, request: Request,
+                                         operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "financial_report.prepare")
+        close = operational_session.scalar(select(OperationalPeriodClose).where(
+            OperationalPeriodClose.close_key == close_key).with_for_update())
+        if not close:
+            raise HTTPException(status_code=404, detail="Approved close package not found")
+        try:
+            row = generate_report_package(operational_session, close, actor=user.username)
+            return report_package_payload(row)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/close-reporting/packages/{package_key}/{action}")
+    def close_reporting_action(package_key: str, action: str, payload: PeriodCloseWorkflowRequest,
+                               request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        permissions = {"submit": "financial_report.submit", "approve": "financial_report.approve",
+                       "reject": "financial_report.approve"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="Financial-report action not found")
+        user = require_csrf(request, permissions[action])
+        row = operational_session.scalar(select(OperationalFinancialReportPackage).where(
+            OperationalFinancialReportPackage.package_key == package_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Financial-report package not found")
+        try:
+            transition_report_package(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, note=payload.note or "", actor=user.username)
+            return report_package_payload(row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/close-reporting/packages/{package_key}/export/{format_name}")
+    def export_close_reporting_package(package_key: str, format_name: str, request: Request,
+                                       operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        if not user or "financial_report.export" not in user.permissions:
+            raise HTTPException(status_code=403, detail="Permission financial_report.export is required")
+        row = operational_session.scalar(select(OperationalFinancialReportPackage).where(
+            OperationalFinancialReportPackage.package_key == package_key))
+        if not row or row.status != "approved":
+            raise HTTPException(status_code=409, detail="Exports require an approved financial-report package")
+        if format_name == "xlsx":
+            content, media = workbook_bytes(row), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif format_name == "pdf":
+            content, media = pdf_bytes(row), "application/pdf"
+        else:
+            raise HTTPException(status_code=404, detail="Export format not found")
+        return Response(content=content, media_type=media,
+            headers={"Content-Disposition": f'attachment; filename="{row.package_no}.{format_name}"'})
+
+    @app.get("/api/v1/audit-compliance/workspace")
+    def audit_compliance_workspace(request: Request,
+                                   operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        if not user or "audit_compliance.read" not in user.permissions:
+            raise HTTPException(status_code=403, detail="Permission audit_compliance.read is required")
+        return audit_compliance_workspace_payload(operational_session)
+
+    @app.post("/api/v1/audit-compliance/reports/{report_key}/generate", status_code=201)
+    def generate_audit_compliance_package(report_key: str, request: Request,
+                                          operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "audit_compliance.prepare")
+        report = operational_session.scalar(select(OperationalFinancialReportPackage).where(
+            OperationalFinancialReportPackage.package_key == report_key).with_for_update())
+        if not report:
+            raise HTTPException(status_code=404, detail="Approved financial report not found")
+        try:
+            return statutory_package_payload(generate_statutory_package(
+                operational_session, report, actor=user.username))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/audit-compliance/packages/{package_key}/{action}")
+    def audit_compliance_action(package_key: str, action: str, payload: PeriodCloseWorkflowRequest,
+                                request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        permissions = {"submit": "audit_compliance.submit", "approve": "audit_compliance.approve",
+                       "reject": "audit_compliance.approve"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="Statutory-package action not found")
+        user = require_csrf(request, permissions[action])
+        row = operational_session.scalar(select(OperationalStatutoryEvidencePackage).where(
+            OperationalStatutoryEvidencePackage.package_key == package_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Statutory evidence package not found")
+        try:
+            transition_statutory_package(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, note=payload.note or "", actor=user.username)
+            return statutory_package_payload(row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/audit-compliance/packages/{package_key}/export/{format_name}")
+    def export_audit_compliance_package(package_key: str, format_name: str, request: Request,
+                                        operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        if not user or "audit_compliance.export" not in user.permissions:
+            raise HTTPException(status_code=403, detail="Permission audit_compliance.export is required")
+        row = operational_session.scalar(select(OperationalStatutoryEvidencePackage).where(
+            OperationalStatutoryEvidencePackage.package_key == package_key))
+        if not row or row.status != "approved":
+            raise HTTPException(status_code=409, detail="Exports require an approved statutory evidence package")
+        if format_name == "xlsx":
+            content = statutory_workbook_bytes(row)
+            media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif format_name == "json":
+            content, media = statutory_json_bytes(row), "application/json"
+        else:
+            raise HTTPException(status_code=404, detail="Export format not found")
+        return Response(content=content, media_type=media,
+            headers={"Content-Disposition": f'attachment; filename="{row.package_no}.{format_name}"'})
+
+    @app.get("/api/v1/cutover-rehearsal/workspace")
+    def cutover_rehearsal_workspace(request: Request,
+                                    operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        if not user or "cutover_rehearsal.read" not in user.permissions:
+            raise HTTPException(status_code=403, detail="Permission cutover_rehearsal.read is required")
+        return cutover_rehearsal_workspace_payload(operational_session)
+
+    @app.post("/api/v1/cutover-rehearsal/generate", status_code=201)
+    def generate_cutover_rehearsal_package(request: Request,
+                                           operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "cutover_rehearsal.prepare")
+        return cutover_rehearsal_payload(generate_cutover_rehearsal(
+            operational_session, actor=user.username))
+
+    @app.post("/api/v1/cutover-rehearsal/packages/{package_key}/{action}")
+    def cutover_rehearsal_action(package_key: str, action: str, payload: PeriodCloseWorkflowRequest,
+                                 request: Request,
+                                 operational_session=Depends(operational_session_dependency)):
+        permissions = {"submit": "cutover_rehearsal.submit", "approve": "cutover_rehearsal.approve",
+                       "reject": "cutover_rehearsal.approve"}
+        if action not in permissions:
+            raise HTTPException(status_code=404, detail="Cutover-rehearsal action not found")
+        user = require_csrf(request, permissions[action])
+        row = operational_session.scalar(select(OperationalCutoverRehearsalPackage).where(
+            OperationalCutoverRehearsalPackage.package_key == package_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Cutover rehearsal not found")
+        try:
+            transition_cutover_rehearsal(operational_session, row, action=action,
+                expected_revision=payload.expected_revision, note=payload.note or "", actor=user.username)
+            return cutover_rehearsal_payload(row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/cutover-rehearsal/packages/{package_key}/export/{format_name}")
+    def export_cutover_rehearsal_package(package_key: str, format_name: str, request: Request,
+                                         operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        if not user or "cutover_rehearsal.export" not in user.permissions:
+            raise HTTPException(status_code=403, detail="Permission cutover_rehearsal.export is required")
+        row = operational_session.scalar(select(OperationalCutoverRehearsalPackage).where(
+            OperationalCutoverRehearsalPackage.package_key == package_key))
+        if not row or row.status != "approved":
+            raise HTTPException(status_code=409, detail="Exports require an approved cutover rehearsal")
+        if format_name == "xlsx":
+            content = cutover_workbook_bytes(row)
+            media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        elif format_name == "json":
+            content, media = cutover_json_bytes(row), "application/json"
+        else:
+            raise HTTPException(status_code=404, detail="Export format not found")
+        return Response(content=content, media_type=media,
+            headers={"Content-Disposition": f'attachment; filename="{row.package_no}.{format_name}"'})
 
     def require_integrated_resource(request: Request, operational_session, resource_type: str,
                                     resource_key: str, permission: str):
@@ -1956,7 +5179,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             "secure_cookies": app.state.secure_cookies,
             "explicit_allowed_hosts": bool(security_settings["allowed_hosts"]),
             "operational_postgresql": operational_url.startswith("postgresql"),
-            "hr_payroll_excluded": True,
+            "hrm_included": True,
+            "payroll_excluded": True,
             "posting_dual_control": (not security_settings["posting_requested"]
                                      or (security_settings["posting_confirmed"]
                                          and len(security_settings["posting_approval_reference"]) >= 8)),
@@ -1967,6 +5191,11 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             "posting_approval_reference_present": bool(app.state.posting_approval_reference),
             "gates": gates,
         }
+
+    @app.get("/api/v1/completion-audit")
+    def completion_audit(request: Request):
+        require_user(request, "clone.read")
+        return completion_audit_payload({route.path for route in request.app.routes})
 
     @app.post("/api/v1/posting/{resource_type}/{resource_key}")
     def post_integrated_resource(resource_type: str, resource_key: str, payload: PostingExecutionRequest,
@@ -2076,7 +5305,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             "atomic_source": snapshot.is_atomic,
             "mode": "read_only_preview",
             "posting_enabled": False,
-            "hr_payroll_enabled": False,
+            "hrm_enabled": app.state.operational_sessions is not None,
+            "payroll_enabled": False,
             "counts": latest_counts,
             "baseline_counts": baseline_counts,
             "delta_overlay": _overlay_status(overlay),
@@ -2435,13 +5665,13 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     def sales(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
               q: str | None = Query(None, max_length=120),
               snapshot: SourceSnapshot = Depends(snapshot_dependency), session: Session = Depends(session_dependency)):
-        return documents(("sale", "sale_return"), limit, offset, q, snapshot, session)
+        return documents(("sale",), limit, offset, q, snapshot, session)
 
     @app.get("/api/v1/purchases")
     def purchases(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
                   q: str | None = Query(None, max_length=120),
                   snapshot: SourceSnapshot = Depends(snapshot_dependency), session: Session = Depends(session_dependency)):
-        return documents(("purchase", "purchase_return"), limit, offset, q, snapshot, session)
+        return documents(("purchase",), limit, offset, q, snapshot, session)
 
     @app.get("/api/v1/inventory")
     def inventory(limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0),
@@ -2512,6 +5742,235 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         require_finance_report_scope(request, snapshot, session)
         return build_ageing_report(session, operational_session, snapshot_id=snapshot.id,
             ledger_kind=ledger_kind, as_of=as_of or date.today(), query=q, limit=limit, offset=offset)
+
+    @app.get("/api/v1/reports/customer-statement")
+    def customer_statement(request: Request, party_code: str = Query(min_length=1, max_length=80),
+                           as_of: date | None = Query(None),
+                           snapshot: SourceSnapshot = Depends(snapshot_dependency),
+                           session: Session = Depends(session_dependency),
+                           operational_session=Depends(operational_session_dependency)):
+        require_finance_report_scope(request, snapshot, session)
+        party = session.scalar(select(ErpParty).where(
+            ErpParty.snapshot_id == snapshot.id,
+            ErpParty.party_code == party_code,
+            ErpParty.party_kind.in_(("customer", "both"))))
+        if not party:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        return build_customer_statement(operational_session, party_code=party.party_code,
+                                        party_name=party.legal_or_business_name,
+                                        as_of=as_of or date.today())
+
+    def credit_customer(snapshot: SourceSnapshot, session: Session, party_code: str):
+        party = session.scalar(select(ErpParty).where(
+            ErpParty.snapshot_id == snapshot.id,
+            ErpParty.party_code == party_code,
+            ErpParty.party_kind.in_(("customer", "both"))))
+        if not party:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        return party
+
+    @app.get("/api/v1/credit-control")
+    def credit_control_workspace(request: Request, as_of: date | None = Query(None),
+                                 q: str = Query("", max_length=120),
+                                 snapshot: SourceSnapshot = Depends(snapshot_dependency),
+                                 session: Session = Depends(session_dependency),
+                                 operational_session=Depends(operational_session_dependency)):
+        require_finance_report_scope(request, snapshot, session)
+        filters = [ErpParty.snapshot_id == snapshot.id,
+                   ErpParty.party_kind.in_(("customer", "both"))]
+        if q.strip():
+            pattern = f"%{q.strip()}%"
+            filters.append(or_(ErpParty.party_code.ilike(pattern),
+                               ErpParty.legal_or_business_name.ilike(pattern)))
+        parties = [{"party_code": row.party_code, "party_name": row.legal_or_business_name}
+                   for row in session.scalars(select(ErpParty).where(*filters).order_by(
+                       ErpParty.legal_or_business_name))]
+        return credit_workspace_payload(operational_session, parties, as_of=as_of or date.today())
+
+    @app.post("/api/v1/credit-control/limit-requests", status_code=201)
+    def new_credit_limit_request(payload: CreditLimitRequestCreate, request: Request,
+                                 snapshot: SourceSnapshot = Depends(snapshot_dependency),
+                                 session: Session = Depends(session_dependency),
+                                 operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "credit.limit.prepare")
+        party = credit_customer(snapshot, session, payload.party_code)
+        try:
+            row = create_credit_limit_request(operational_session,
+                party_code=party.party_code, party_name=party.legal_or_business_name,
+                proposed_limit=payload.proposed_limit,
+                proposed_terms_days=payload.proposed_terms_days,
+                reason=payload.reason, actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return credit_request_payload(row)
+
+    @app.post("/api/v1/credit-control/limit-requests/{request_key}/{action}")
+    def credit_limit_action(request_key: str, action: str, payload: CreditWorkflowRequest,
+                            request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        if action not in {"approve", "reject", "cancel"}:
+            raise HTTPException(status_code=404, detail="Credit workflow action not found")
+        permission = "credit.limit.approve" if action in {"approve", "reject"} else "credit.limit.prepare"
+        user = require_csrf(request, permission)
+        row = operational_session.scalar(select(OperationalCreditLimitRequest).where(
+            OperationalCreditLimitRequest.request_key == request_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Credit-limit request not found")
+        try:
+            row = transition_credit_limit_request(operational_session, row,
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username, note=payload.note)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return credit_request_payload(row)
+
+    @app.post("/api/v1/credit-control/profiles/{party_code}/{action}")
+    def credit_hold_action(party_code: str, action: str, payload: CreditWorkflowRequest,
+                           request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        if action not in {"hold", "release"}:
+            raise HTTPException(status_code=404, detail="Credit action not found")
+        user = require_csrf(request, "credit.hold.release")
+        profile = operational_session.scalar(select(OperationalCustomerCreditProfile).where(
+            OperationalCustomerCreditProfile.party_code == party_code).with_for_update())
+        if not profile:
+            raise HTTPException(status_code=404, detail="Approved customer credit profile not found")
+        try:
+            profile = set_credit_hold(operational_session, profile,
+                expected_revision=payload.expected_revision, action=action,
+                reason=payload.note, actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"party_code": profile.party_code, "status": profile.status,
+                "revision": profile.revision, "hold_reason": profile.hold_reason,
+                "posting_enabled": False}
+
+    @app.post("/api/v1/credit-control/overrides", status_code=201)
+    def new_credit_override(payload: CreditOverrideRequestCreate, request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "credit.override.prepare")
+        quotation = operational_session.scalar(select(OperationalSalesQuotation).where(
+            OperationalSalesQuotation.quotation_key == payload.quotation_key).with_for_update())
+        if not quotation or not location_allowed(user, quotation.location_code):
+            raise HTTPException(status_code=404, detail="Sales quotation not found")
+        try:
+            row = create_credit_override_request(operational_session, quotation,
+                valid_until=payload.valid_until, reason=payload.reason,
+                actor=user.username, as_of=date.today())
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return credit_override_payload(row)
+
+    @app.post("/api/v1/credit-control/overrides/{request_key}/{action}")
+    def credit_override_action(request_key: str, action: str, payload: CreditWorkflowRequest,
+                               request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        if action not in {"approve", "reject", "cancel"}:
+            raise HTTPException(status_code=404, detail="Credit override action not found")
+        permission = "credit.override.approve" if action in {"approve", "reject"} else "credit.override.prepare"
+        user = require_csrf(request, permission)
+        row = operational_session.scalar(select(OperationalCreditOverrideRequest).where(
+            OperationalCreditOverrideRequest.request_key == request_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Credit override request not found")
+        try:
+            row = transition_credit_override_request(operational_session, row,
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username, note=payload.note)
+        except PermissionError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return credit_override_payload(row)
+
+    @app.post("/api/v1/credit-control/dunning", status_code=201)
+    def new_dunning_request(payload: DunningRequestCreate, request: Request,
+                            snapshot: SourceSnapshot = Depends(snapshot_dependency),
+                            session: Session = Depends(session_dependency),
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "collection.escalation.prepare")
+        party = credit_customer(snapshot, session, payload.party_code)
+        try:
+            row = create_dunning_request(operational_session,
+                party_code=party.party_code, party_name=party.legal_or_business_name,
+                stage=payload.stage, reason=payload.reason,
+                actor=user.username, as_of=date.today())
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return dunning_request_payload(row)
+
+    @app.post("/api/v1/credit-control/dunning/{request_key}/{action}")
+    def dunning_action(request_key: str, action: str, payload: CreditWorkflowRequest,
+                       request: Request,
+                       operational_session=Depends(operational_session_dependency)):
+        if action not in {"approve", "reject", "cancel", "complete"}:
+            raise HTTPException(status_code=404, detail="Dunning action not found")
+        permission = ("collection.escalation.approve" if action in {"approve", "reject"}
+                      else "collection.escalation.prepare")
+        user = require_csrf(request, permission)
+        row = operational_session.scalar(select(OperationalDunningRequest).where(
+            OperationalDunningRequest.request_key == request_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Dunning request not found")
+        try:
+            row = transition_dunning_request(operational_session, row,
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username, note=payload.note)
+        except PermissionError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return dunning_request_payload(row)
+
+    @app.post("/api/v1/credit-control/collections", status_code=201)
+    def new_collection_action(payload: CollectionActionCreate, request: Request,
+                              snapshot: SourceSnapshot = Depends(snapshot_dependency),
+                              session: Session = Depends(session_dependency),
+                              operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "collection.manage")
+        party = credit_customer(snapshot, session, payload.party_code)
+        if payload.invoice_no and not operational_session.scalar(select(OperationalCustomerInvoice.id).where(
+                OperationalCustomerInvoice.customer_code == payload.party_code,
+                OperationalCustomerInvoice.invoice_no == payload.invoice_no)):
+            raise HTTPException(status_code=422, detail="Target-ERP customer invoice not found for this customer")
+        try:
+            row = create_collection_action(operational_session,
+                party_code=party.party_code, party_name=party.legal_or_business_name,
+                invoice_no=payload.invoice_no, action_date=payload.action_date,
+                action_type=payload.action_type, outcome=payload.outcome,
+                next_followup_date=payload.next_followup_date,
+                promise_amount=payload.promise_amount, promise_date=payload.promise_date,
+                actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return collection_action_payload(row)
+
+    @app.post("/api/v1/credit-control/collections/{action_key}/{action}")
+    def collection_workflow_action(action_key: str, action: str,
+                                   payload: CollectionTransitionRequest, request: Request,
+                                   operational_session=Depends(operational_session_dependency)):
+        if action not in {"complete", "break", "cancel"}:
+            raise HTTPException(status_code=404, detail="Collection workflow action not found")
+        user = require_csrf(request, "collection.manage")
+        row = operational_session.scalar(select(OperationalCollectionAction).where(
+            OperationalCollectionAction.action_key == action_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Collection action not found")
+        try:
+            row = transition_collection_action(operational_session, row,
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return collection_action_payload(row)
 
     @app.get("/api/v1/reports")
     def reports(snapshot: SourceSnapshot = Depends(snapshot_dependency), session: Session = Depends(session_dependency)):

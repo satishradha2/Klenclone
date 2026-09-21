@@ -11,12 +11,27 @@ from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from .goods_receipts import OperationalGoodsReceipt, rehearse_goods_receipt_posting
 from .inventory_operations import OperationalInventoryDocument, OperationalInventoryReservation, rehearse_inventory_posting
-from .operational import MONEY, OperationalAuditEvent, OperationalBase, OperationalStockPosition, utc_now
+from .operational import (
+    MONEY, OperationalAuditEvent, OperationalBase, OperationalDraft,
+    OperationalStockPosition, OperationalStockReservation, utc_now,
+)
 from .payments import OperationalPayment, OperationalPaymentAllocationClaim, rehearse_payment_posting
-from .purchase_returns import OperationalPurchaseReturn, OperationalPurchaseReturnReservation, rehearse_purchase_return_posting
-from .sales_returns import OperationalSalesReturn, rehearse_sales_return_posting
+from .procurement_matching import (
+    OperationalSupplierAdjustment,
+    OperationalSupplierInvoice,
+    rehearse_supplier_adjustment_posting,
+    rehearse_supplier_invoice_posting,
+)
+from .purchase_returns import (
+    OperationalPurchaseReturn,
+    OperationalPurchaseReturnPostingRehearsal,
+    OperationalPurchaseReturnReservation,
+    rehearse_purchase_return_posting,
+)
+from .sales_returns import OperationalSalesReturn, OperationalSalesReturnPostingRehearsal, rehearse_sales_return_posting
+from .sales_invoices import OperationalSalesInvoicePostingRehearsal, rehearse_sales_invoice_posting
 
-RESOURCE_TYPES = {"inventory_document", "goods_receipt", "sales_return", "purchase_return", "payment"}
+RESOURCE_TYPES = {"inventory_document", "goods_receipt", "sales_invoice", "sales_return", "purchase_return", "payment", "supplier_invoice", "supplier_adjustment"}
 
 
 class OperationalIntegratedPostingBatch(OperationalBase):
@@ -24,7 +39,7 @@ class OperationalIntegratedPostingBatch(OperationalBase):
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_integrated_posting_idempotency"),
         UniqueConstraint("resource_type", "resource_key", "posting_sequence", name="uq_integrated_posting_resource_sequence"),
-        CheckConstraint("resource_type IN ('inventory_document','goods_receipt','sales_return','purchase_return','payment')", name="ck_integrated_posting_resource_type"),
+        CheckConstraint("resource_type IN ('inventory_document','goods_receipt','sales_invoice','sales_return','purchase_return','payment','supplier_invoice','supplier_adjustment')", name="ck_integrated_posting_resource_type"),
         CheckConstraint("batch_kind IN ('posting','reversal')", name="ck_integrated_posting_kind"),
         CheckConstraint("status IN ('posted','reversed')", name="ck_integrated_posting_status"),
     )
@@ -96,12 +111,20 @@ def _money(value) -> Decimal:
 
 
 def _resource(session: Session, resource_type: str, resource_key: str, *, lock: bool = False):
+    if resource_type == "sales_invoice":
+        query = select(OperationalDraft).where(
+            OperationalDraft.draft_key == resource_key,
+            OperationalDraft.document_type == "sale",
+        )
+        return session.scalar(query.with_for_update() if lock else query)
     mapping = {
         "inventory_document": (OperationalInventoryDocument, OperationalInventoryDocument.document_key),
         "goods_receipt": (OperationalGoodsReceipt, OperationalGoodsReceipt.receipt_key),
         "sales_return": (OperationalSalesReturn, OperationalSalesReturn.return_key),
         "purchase_return": (OperationalPurchaseReturn, OperationalPurchaseReturn.return_key),
         "payment": (OperationalPayment, OperationalPayment.payment_key),
+        "supplier_invoice": (OperationalSupplierInvoice, OperationalSupplierInvoice.invoice_key),
+        "supplier_adjustment": (OperationalSupplierAdjustment, OperationalSupplierAdjustment.adjustment_key),
     }
     if resource_type not in mapping:
         raise ValueError("Unsupported posting resource type")
@@ -119,16 +142,46 @@ def _plan(session: Session, resource_type: str, document, actor: str) -> dict:
         plan["subledger"] = []
     elif resource_type == "sales_return":
         plan = rehearse_sales_return_posting(session, document, actor=actor)
+        plan["journal"] = [{"account": row["account_code"], "debit": row["debit"], "credit": row["credit"]}
+                           for row in plan["journal"]]
         plan["subledger"] = [{"entry_type": "receivable_credit", "party_code": document.customer_code,
-            "source_type": "credit_note", "source_reference_key": document.credit_note.credit_note_no,
+            "source_type": "sales_invoice", "source_reference_key": document.original_invoice_reference,
             "amount": -document.total_amount}]
+    elif resource_type == "sales_invoice":
+        plan = rehearse_sales_invoice_posting(session, document, actor=actor)
+        plan["journal"] = [{"account": row["account_code"], "debit": row["debit"], "credit": row["credit"]}
+                           for row in plan["journal"]]
+        plan["subledger"] = [{"entry_type": "receivable_invoice", "party_code": document.party_code,
+            "source_type": "sales_invoice", "source_reference_key": document.draft_no,
+            "amount": document.total_amount}]
     elif resource_type == "purchase_return":
         plan = rehearse_purchase_return_posting(session, document, actor=actor)
+        plan["journal"] = [{"account": row["account_code"], "debit": row["debit"], "credit": row["credit"]}
+                           for row in plan["journal"]]
         plan["subledger"] = [{"entry_type": "payable_debit", "party_code": document.supplier_code,
-            "source_type": "debit_note", "source_reference_key": document.debit_note.debit_note_no,
+            "source_type": "supplier_invoice", "source_reference_key": plan["supplier_invoice_no"],
             "amount": -document.total_amount}]
-    else:
+    elif resource_type == "payment":
         plan = rehearse_payment_posting(session, document, actor=actor)
+    elif resource_type == "supplier_invoice":
+        plan = rehearse_supplier_invoice_posting(session, document, actor=actor)
+        plan["journal"] = [{"account": row["account_code"], "debit": row["debit"], "credit": row["credit"]}
+                           for row in plan["journal"]]
+        plan["movements"] = []
+        plan["subledger"] = [{"entry_type": "payable_invoice", "party_code": document.supplier_code,
+            "source_type": "supplier_invoice", "source_reference_key": document.supplier_invoice_no,
+            "amount": document.total_amount}]
+    else:
+        plan = rehearse_supplier_adjustment_posting(session, document, actor=actor)
+        invoice = session.get(OperationalSupplierInvoice, document.supplier_invoice_id)
+        plan["journal"] = [{"account": row["account_code"], "debit": row["debit"], "credit": row["credit"]}
+                           for row in plan["journal"]]
+        plan["movements"] = []
+        plan["subledger"] = [{"entry_type": ("payable_credit_note" if document.adjustment_type == "credit_note"
+                                               else "payable_debit_note"),
+            "party_code": document.supplier_code, "source_type": "supplier_invoice",
+            "source_reference_key": invoice.supplier_invoice_no,
+            "amount": (-document.total_amount if document.adjustment_type == "credit_note" else document.total_amount)}]
     return plan
 
 
@@ -161,6 +214,9 @@ def _control_rows(session: Session, resource_type: str, document, *, active_only
     elif resource_type == "payment":
         model = OperationalPaymentAllocationClaim
         query = select(model).where(model.payment_id == document.id)
+    elif resource_type == "sales_invoice":
+        model = OperationalStockReservation
+        query = select(model).where(model.draft_id == document.id)
     else:
         return []
     if active_only:
@@ -236,6 +292,15 @@ def execute_integrated_posting(session: Session, *, resource_type: str, resource
     expected_status = "accepted" if resource_type == "goods_receipt" else "approved"
     if document.status != expected_status:
         raise ValueError(f"Only a {expected_status} {resource_type.replace('_', ' ')} can be posted")
+    if resource_type in {"sales_invoice", "supplier_invoice", "supplier_adjustment", "purchase_return", "sales_return"}:
+        if document.created_by == actor:
+            raise ValueError(f"The {resource_type.replace('_', '-')} maker cannot execute its posting")
+    if resource_type == "supplier_invoice":
+        dependent_adjustment = session.scalar(select(OperationalSupplierAdjustment.id).where(
+            OperationalSupplierAdjustment.supplier_invoice_id == document.id,
+            OperationalSupplierAdjustment.status.in_(("submitted", "approved"))))
+        if dependent_adjustment:
+            raise ValueError("Submitted or approved supplier adjustments must be resolved before invoice posting")
     revision = document.revision
     plan = _plan(session, resource_type, document, actor)
     if idempotency_key != plan["idempotency_key"]:
@@ -339,6 +404,76 @@ def _execute_integrated_reversal(session: Session, batch: OperationalIntegratedP
     document = _resource(session, locked.resource_type, locked.resource_key, lock=True)
     if not document or document.status != "posted":
         raise ValueError("The posted resource is unavailable for reversal")
+    if locked.resource_type == "supplier_invoice":
+        payment_dependency = session.scalar(select(OperationalPaymentAllocationClaim.id).where(
+            OperationalPaymentAllocationClaim.party_code == document.supplier_code,
+            OperationalPaymentAllocationClaim.source_type == "invoice",
+            OperationalPaymentAllocationClaim.source_reference_key.in_((
+                document.invoice_key, document.supplier_invoice_no)),
+            OperationalPaymentAllocationClaim.status.in_(("active", "consumed"))))
+        if payment_dependency:
+            raise ValueError("A dependent supplier payment allocation prevents invoice reversal")
+        adjustment_dependency = session.scalar(select(OperationalSupplierAdjustment.id).where(
+            OperationalSupplierAdjustment.supplier_invoice_id == document.id,
+            OperationalSupplierAdjustment.created_at >= locked.posted_at,
+            OperationalSupplierAdjustment.status.not_in(("rejected", "cancelled"))))
+        if adjustment_dependency:
+            raise ValueError("Later supplier adjustment activity prevents invoice reversal")
+    if locked.resource_type == "supplier_adjustment":
+        invoice = session.get(OperationalSupplierInvoice, document.supplier_invoice_id)
+        payment_dependency = session.scalar(select(OperationalPaymentAllocationClaim.id).where(
+            OperationalPaymentAllocationClaim.party_code == document.supplier_code,
+            OperationalPaymentAllocationClaim.source_type == "invoice",
+            OperationalPaymentAllocationClaim.source_reference_key.in_((invoice.invoice_key, invoice.supplier_invoice_no)),
+            OperationalPaymentAllocationClaim.created_at >= locked.posted_at,
+            OperationalPaymentAllocationClaim.status.in_(("active", "consumed"))))
+        if payment_dependency:
+            raise ValueError("A later supplier payment allocation prevents adjustment reversal")
+    if locked.resource_type == "purchase_return":
+        rehearsal = session.scalar(select(OperationalPurchaseReturnPostingRehearsal).where(
+            OperationalPurchaseReturnPostingRehearsal.purchase_return_id == document.id,
+            OperationalPurchaseReturnPostingRehearsal.return_revision == locked.resource_revision))
+        invoice = (session.get(OperationalSupplierInvoice, rehearsal.original_supplier_invoice_id)
+                   if rehearsal else None)
+        if invoice is None:
+            raise ValueError("The original supplier-invoice link is unavailable for purchase-return reversal")
+        payment_dependency = session.scalar(select(OperationalPaymentAllocationClaim.id).where(
+            OperationalPaymentAllocationClaim.party_code == document.supplier_code,
+            OperationalPaymentAllocationClaim.source_type == "invoice",
+            OperationalPaymentAllocationClaim.source_reference_key.in_((
+                invoice.invoice_key, invoice.supplier_invoice_no)),
+            OperationalPaymentAllocationClaim.created_at >= locked.posted_at,
+            OperationalPaymentAllocationClaim.status.in_(("active", "consumed"))))
+        if payment_dependency:
+            raise ValueError("A later supplier payment allocation prevents purchase-return reversal")
+    if locked.resource_type == "sales_return":
+        rehearsal = session.scalar(select(OperationalSalesReturnPostingRehearsal).where(
+            OperationalSalesReturnPostingRehearsal.sales_return_id == document.id,
+            OperationalSalesReturnPostingRehearsal.return_revision == locked.resource_revision))
+        if rehearsal is None:
+            raise ValueError("The original customer-invoice evidence is unavailable for sales-return reversal")
+        receipt_dependency = session.scalar(select(OperationalPaymentAllocationClaim.id).where(
+            OperationalPaymentAllocationClaim.party_code == document.customer_code,
+            OperationalPaymentAllocationClaim.source_type == "invoice",
+            OperationalPaymentAllocationClaim.source_reference_key == document.original_invoice_reference,
+            OperationalPaymentAllocationClaim.created_at >= locked.posted_at,
+            OperationalPaymentAllocationClaim.status.in_(("active", "consumed"))))
+        if receipt_dependency:
+            raise ValueError("A later customer receipt allocation prevents sales-return reversal")
+    if locked.resource_type == "sales_invoice":
+        rehearsal = session.scalar(select(OperationalSalesInvoicePostingRehearsal).where(
+            OperationalSalesInvoicePostingRehearsal.sales_invoice_id == document.id,
+            OperationalSalesInvoicePostingRehearsal.invoice_revision == locked.resource_revision))
+        if rehearsal is None:
+            raise ValueError("The approved sales-invoice rehearsal is unavailable for reversal")
+        receipt_dependency = session.scalar(select(OperationalPaymentAllocationClaim.id).where(
+            OperationalPaymentAllocationClaim.party_code == document.party_code,
+            OperationalPaymentAllocationClaim.source_type == "invoice",
+            OperationalPaymentAllocationClaim.source_reference_key.in_((document.draft_key, document.draft_no)),
+            OperationalPaymentAllocationClaim.created_at >= locked.posted_at,
+            OperationalPaymentAllocationClaim.status.in_(("active", "consumed"))))
+        if receipt_dependency:
+            raise ValueError("A later customer receipt allocation prevents sales-invoice reversal")
     fingerprint = hashlib.sha256(f"reverse:{locked.posting_fingerprint}".encode("ascii")).hexdigest()
     reversal = OperationalIntegratedPostingBatch(batch_key=str(uuid.uuid4()),
         idempotency_key=f"reverse:{locked.idempotency_key}", resource_type=locked.resource_type,

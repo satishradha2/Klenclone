@@ -396,12 +396,38 @@ def initialize_operational_database(engine) -> None:
     # creates the same schema without relying on import order.
     from . import data_governance as _data_governance  # noqa: F401
     from . import data_reviews as _data_reviews  # noqa: F401
+    from . import delivery_fulfillment as _delivery_fulfillment  # noqa: F401
+    from . import enterprise_setup as _enterprise_setup  # noqa: F401
+    from . import access_control as _access_control  # noqa: F401
+    from . import finance_foundation as _finance_foundation  # noqa: F401
+    from . import finance_ledger as _finance_ledger  # noqa: F401
+    from . import finance_reconciliation as _finance_reconciliation  # noqa: F401
     from . import goods_receipts as _goods_receipts  # noqa: F401
+    from . import hrm as _hrm  # noqa: F401
+    from . import hrm_operations as _hrm_operations  # noqa: F401
+    from . import pos_counter as _pos_counter  # noqa: F401
+    from . import van_sales as _van_sales  # noqa: F401
+    from . import crm as _crm  # noqa: F401
+    from . import commercial_pricing as _commercial_pricing  # noqa: F401
     from . import inventory_operations as _inventory_operations  # noqa: F401
     from . import operational_masters as _operational_masters  # noqa: F401
     from . import payments as _payments  # noqa: F401
+    from . import cash_management as _cash_management  # noqa: F401
+    from . import expense_management as _expense_management  # noqa: F401
+    from . import fixed_assets as _fixed_assets  # noqa: F401
+    from . import vat_control as _vat_control  # noqa: F401
+    from . import period_close as _period_close  # noqa: F401
+    from . import close_reporting as _close_reporting  # noqa: F401
+    from . import audit_compliance as _audit_compliance  # noqa: F401
+    from . import cutover_rehearsal as _cutover_rehearsal  # noqa: F401
+    from . import procurement as _procurement  # noqa: F401
+    from . import procurement_matching as _procurement_matching  # noqa: F401
     from . import posting_integration as _posting_integration  # noqa: F401
     from . import purchase_returns as _purchase_returns  # noqa: F401
+    from . import customer_invoices as _customer_invoices  # noqa: F401
+    from . import credit_management as _credit_management  # noqa: F401
+    from . import sales_invoices as _sales_invoices  # noqa: F401
+    from . import sales_orders as _sales_orders  # noqa: F401
     from . import sales_returns as _sales_returns  # noqa: F401
     from . import security_runtime as _security_runtime  # noqa: F401
     from . import source_verification as _source_verification  # noqa: F401
@@ -456,9 +482,73 @@ def initialize_operational_database(engine) -> None:
         for name, definition in review_additions.items():
             if name not in review_columns:
                 connection.execute(text(f"ALTER TABLE operational_data_reviews ADD COLUMN {name} {definition}"))
+        invoice_columns = {column["name"] for column in inspect(connection).get_columns("operational_supplier_invoices")}
+        invoice_additions = {
+            "state_changed_at": ("TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP"
+                                 if dialect == "postgresql" else "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            "state_changed_by": "VARCHAR(200) NOT NULL DEFAULT 'system'",
+        }
+        for name, definition in invoice_additions.items():
+            if name not in invoice_columns:
+                connection.execute(text(f"ALTER TABLE operational_supplier_invoices ADD COLUMN {name} {definition}"))
+        adjustment_columns = {column["name"] for column in inspect(connection).get_columns("operational_supplier_adjustments")}
+        adjustment_additions = {
+            "accounting_treatment": "VARCHAR(40) NOT NULL DEFAULT 'price_variance'",
+            "state_changed_at": ("TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP"
+                                 if dialect == "postgresql" else "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"),
+            "state_changed_by": "VARCHAR(200) NOT NULL DEFAULT 'system'",
+        }
+        for name, definition in adjustment_additions.items():
+            if name not in adjustment_columns:
+                connection.execute(text(f"ALTER TABLE operational_supplier_adjustments ADD COLUMN {name} {definition}"))
+        sales_return_columns = {column["name"] for column in inspect(connection).get_columns("operational_sales_returns")}
+        sales_return_additions = {
+            "original_invoice_source_record_id": "INTEGER NOT NULL DEFAULT 0",
+            "original_invoice_total_snapshot": "NUMERIC(18,2) NOT NULL DEFAULT 0",
+            "original_invoice_evidence_hash": "VARCHAR(64) NOT NULL DEFAULT 'legacy-unverified'",
+        }
+        for name, definition in sales_return_additions.items():
+            if name not in sales_return_columns:
+                connection.execute(text(f"ALTER TABLE operational_sales_returns ADD COLUMN {name} {definition}"))
+        sales_return_line_columns = {column["name"] for column in inspect(connection).get_columns("operational_sales_return_lines")}
+        sales_return_line_additions = {
+            "original_invoice_quantity_snapshot": "NUMERIC(18,6) NOT NULL DEFAULT 0",
+            "original_invoice_unit_price_snapshot": "NUMERIC(18,4) NOT NULL DEFAULT 0",
+        }
+        for name, definition in sales_return_line_additions.items():
+            if name not in sales_return_line_columns:
+                connection.execute(text(f"ALTER TABLE operational_sales_return_lines ADD COLUMN {name} {definition}"))
+        quotation_columns = {column["name"] for column in inspect(connection).get_columns("operational_sales_quotations")}
+        quotation_additions = {
+            "customer_price_group": "VARCHAR(80)",
+            "price_list_key": "VARCHAR(36)",
+            "promotion_key": "VARCHAR(36)",
+        }
+        for name, definition in quotation_additions.items():
+            if name not in quotation_columns:
+                connection.execute(text(f"ALTER TABLE operational_sales_quotations ADD COLUMN {name} {definition}"))
         if dialect == "postgresql":
             connection.execute(text("ALTER TABLE operational_drafts DROP CONSTRAINT IF EXISTS ck_operational_draft_status"))
             connection.execute(text("ALTER TABLE operational_drafts ADD CONSTRAINT ck_operational_draft_status CHECK (status IN ('draft','submitted','approved','cancelled','posted','reversed'))"))
+            connection.execute(text("ALTER TABLE operational_supplier_invoices DROP CONSTRAINT IF EXISTS ck_supplier_invoice_status"))
+            connection.execute(text("ALTER TABLE operational_supplier_invoices ADD CONSTRAINT ck_supplier_invoice_status CHECK (status IN ('draft','matched','exception','approved','rejected','cancelled','posted','reversed'))"))
+            connection.execute(text("ALTER TABLE operational_integrated_posting_batches DROP CONSTRAINT IF EXISTS ck_integrated_posting_resource_type"))
+            connection.execute(text("ALTER TABLE operational_integrated_posting_batches ADD CONSTRAINT ck_integrated_posting_resource_type CHECK (resource_type IN ('inventory_document','goods_receipt','sales_invoice','sales_return','purchase_return','payment','supplier_invoice','supplier_adjustment'))"))
+            connection.execute(text("ALTER TABLE operational_supplier_adjustments DROP CONSTRAINT IF EXISTS ck_supplier_adjustment_status"))
+            connection.execute(text("ALTER TABLE operational_supplier_adjustments ADD CONSTRAINT ck_supplier_adjustment_status CHECK (status IN ('draft','submitted','approved','rejected','cancelled','posted','reversed'))"))
+            connection.execute(text("ALTER TABLE operational_supplier_adjustments DROP CONSTRAINT IF EXISTS ck_supplier_adjustment_treatment"))
+            connection.execute(text("ALTER TABLE operational_supplier_adjustments ADD CONSTRAINT ck_supplier_adjustment_treatment CHECK (accounting_treatment IN ('price_variance','freight_landed_cost','administrative_expense'))"))
+        for table_name in ("operational_branches", "operational_warehouses", "operational_vans"):
+            unit_columns = {column["name"] for column in inspect(connection).get_columns(table_name)}
+            unit_additions = {
+                "created_by": "VARCHAR(200) NOT NULL DEFAULT 'enterprise_setup'",
+                "approved_by": "VARCHAR(200)",
+                "approval_note": "TEXT",
+                "revision": "INTEGER NOT NULL DEFAULT 1",
+            }
+            for name, definition in unit_additions.items():
+                if name not in unit_columns:
+                    connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}"))
         applied = {row[0]: row[1] for row in connection.execute(text(
             "SELECT version, checksum FROM operational_schema_migrations"
         ))}
@@ -482,6 +572,36 @@ def initialize_operational_database(engine) -> None:
             "0017": "c335e711a4772c9b41878cb7d5571ab84dc979413d941867b121d527c04d39cc",
             "0018": "97bbbaeb89e0b43d3bb9698d380496a23ab8df0366076476191ddbd750ac57e9",
             "0019": "1912f01953c2646c676ba2c4a051ba8aaf7a6dbb46f64e8531aae10cc183abe3",
+            "0020": "e4456533b41c72be6ab16d0669224b8168b0b6ace9324ed0afc0b2fb85d2a37e",
+            "0021": "802615402795d14f48f7b3f78285eb71786dcfcb1f6d17d4f4f843bddb278379",
+            "0022": "bcc6ccc66f97ed6c4c5d4da4f4cea604e16ead085688305f754630960a28acd9",
+            "0023": "cb2221253dd2202f566d289dfe42291f679b4973d7637f1517d9e12f78ec2338",
+            "0024": "78862fb22ce2b428378b7961ff565614d37d48215cf7f29780166b7744c956e0",
+            "0025": "60835c6bcb1ef28d4e8d10cfc66dd8251d043477d2044e8da1141aee9cd289ad",
+            "0026": "15bd0d94120f4a42e7967c6ca4f43bc6c5b0f11b9885203881aeb774b26ae07f",
+            "0027": "1b47fbe0bb4dd6f7cf36aa7f53a447c6db8b0bb95e209b809f59be8dcff483b5",
+            "0028": "bc90c18535fc314ea134fa78d83c919c435411bf3b3d00fdc77de43582de390a",
+            "0029": "afd7ce04d12853ecdd3624a493a1787de43212db856d48ed9d4f386c9fd47a16",
+            "0030": "40c66393883ff36cd01c5ff324743465229456975585529087db58ec562e9f43",
+            "0031": "4d7f2de36b574d95157f30fa13f64236d70dd62bd76a2d7e1ecf22063b912877",
+            "0032": "a93c1fd90bf5dffbf57195d0e4ad76bed5bd1f8c05e0d8599c0a47f4ddc9bc55",
+            "0033": "8a3c0d50be8d8ec3eef263792265678c862e6b1d56473ec90f74a2b3278e7186",
+            "0034": "e5b1c0bb11e6495e10fe824fb29bc320a6cd5a110a5e3a880f78c45e1c63b579",
+            "0035": "7f1097eb3208d74e1e8a08a5763ccda74ce7534f74a07dc746e64d6424fdcc5d",
+            "0036": "54f1ce8b9457dbd62926462960ac7900a7d70d0124ce4daf88a548c36405a65c",
+            "0037": "be7140fe834b9967fd9e1372ec65588fef55c9f87a26d41ee86af70bd010342c",
+            "0038": "938f1fd8ae2804d5185ee7e105dc70814f0c795c6bf4245e45dc9c4da24cd9d1",
+            "0039": "3f9dd4e98944c1f9b7008031787c92a1e9c7e9562fb364a57df4084af995ce9d",
+            "0040": "4c810245458c2a997ca203f6756bd96b0c2bad5b808ecea3f75c250462ebbe25",
+            "0041": "824db21a4f21158a2caa31ef29e126005052b77267a0803a2ca2df88597cb962",
+            "0042": "1f09bf4345a86919622da9e5efc59e569ed65dd994a382d7ccde08e4b82c2e57",
+            "0043": "fa627b36e33b085a646be7264435317ca580536523639c9d58ee785088fa0d4e",
+            "0044": "64f7abcf7493ea29d219d4d88e2e48005bacb6fb55facf4e113d21c215735ea3",
+            "0045": "8cd76db857e4ee8763ad17b6657d5054a40be5c445ebedab4f184736244b1e5e",
+            "0046": "9f265def827f62941a97bc8b32a17459a628ab40d586722fbfa891a7032a2683",
+            "0047": "11b9d25d59b2cf786aa33e4e44d539d322b713609f0c4d7f44a2904e0a389b21",
+            "0048": "f08e38111cf7257615fe35cf80f02b6a52ff620689155d02944f6f9db987e663",
+            "0049": "b203dc9e76f6f2516d4c1f1012b1ec39308bbd0ff5f2b54b30ef5f27ba279815",
         }
         for version, checksum in migrations.items():
             if version in applied and applied[version] != checksum:

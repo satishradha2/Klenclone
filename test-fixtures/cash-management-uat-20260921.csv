@@ -1,0 +1,2 @@
+external_id,transaction_date,value_date,reference,description,debit_amount,credit_amount
+UAT-BANK-FEE-20260921,2026-09-21,2026-09-21,UAT-FEE-20260921,Testing purpose only - controlled bank fee,10.00,0.00

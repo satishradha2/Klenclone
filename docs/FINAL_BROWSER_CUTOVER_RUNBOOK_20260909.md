@@ -2,7 +2,7 @@
 
 Status: **prepared; source still active; execution not authorized before freeze**
 
-This runbook is for the best-achievable BizModo V7.5.1 migration using the authenticated browser account. It never creates, edits, approves, cancels, deletes or posts anything in BizModo. HRM/payroll is excluded from the new ERP and retained only as archive evidence if exported.
+This runbook is for the best-achievable BizModo V7.5.1 migration using the authenticated browser account. It never creates, edits, approves, cancels, deletes or posts anything in BizModo. HRM is included in the new ERP; payroll is excluded.
 
 ## Preconditions
 
@@ -24,7 +24,7 @@ Record count, active date scope, latest immutable reference and latest timestamp
 - stock by location, stock transfers, stock adjustments and traceability registers;
 - payment accounts, cash flow, VAT, trial balance and profitability;
 - users, roles, permissions, settings and CRM configuration;
-- HRM metadata as archive-only evidence, without enabling HRM in the target ERP.
+- Complete HRM migration evidence for controlled operational import, without payroll data.
 
 ## Controlled exports
 

@@ -18,7 +18,8 @@ was enabled or reused.
 - Logout: CSRF-protected
 - Login throttling: five attempts per five-minute window
 - Posting permission: absent
-- HR/payroll access: absent
+- HRM access at this historical checkpoint: absent; the current target ERP now
+  includes separately authorized HRM roles and workflows. Payroll remains excluded.
 
 The password is stored only as a PBKDF2-SHA256 hash with 600,000 iterations in
 the ignored local environment file `.env.asas.local`. The plaintext password is

@@ -2,7 +2,7 @@ from klen_clone.coverage import reference_identity, residual_class
 
 
 def test_residual_class_keeps_hrm_archival_and_sales_workflow_pending():
-    assert residual_class("attendance") == ("hrm_archival", "archival_only_preserved")
+    assert residual_class("attendance") == ("operational_pending", "structured_promotion_required")
     assert residual_class("sales_quotation") == ("operational_pending", "structured_promotion_required")
 
 

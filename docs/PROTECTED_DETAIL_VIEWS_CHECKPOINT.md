@@ -19,7 +19,7 @@ Every transaction and inventory detail is re-authorized and re-filtered by the a
 
 - No edit, delete, posting, approval, number reservation, or source-write endpoint exists.
 - Raw payloads and internal evidence dictionaries are excluded.
-- HRM and payroll remain excluded.
+- HRM is included; payroll remains excluded.
 - Master detail is read-only and operationally disabled.
 
 ## Verification
