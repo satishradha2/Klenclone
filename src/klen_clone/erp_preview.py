@@ -56,10 +56,14 @@ from .inventory_operations import (
 )
 from .warehouse_controls import (
     OperationalBarcodeIdentity, OperationalCycleCountSession, OperationalQuarantineHold,
-    OperationalSerialUnit, barcode_payload, create_cycle_count, create_quarantine_hold,
+    OperationalProductRecall, OperationalProductUomConversion, OperationalSerialUnit,
+    OperationalWarehouseTask, barcode_payload, create_cycle_count, create_product_recall,
+    create_quarantine_hold,
     cycle_count_payload, quarantine_payload, record_warehouse_scan, register_barcode,
-    register_serial, release_quarantine_hold, scan_payload, serial_payload,
-    transition_cycle_count, transition_serial, warehouse_control_payload,
+    register_product_uom, register_serial, release_quarantine_hold, recall_payload,
+    resolve_product_uom, scan_payload, serial_payload, task_payload, transition_cycle_count,
+    transition_product_recall, transition_serial, transition_warehouse_task,
+    warehouse_control_payload,
 )
 from .approval_workspace import approval_workspace_payload
 from .goods_receipts import (
@@ -831,10 +835,39 @@ class QuarantineHoldRequest(BaseModel):
 
 
 class BarcodeRegistrationRequest(BaseModel):
-    barcode_value: str = Field(min_length=4, max_length=80, pattern="^[A-Za-z0-9][A-Za-z0-9._/-]+$")
+    barcode_value: str | None = Field(default=None, min_length=4, max_length=80, pattern="^[A-Za-z0-9][A-Za-z0-9._/-]+$")
     sku: str = Field(min_length=1, max_length=100)
     location_code: str = Field(min_length=1, max_length=80)
+    uom: str = Field(min_length=1, max_length=80)
+
+
+class ProductUomRegistrationRequest(BaseModel):
+    sku: str = Field(min_length=1, max_length=100)
+    uom: str = Field(min_length=1, max_length=80)
     factor_to_base: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+    pack_level: str = Field(pattern="^(transaction|inner|outer|pallet)$")
+    allow_purchase: bool = True
+    allow_sale: bool = True
+    is_default_purchase: bool = False
+    is_default_sale: bool = False
+
+
+class RecallLineRequest(BaseModel):
+    sku: str = Field(min_length=1, max_length=100)
+    identity_value: str | None = Field(default=None, max_length=80)
+    quantity_base: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+
+
+class RecallCreateRequest(BaseModel):
+    location_code: str = Field(min_length=1, max_length=80)
+    reason: str = Field(min_length=5, max_length=2000)
+    severity: str = Field(pattern="^(low|medium|high|critical)$")
+    lines: list[RecallLineRequest] = Field(min_length=1, max_length=1000)
+
+
+class WarehouseTaskActionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    evidence: str | None = Field(default=None, max_length=4000)
 
 
 class SerialRegistrationRequest(BaseModel):
@@ -1201,7 +1234,7 @@ NAVIGATION_PERMISSION_RULES: dict[str, frozenset[str]] = {
     "procurement": frozenset({"purchase.requisition.create", "purchase.requisition.approve", "rfq.create", "supplier_quote.manage", "purchase_order.prepare", "purchase_order.approve", "supplier_bill.prepare", "supplier_bill.approve", "supplier_bill.tolerance.approve", "supplier_bill.rehearse", "supplier_adjustment.prepare", "supplier_adjustment.approve", "match_tolerance.prepare", "match_tolerance.approve", "enterprise.setup"}),
     "drafts": frozenset({"draft.create", "draft.edit", "draft.submit", "draft.approve", "draft.cancel", "draft.rehearse"}),
     "inventory-operations": frozenset({"inventory.create", "inventory.edit", "inventory.submit", "inventory.approve", "inventory.cancel", "inventory.rehearse"}),
-    "warehouse-controls": frozenset({"stock.count", "quarantine.manage", "barcode.manage", "serial.manage", "warehouse.scan", "inventory.submit", "inventory.approve"}),
+    "warehouse-controls": frozenset({"stock.count", "quarantine.manage", "barcode.manage", "serial.manage", "warehouse.scan", "recall.manage", "recall.approve", "warehouse.task.execute", "inventory.submit", "inventory.approve"}),
     "goods-receipts": frozenset({"goods_receipt.create", "goods_receipt.edit", "goods_receipt.submit", "goods_receipt.accept", "goods_receipt.reject", "goods_receipt.rehearse"}),
     "sales-returns": frozenset({"sales_return.create", "sales_return.edit", "sales_return.submit", "sales_return.approve", "sales_return.cancel", "sales_return.rehearse"}),
     "purchase-returns": frozenset({"purchase_return.create", "purchase_return.edit", "purchase_return.submit", "purchase_return.approve", "purchase_return.cancel", "purchase_return.rehearse"}),
@@ -2665,6 +2698,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             raise HTTPException(status_code=422, detail=f"{expected_kind.title()} is not present in the cloned master")
         prepared_lines = []
         for item in payload.lines:
+            governed_conversion = None
             if operational_masters_present(operational_session, OperationalProductMaster):
                 product_record = operational_session.scalar(select(OperationalProductMaster).where(
                     OperationalProductMaster.sku == item.sku))
@@ -2674,6 +2708,12 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                             product_record.selling_price, product_record.base_uom,
                             product_record.canonical_base_uom, product_record.factor_to_base,
                             "operational") if product_record else None)
+                if product_record:
+                    try:
+                        governed_conversion = resolve_product_uom(
+                            operational_session, sku=item.sku, uom=item.uom, actor=user.username)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc)) from exc
             else:
                 product = session.execute(select(
                     ErpProductMaster.sku, ErpProductMaster.name,
@@ -2694,10 +2734,13 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 raise HTTPException(status_code=422, detail=f"Product SKU {item.sku} is not present in the cloned master")
             source_uom = str(product[4] or "")
             canonical_uom = normalize_uom(str(product[5] or "") or source_uom) or ""
-            if (product[7] == "unobserved"
-                    or normalize_uom(item.uom) not in {normalize_uom(source_uom), canonical_uom}):
+            if (not governed_conversion and (product[7] == "unobserved"
+                    or normalize_uom(item.uom) not in {normalize_uom(source_uom), canonical_uom})):
                 raise HTTPException(status_code=422, detail=f"UOM {item.uom} is not an approved base-unit mapping for SKU {item.sku}")
-            factor = Decimal(str(product[6]))
+            factor = (Decimal(str(governed_conversion.factor_to_base)) if governed_conversion
+                      else Decimal(str(product[6])))
+            if governed_conversion:
+                canonical_uom = governed_conversion.canonical_uom
             default_price = product[3] if payload.document_type == "sale" else product[2]
             price = item.unit_price if item.unit_price is not None else Decimal(str(default_price or "0"))
             net, tax, gross = calculate_line(item.quantity, price, item.tax_rate)
@@ -2888,11 +2931,18 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             raise HTTPException(status_code=403, detail="Inventory location is outside the user's operational scope")
         prepared: list[dict] = []
         for item in payload.lines:
+            governed_conversion = None
             if operational_masters_present(operational_session, OperationalProductMaster):
                 master = operational_session.scalar(select(OperationalProductMaster).where(
                     OperationalProductMaster.sku == item.sku, OperationalProductMaster.status == "active"))
                 product = ((master.sku, master.name, master.purchase_price, master.base_uom,
                             master.canonical_base_uom, master.factor_to_base, "operational") if master else None)
+                if master:
+                    try:
+                        governed_conversion = resolve_product_uom(
+                            operational_session, sku=item.sku, uom=item.uom, actor=user.username)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=422, detail=str(exc)) from exc
             else:
                 product = clone_session.execute(select(
                     ErpProductMaster.sku, ErpProductMaster.name, ErpProductMaster.purchase_price_evidence,
@@ -2904,8 +2954,13 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             if not product:
                 raise HTTPException(status_code=422, detail=f"Product SKU {item.sku} is not active in the operational master")
             source_uom, canonical_uom = str(product[3] or ""), str(product[4] or "")
-            if product[6] == "unobserved" or item.uom.casefold() not in {source_uom.casefold(), canonical_uom.casefold()}:
+            if (not governed_conversion and (product[6] == "unobserved"
+                    or item.uom.casefold() not in {source_uom.casefold(), canonical_uom.casefold()})):
                 raise HTTPException(status_code=422, detail=f"UOM {item.uom} is not an approved base-unit mapping for SKU {item.sku}")
+            factor = (Decimal(str(governed_conversion.factor_to_base)) if governed_conversion
+                      else Decimal(str(product[5])))
+            if governed_conversion:
+                canonical_uom = governed_conversion.canonical_uom
             position = operational_session.scalar(select(OperationalStockPosition).where(
                 OperationalStockPosition.location_code == payload.location_code,
                 OperationalStockPosition.sku == item.sku,
@@ -2920,7 +2975,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             prepared.append({
                 "sku": item.sku, "product_name_snapshot": product[1], "quantity": item.quantity,
                 "uom": item.uom, "canonical_uom": canonical_uom,
-                "factor_to_base_snapshot": Decimal(str(product[5])), "unit_cost_snapshot": cost,
+                "factor_to_base_snapshot": factor, "unit_cost_snapshot": cost,
             })
         return prepared
 
@@ -3102,6 +3157,72 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 operational_session, actor=user.username, **payload.model_dump()))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/product-uoms", status_code=201)
+    def new_product_uom(payload: ProductUomRegistrationRequest, request: Request,
+                        operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "product.manage")
+        try:
+            row = register_product_uom(operational_session, actor=user.username, **payload.model_dump())
+            return {"conversion_key": row.conversion_key, "sku": row.sku, "uom": row.uom,
+                    "canonical_uom": row.canonical_uom, "factor_to_base": row.factor_to_base,
+                    "pack_level": row.pack_level, "barcode_value": row.barcode_value}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/recalls", status_code=201)
+    def new_product_recall(payload: RecallCreateRequest, request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "recall.manage")
+        if not location_allowed(user, payload.location_code):
+            raise HTTPException(status_code=404, detail="Warehouse location not found")
+        try:
+            return recall_payload(create_product_recall(
+                operational_session, location_code=payload.location_code,
+                reason=payload.reason, severity=payload.severity,
+                lines=[line.model_dump() for line in payload.lines], actor=user.username))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/recalls/{recall_key}/{action}")
+    def product_recall_action(recall_key: str, action: str, payload: DraftTransitionRequest,
+                              request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        if action not in {"submit", "activate", "close", "cancel"}:
+            raise HTTPException(status_code=404, detail="Recall action not found")
+        user = require_csrf(request, "recall.approve" if action in {"activate", "close"} else "recall.manage")
+        recall = operational_session.scalar(select(OperationalProductRecall).where(
+            OperationalProductRecall.recall_key == recall_key).with_for_update())
+        if not recall or not location_allowed(user, recall.location_code):
+            raise HTTPException(status_code=404, detail="Product recall not found")
+        try:
+            return recall_payload(transition_product_recall(
+                operational_session, recall, action=action,
+                expected_revision=payload.expected_revision, actor=user.username,
+                note=payload.note or f"Recall {action}"))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/tasks/{task_key}/{action}")
+    def warehouse_task_action(task_key: str, action: str,
+                              payload: WarehouseTaskActionRequest, request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        if action not in {"start", "complete", "cancel"}:
+            raise HTTPException(status_code=404, detail="Warehouse task action not found")
+        user = require_csrf(request, "warehouse.task.execute")
+        task = operational_session.scalar(select(OperationalWarehouseTask).where(
+            OperationalWarehouseTask.task_key == task_key).with_for_update())
+        if not task or not location_allowed(user, task.location_code):
+            raise HTTPException(status_code=404, detail="Warehouse task not found")
+        try:
+            return task_payload(transition_warehouse_task(
+                operational_session, task, action=action,
+                expected_revision=payload.expected_revision, actor=user.username,
+                evidence=payload.evidence))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/warehouse-controls/serials", status_code=201)
     def new_serial_identity(payload: SerialRegistrationRequest, request: Request,

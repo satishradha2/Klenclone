@@ -27,6 +27,7 @@ IMPLEMENTED_CAPABILITIES = (
     ("payments", "Customer receipts, supplier payments and allocation", ("/api/v1/payments",)),
     ("credit_collections", "Limits, holds, overrides, dunning and collections", ("/api/v1/credit-control",)),
     ("inventory", "Stock transfers, adjustments and UOM-controlled operations", ("/api/v1/inventory-documents",)),
+    ("warehouse_traceability", "Governed UOM barcodes, serials, recalls and evidence-backed warehouse tasks", ("/api/v1/warehouse-controls", "/api/v1/warehouse-controls/recalls", "/api/v1/warehouse-controls/tasks/{task_key}/{action}")),
     ("cash_management", "Bank accounts, statement matching and reconciliation", ("/api/v1/cash-management",)),
     ("expenses", "Expense claims, UAE VAT evidence and petty cash", ("/api/v1/expense-management/workspace",)),
     ("fixed_assets", "Asset register, depreciation and disposal rehearsal", ("/api/v1/fixed-assets/workspace",)),
@@ -38,7 +39,7 @@ IMPLEMENTED_CAPABILITIES = (
 
 REMAINING_GAPS = (
     {"priority": "high", "area": "Inventory", "capability": "Advanced traceability and warehouse control",
-     "gap": "Batch and expiry are captured at receipt, and controlled cycle-count sessions plus independent quarantine release are available. Serial registry, barcode execution, recall and warehouse task controls remain incomplete."},
+     "gap": "Cycle counts, quarantine, serials, governed UOM barcodes, maker-checker recalls, scan blocking and evidence-backed isolation tasks are operational. Lot-level backward/forward trace across supplier receipt, delivery, invoice and customer remains to be connected."},
     {"priority": "high", "area": "Finance", "capability": "Multi-currency and foreign exchange",
      "gap": "The current operational model is AED-focused; currency masters, rates, realized/unrealized FX and revaluation are not implemented."},
     {"priority": "high", "area": "Finance", "capability": "Budgets, consolidation and corporate tax",

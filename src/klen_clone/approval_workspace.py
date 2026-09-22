@@ -53,6 +53,8 @@ APPROVAL_SOURCES = (
             "submitted", "document_key", "document_no", "created_by", location="location_code"),
     _source("Cycle count", "operational_cycle_count_sessions", "warehouse-controls", {"inventory.approve"},
             "submitted", "count_key", "count_no", "created_by", location="location_code"),
+    _source("Product recall activation", "operational_product_recalls", "warehouse-controls", {"recall.approve"},
+            "submitted", "recall_key", "recall_no", "created_by", location="location_code"),
     _source("Quarantine release", "operational_quarantine_holds", "warehouse-controls", {"quarantine.manage"},
             "held", "hold_key", "hold_no", "created_by", location="location_code"),
     _source("Serial quarantine release", "operational_serial_units", "warehouse-controls", {"quarantine.manage"},

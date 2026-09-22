@@ -25,6 +25,7 @@ from klen_clone.operational import (
     OperationalSubledgerEntry, OperationalWorkflowEvent, execute_posting, execute_reversal,
 )
 from klen_clone.operational_masters import OperationalLocationMaster, OperationalPartyMaster, OperationalProductMaster
+from klen_clone.warehouse_controls import register_product_uom
 from klen_clone.posting_integration import (
     OperationalIntegratedJournalLine, OperationalIntegratedPostingBatch,
     OperationalIntegratedStockEntry, execute_integrated_posting, execute_integrated_reversal,
@@ -183,6 +184,12 @@ def preview_client(tmp_path, *, include_hrm: bool = False) -> TestClient:
 
 def seed_operational_controls(client: TestClient, quantity: str = "100") -> None:
     with client.app.state.operational_sessions() as session:
+        session.add(OperationalProductMaster(
+            product_key="seed-product-SKU-001", sku="SKU-001", name="Source product",
+            base_uom="Piece", canonical_base_uom="piece", factor_to_base=1,
+            purchase_price=2, selling_price=3, tax_rate=5, status="active",
+            source_promoted=False, source_snapshot_name="test",
+            source_checksum="a" * 64, created_by="test", updated_by="test"))
         session.add(OperationalFiscalPeriod(
             period_key="FY-OPEN", starts_on=date(2020, 1, 1), ends_on=date(2035, 12, 31),
             status="open", rehearsal_enabled=True, approval_reference="test-approval",
@@ -363,7 +370,7 @@ def test_warehouse_traceability_api_enforces_identity_scope_and_maker_checker(tm
 
     barcode = client.post("/api/v1/warehouse-controls/barcodes", headers=headers, json={
         "barcode_value": "BC-SHJ-001", "sku": "SKU-001", "location_code": "SHJ",
-        "factor_to_base": "1",
+        "uom": "Piece",
     })
     assert barcode.status_code == 201
     assert barcode.json()["barcode_value"] == "BC-SHJ-001"
@@ -1543,21 +1550,20 @@ def test_operational_sales_draft_is_separate_validated_and_non_posting(tmp_path,
     client = preview_client(tmp_path)
     seed_operational_controls(client, quantity="3")
     with client.app.state.operational_sessions() as session:
-        session.add(OperationalProductMaster(
-            product_key="product-plural-uom", sku="SKU-001", name="Source product",
-            base_uom="Pieces", canonical_base_uom="pieces", factor_to_base=1,
-            purchase_price=2, selling_price=3, tax_rate=5, status="active",
-            source_promoted=True, source_snapshot_name="preview-snapshot",
-            source_checksum="d" * 64, created_by="migration", updated_by="migration",
-        ))
+        product = session.scalar(select(OperationalProductMaster).where(
+            OperationalProductMaster.sku == "SKU-001"))
+        product.base_uom, product.canonical_base_uom = "Pieces", "pieces"
         session.commit()
+        register_product_uom(session, sku="SKU-001", uom="Carton", factor_to_base="12",
+            pack_level="outer", allow_purchase=True, allow_sale=True,
+            is_default_purchase=False, is_default_sale=False, actor="master-maker")
     login = client.post("/api/v1/auth/login", json={
         "username": "asas-admin", "password": "temporary strong password",
     })
     csrf = login.json()["csrf_token"]
     payload = {
         "document_type": "sale", "party_code": "CO-001", "location_code": "SHJ",
-        "discount_amount": "0", "lines": [{"sku": "SKU-001", "quantity": "2", "uom": "Piece"}],
+        "discount_amount": "0", "lines": [{"sku": "SKU-001", "quantity": "2", "uom": "Carton"}],
     }
     assert client.post("/api/v1/drafts", json=payload).status_code == 403
     created = client.post("/api/v1/drafts", json=payload, headers={"X-CSRF-Token": csrf})
@@ -1565,11 +1571,11 @@ def test_operational_sales_draft_is_separate_validated_and_non_posting(tmp_path,
     assert created.json()["status"] == "draft"
     assert created.json()["posting_enabled"] is False
     assert created.json()["subtotal"] == 6.0
+    assert created.json()["lines"][0]["factor_to_base_snapshot"] == 12.0
+    assert created.json()["lines"][0]["quantity_base"] == 24.0
     assert created.json()["tax_amount"] == 0.3
     assert created.json()["total_amount"] == 6.3
     assert created.json()["lines"][0]["canonical_uom"] == "piece"
-    assert created.json()["lines"][0]["factor_to_base_snapshot"] == 1.0
-    assert created.json()["lines"][0]["quantity_base"] == 2.0
     assert created.json()["revision"] == 1
     draft_register = client.get("/api/v1/drafts").json()
     assert draft_register["total"] == 1
@@ -1578,7 +1584,7 @@ def test_operational_sales_draft_is_separate_validated_and_non_posting(tmp_path,
     assert draft_register["controls"]["permanent_journals"] == 0
     invalid = payload | {"lines": [{"sku": "NOT-FOUND", "quantity": "1", "uom": "Piece"}]}
     assert client.post("/api/v1/drafts", json=invalid, headers={"X-CSRF-Token": csrf}).status_code == 422
-    wrong_uom = payload | {"lines": [{"sku": "SKU-001", "quantity": "1", "uom": "Carton"}]}
+    wrong_uom = payload | {"lines": [{"sku": "SKU-001", "quantity": "1", "uom": "Case"}]}
     assert client.post("/api/v1/drafts", json=wrong_uom, headers={"X-CSRF-Token": csrf}).status_code == 422
 
     key = created.json()["draft_key"]

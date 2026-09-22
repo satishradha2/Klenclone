@@ -42,7 +42,8 @@ def load_provisioned_users(path: str | None, fallback_username: str, fallback_ha
         roles = tuple(raw.get("roles") or ())
         permissions = set(raw.get("permissions") or ())
         if "operations_administrator" in roles:
-            permissions.update({"barcode.manage", "serial.manage", "warehouse.scan"})
+            permissions.update({"barcode.manage", "serial.manage", "warehouse.scan",
+                                "product.manage", "recall.manage", "warehouse.task.execute"})
             permissions.update({"hrm.read", "hrm.manage", "hrm.lifecycle.prepare"})
             permissions.update({"pos.read", "pos.manage", "pos.sale", "cash.close.prepare"})
             permissions.update({"van.read", "van.route.prepare", "van.shift", "van.sale",
@@ -74,6 +75,7 @@ def load_provisioned_users(path: str | None, fallback_username: str, fallback_ha
             permissions.update({"cutover_rehearsal.read", "cutover_rehearsal.approve",
                                 "cutover_rehearsal.export"})
         if "independent_approver" in roles:
+            permissions.update({"recall.approve", "warehouse.task.execute"})
             permissions.update({"hrm.read", "hrm.lifecycle.approve"})
             permissions.update({"pos.read", "cash.close.approve"})
             permissions.update({"van.read", "van.shift.approve", "van.stock.approve", "van.close.approve"})
