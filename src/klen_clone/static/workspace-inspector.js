@@ -18,6 +18,9 @@
   let inspectorRoute = '';
 
   const clean = value => String(value || '').trim().replace(/\s+/g, ' ');
+  const renderedText = node => clean([...node.childNodes]
+    .map(child => child.nodeType === 3 ? child.textContent : (child.innerText || child.textContent))
+    .join(' '));
   const route = () => location.hash.slice(1).split('?')[0] || 'overview';
   const element = (tag, className, text) => {
     const node = document.createElement(tag);
@@ -120,8 +123,8 @@
   function openInspector(row) {
     const table = row.closest('table');
     const panel = row.closest('.panel');
-    const headers = [...table.querySelectorAll('thead th')].map(cell => clean(cell.textContent));
-    const cells = [...row.children].map(cell => clean(cell.textContent));
+    const headers = [...table.querySelectorAll('thead th')].map(renderedText);
+    const cells = [...row.children].map(renderedText);
     const reference = cells[0] || 'Record';
     inspectorRoute = route();
     inspectorTitle.textContent = reference;

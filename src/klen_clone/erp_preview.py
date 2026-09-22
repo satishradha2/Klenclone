@@ -178,7 +178,6 @@ from .commercial_pricing import (
     OperationalCustomerPriceGroup, OperationalCustomerPriceGroupAssignment, OperationalPriceList,
     OperationalPriceListItem, OperationalPromotion, approve_price_list, approve_promotion,
     assign_customer_price_group, create_customer_price_group, create_price_list, create_promotion,
-    enforce_quotation_pricing,
 )
 from .credit_management import (
     OperationalCollectionAction, OperationalCreditLimitRequest,
@@ -3352,7 +3351,11 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    def sales_quotation_payload(document: OperationalSalesQuotation) -> dict:
+    def sales_quotation_payload(document: OperationalSalesQuotation, operational_session: Session) -> dict:
+        promotion_code = None
+        if document.promotion_key:
+            promotion_code = operational_session.scalar(select(OperationalPromotion.promotion_code).where(
+                OperationalPromotion.promotion_key == document.promotion_key))
         return {"quotation_key": document.quotation_key, "quotation_no": document.quotation_no,
                 "customer_code": document.customer_code, "customer_name": document.customer_name_snapshot,
                 "location_code": document.location_code, "quotation_date": document.quotation_date,
@@ -3362,7 +3365,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "payment_terms": document.payment_terms, "delivery_terms": document.delivery_terms,
                 "notes": document.notes, "status": document.status,
                 "customer_price_group": document.customer_price_group, "price_list_key": document.price_list_key,
-                "promotion_key": document.promotion_key,
+                "promotion_key": document.promotion_key, "promotion_code": promotion_code,
                 "posting_enabled": False, "stock_reservation_enabled": False,
                 "created_by": document.created_by, "created_at": document.created_at,
                 "approved_by": document.approved_by, "approval_note": document.approval_note,
@@ -3566,8 +3569,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
 
     @app.get("/api/v1/commercial-pricing")
     def commercial_pricing_workspace(request: Request, operational_session=Depends(operational_session_dependency)):
-        user = current_user(request)
-        if not user: raise HTTPException(status_code=401, detail="Authentication required")
+        require_any_user(request, {"draft.create", "draft.edit", "draft.approve",
+                                   "price_list.manage", "discount.approve"})
         lists = operational_session.scalars(select(OperationalPriceList).order_by(OperationalPriceList.effective_from.desc())).all()
         return {"posting_enabled": False,
                 "groups": [{"group_code": row.group_code, "name": row.name, "status": row.status} for row in operational_session.scalars(select(OperationalCustomerPriceGroup).order_by(OperationalCustomerPriceGroup.group_code))],
@@ -3581,17 +3584,56 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         try: return {"group_code": create_customer_price_group(operational_session, actor=user.username, **payload.model_dump()).group_code}
         except ValueError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    def validate_pricing_customer(customer_code: str, clone_session: Session,
+                                  operational_session: Session) -> None:
+        if operational_masters_present(operational_session, OperationalPartyMaster):
+            exists = operational_session.scalar(select(OperationalPartyMaster.id).where(
+                OperationalPartyMaster.party_code == customer_code,
+                OperationalPartyMaster.party_kind.in_(("customer", "both")),
+                OperationalPartyMaster.status == "active"))
+        else:
+            snapshot = clone_session.scalar(select(SourceSnapshot).where(SourceSnapshot.name == selected_snapshot))
+            exists = clone_session.scalar(select(ErpParty.id).where(
+                ErpParty.snapshot_id == snapshot.id, ErpParty.party_code == customer_code,
+                ErpParty.party_kind.in_(("customer", "both"))))
+        if not exists:
+            raise ValueError("Customer is not active in the controlled customer master")
+
+    def validate_pricing_skus(skus: set[str], clone_session: Session,
+                              operational_session: Session) -> None:
+        if not skus:
+            return
+        if operational_masters_present(operational_session, OperationalProductMaster):
+            found = set(operational_session.scalars(select(OperationalProductMaster.sku).where(
+                OperationalProductMaster.sku.in_(skus),
+                OperationalProductMaster.status == "active")).all())
+        else:
+            snapshot = clone_session.scalar(select(SourceSnapshot).where(SourceSnapshot.name == selected_snapshot))
+            found = set(clone_session.scalars(select(ErpProductMaster.sku).where(
+                ErpProductMaster.snapshot_id == snapshot.id,
+                ErpProductMaster.sku.in_(skus))).all())
+        missing = sorted(skus - found)
+        if missing:
+            raise ValueError(f"Product SKU is not active in the controlled product master: {', '.join(missing)}")
+
     @app.put("/api/v1/commercial-pricing/customers/{customer_code}/group")
-    def commercial_customer_group(customer_code: str, payload: CustomerPriceGroupAssignmentRequest, request: Request, operational_session=Depends(operational_session_dependency)):
+    def commercial_customer_group(customer_code: str, payload: CustomerPriceGroupAssignmentRequest,
+                                  request: Request, clone_session: Session = Depends(session_dependency),
+                                  operational_session=Depends(operational_session_dependency)):
         user = require_csrf(request, "price_list.manage")
-        try: return {"customer_code": assign_customer_price_group(operational_session, customer_code=customer_code, group_code=payload.group_code, actor=user.username).customer_code}
+        try:
+            validate_pricing_customer(customer_code, clone_session, operational_session)
+            return {"customer_code": assign_customer_price_group(operational_session, customer_code=customer_code, group_code=payload.group_code, actor=user.username).customer_code}
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/v1/commercial-pricing/price-lists", status_code=201)
-    def commercial_price_list(payload: PriceListRequest, request: Request, operational_session=Depends(operational_session_dependency)):
+    def commercial_price_list(payload: PriceListRequest, request: Request,
+                              clone_session: Session = Depends(session_dependency),
+                              operational_session=Depends(operational_session_dependency)):
         user = require_csrf(request, "price_list.manage")
         try:
             values = payload.model_dump(); values["items"] = [item.model_dump() for item in payload.items]
+            validate_pricing_skus({item.sku for item in payload.items}, clone_session, operational_session)
             return {"price_list_key": create_price_list(operational_session, actor=user.username, **values).price_list_key, "posting_enabled": False}
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -3603,9 +3645,13 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/v1/commercial-pricing/promotions", status_code=201)
-    def commercial_promotion(payload: PromotionRequest, request: Request, operational_session=Depends(operational_session_dependency)):
+    def commercial_promotion(payload: PromotionRequest, request: Request,
+                             clone_session: Session = Depends(session_dependency),
+                             operational_session=Depends(operational_session_dependency)):
         user = require_csrf(request, "price_list.manage")
-        try: return {"promotion_key": create_promotion(operational_session, actor=user.username, **payload.model_dump()).promotion_key, "posting_enabled": False}
+        try:
+            validate_pricing_skus({payload.sku} if payload.sku else set(), clone_session, operational_session)
+            return {"promotion_key": create_promotion(operational_session, actor=user.username, **payload.model_dump()).promotion_key, "posting_enabled": False}
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/v1/commercial-pricing/promotions/{promotion_key}/approve")
@@ -3622,7 +3668,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         locations = user.allowed_locations if user else ()
         quotations = list_sales_quotations(operational_session, allowed_locations=locations)
         orders = list_sales_orders(operational_session, allowed_locations=locations)
-        return {"quotations": [sales_quotation_payload(row) for row in quotations],
+        return {"quotations": [sales_quotation_payload(row, operational_session) for row in quotations],
                 "orders": [sales_order_payload(row) for row in orders],
                 "controls": sales_order_control_counts(operational_session)}
 
@@ -3634,7 +3680,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             OperationalSalesQuotation.quotation_key == quotation_key))
         if not document or not user or not location_allowed(user, document.location_code):
             raise HTTPException(status_code=404, detail="Sales quotation not found")
-        return sales_quotation_payload(document)
+        return sales_quotation_payload(document, operational_session)
 
     @app.post("/api/v1/sales-orders/quotations", status_code=201)
     def new_sales_quotation(payload: SalesQuotationRequest, request: Request,
@@ -3643,17 +3689,16 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         user = require_csrf(request, "draft.create")
         location, customer, lines = prepare_sales_quotation(payload, clone_session, operational_session, user)
         try:
-            pricing = enforce_quotation_pricing(operational_session, customer_code=customer[0], quotation_date=payload.quotation_date, lines=lines, discount_amount=payload.discount_amount, promotion_code=payload.promotion_code)
             document = create_sales_quotation(operational_session,
                 customer_code=customer[0], customer_name_snapshot=customer[1], location_code=location[0],
                 quotation_date=payload.quotation_date, valid_until=payload.valid_until,
                 discount_amount=payload.discount_amount, payment_terms=payload.payment_terms,
                 delivery_terms=payload.delivery_terms, notes=payload.notes,
-                actor=user.username, lines=lines, pricing=pricing)
+                actor=user.username, lines=lines, promotion_code=payload.promotion_code)
         except ValueError as exc:
             operational_session.rollback()
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return sales_quotation_payload(document)
+        return sales_quotation_payload(document, operational_session)
 
     @app.put("/api/v1/sales-orders/quotations/{quotation_key}")
     def edit_sales_quotation(quotation_key: str, payload: SalesQuotationRequest, request: Request,
@@ -3667,18 +3712,17 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             raise HTTPException(status_code=404, detail="Sales quotation not found")
         location, customer, lines = prepare_sales_quotation(payload, clone_session, operational_session, user)
         try:
-            pricing = enforce_quotation_pricing(operational_session, customer_code=customer[0], quotation_date=payload.quotation_date, lines=lines, discount_amount=payload.discount_amount, promotion_code=payload.promotion_code)
             document = replace_sales_quotation(operational_session, document,
                 expected_revision=expected_revision, customer_code=customer[0],
                 customer_name_snapshot=customer[1], location_code=location[0],
                 quotation_date=payload.quotation_date, valid_until=payload.valid_until,
                 discount_amount=payload.discount_amount, payment_terms=payload.payment_terms,
                 delivery_terms=payload.delivery_terms, notes=payload.notes,
-                actor=user.username, lines=lines, pricing=pricing)
+                actor=user.username, lines=lines, promotion_code=payload.promotion_code)
         except ValueError as exc:
             operational_session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return sales_quotation_payload(document)
+        return sales_quotation_payload(document, operational_session)
 
     def sales_quotation_action(quotation_key: str, action: str, payload: DraftTransitionRequest,
                                request: Request, operational_session: Session):
@@ -3698,7 +3742,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         except ValueError as exc:
             operational_session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return sales_quotation_payload(document)
+        return sales_quotation_payload(document, operational_session)
 
     @app.post("/api/v1/sales-orders/quotations/{quotation_key}/submit")
     def submit_sales_quotation(quotation_key: str, payload: DraftTransitionRequest, request: Request,
@@ -3736,7 +3780,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         except ValueError as exc:
             operational_session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return sales_quotation_payload(document)
+        return sales_quotation_payload(document, operational_session)
 
     @app.post("/api/v1/sales-orders/quotations/{quotation_key}/convert")
     def convert_sales_quotation_to_order(quotation_key: str, payload: SalesOrderConversionRequest,

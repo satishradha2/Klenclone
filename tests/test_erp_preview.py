@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -243,6 +244,104 @@ def test_navigation_policy_is_server_owned_and_mutation_middleware_allows_contro
     assert group.json()["group_code"] == "QA"
 
 
+def test_commercial_pricing_api_validates_masters_and_enforces_quotation_prices(tmp_path, monkeypatch):
+    password = "commercial pricing test password"
+    users_file = tmp_path / "commercial-pricing-users.json"
+    users_file.write_text(json.dumps({"users": [
+        {
+            "id": 1, "username": "pricing-maker", "password_hash": hash_password(password),
+            "roles": ["sales_manager"],
+            "permissions": ["clone.read", "draft.create", "draft.edit", "price_list.manage"],
+            "allowed_locations": ["SHJ"],
+        },
+        {
+            "id": 2, "username": "pricing-checker", "password_hash": hash_password(password),
+            "roles": ["sales_manager"], "permissions": ["clone.read", "discount.approve"],
+            "allowed_locations": ["SHJ"],
+        },
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'operational.db'}")
+    client = preview_client(tmp_path)
+
+    login = client.post("/api/v1/auth/login", json={"username": "pricing-maker", "password": password})
+    maker_headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    assert client.post("/api/v1/commercial-pricing/groups", headers=maker_headers,
+                       json={"group_code": "TRADE", "name": "Trade customers"}).status_code == 201
+    invalid_customer = client.put(
+        "/api/v1/commercial-pricing/customers/UNKNOWN/group", headers=maker_headers,
+        json={"group_code": "TRADE"})
+    assert invalid_customer.status_code == 422
+    assignment = client.put(
+        "/api/v1/commercial-pricing/customers/CO-001/group", headers=maker_headers,
+        json={"group_code": "TRADE"})
+    assert assignment.status_code == 200
+
+    list_payload = {
+        "name": "Approved trade prices", "customer_group": "TRADE",
+        "effective_from": "2026-01-01", "effective_to": "2030-12-31",
+        "max_discount_percent": "5", "items": [{"sku": "SKU-001", "unit_price": "3"}],
+    }
+    invalid_list = client.post(
+        "/api/v1/commercial-pricing/price-lists", headers=maker_headers,
+        json={**list_payload, "items": [{"sku": "UNKNOWN", "unit_price": "3"}]})
+    assert invalid_list.status_code == 422
+    created = client.post("/api/v1/commercial-pricing/price-lists", headers=maker_headers,
+                          json=list_payload)
+    assert created.status_code == 201
+    price_list_key = created.json()["price_list_key"]
+    self_approval = client.post(
+        f"/api/v1/commercial-pricing/price-lists/{price_list_key}/approve",
+        headers=maker_headers, json={})
+    assert self_approval.status_code == 403
+
+    login = client.post("/api/v1/auth/login", json={"username": "pricing-checker", "password": password})
+    checker_headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    approval = client.post(
+        f"/api/v1/commercial-pricing/price-lists/{price_list_key}/approve",
+        headers=checker_headers, json={})
+    assert approval.status_code == 200
+
+    login = client.post("/api/v1/auth/login", json={"username": "pricing-maker", "password": password})
+    maker_headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    promotion = client.post("/api/v1/commercial-pricing/promotions", headers=maker_headers, json={
+        "promotion_code": "SKU10", "name": "SKU promotion", "customer_group": "TRADE",
+        "sku": "SKU-001", "discount_percent": "10",
+        "effective_from": "2026-01-01", "effective_to": "2030-12-31",
+    })
+    assert promotion.status_code == 201
+    promotion_key = promotion.json()["promotion_key"]
+    login = client.post("/api/v1/auth/login", json={"username": "pricing-checker", "password": password})
+    checker_headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    assert client.post(
+        f"/api/v1/commercial-pricing/promotions/{promotion_key}/approve",
+        headers=checker_headers, json={}).status_code == 200
+    login = client.post("/api/v1/auth/login", json={"username": "pricing-maker", "password": password})
+    maker_headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    quotation = {
+        "customer_code": "CO-001", "location_code": "SHJ",
+        "quotation_date": "2026-09-22", "valid_until": "2026-10-22",
+        "discount_amount": "0", "promotion_code": "SKU10", "lines": [{
+            "sku": "SKU-001", "quantity": "1", "uom": "Piece",
+            "unit_price": "2", "tax_rate": "5",
+        }],
+    }
+    rejected = client.post("/api/v1/sales-orders/quotations", headers=maker_headers,
+                           json=quotation)
+    assert rejected.status_code == 422
+    assert "approved price list" in rejected.json()["detail"]
+    quotation["lines"][0]["unit_price"] = "3"
+    accepted = client.post("/api/v1/sales-orders/quotations", headers=maker_headers,
+                           json=quotation)
+    assert accepted.status_code == 201
+    assert accepted.json()["customer_price_group"] == "TRADE"
+    assert accepted.json()["price_list_key"] == price_list_key
+    assert accepted.json()["promotion_key"] == promotion_key
+    assert accepted.json()["promotion_code"] == "SKU10"
+    assert accepted.json()["posting_enabled"] is False
+
+
 def test_warehouse_traceability_api_enforces_identity_scope_and_maker_checker(tmp_path, monkeypatch):
     password = "warehouse traceability test password"
     users_file = tmp_path / "warehouse-traceability-users.json"
@@ -423,6 +522,25 @@ def test_my_workspace_is_registered_in_shell_and_requires_authentication(tmp_pat
     assert "async function myWorkspace()" in router
     assert "api('/my-workspace')" in router
     assert "else if(active==='my-workspace')await myWorkspace()" in router
+
+
+def test_enterprise_sidebar_information_architecture_preserves_every_workspace_route():
+    static_root = Path(__file__).parents[1] / "src" / "klen_clone" / "static"
+    shell = (static_root / "erp.html").read_text(encoding="utf-8")
+    behavior = (static_root / "workspace-shell.js").read_text(encoding="utf-8")
+    styles = (static_root / "workspace-shell.css").read_text(encoding="utf-8")
+
+    section_keys = re.findall(r'data-nav-section="([^"]+)"', shell)
+    routes = re.findall(r'<a href="#[^"]+" data-route="([^"]+)"', shell)
+    assert section_keys == ["commercial", "procurement", "inventory", "finance", "organization", "governance"]
+    assert len(routes) == 42
+    assert len(routes) == len(set(routes))
+    assert routes[:2] == ["overview", "my-workspace"]
+    assert "nav-group-collapsed" in behavior
+    assert "aria-expanded" in behavior
+    assert "visibleMembers.length" in behavior
+    assert ".nav-section[hidden]{display:none}" in styles
+    assert "/static/workspace-shell.js?v=20260922-login-motion-4" in shell
 
 
 def test_record_inspector_and_attention_center_are_centralized_read_only_surfaces():
@@ -1377,7 +1495,7 @@ def test_preview_authentication_session_csrf_and_audit(tmp_path, monkeypatch):
     assert "Welcome back" in login_page
     assert "Controlled staging" in login_page
     assert "Source protected" in login_page
-    assert "/static/asas-login.css?v=20260922-modern-1" in login_page
+    assert "/static/asas-login.css?v=20260922-login-motion-1" in login_page
     denied = client.post("/api/v1/auth/login", json={"username": "asas-admin", "password": "wrong"})
     assert denied.status_code == 401
     login = client.post("/api/v1/auth/login", json={

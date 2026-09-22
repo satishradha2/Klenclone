@@ -35,11 +35,31 @@ test('central workspace API loads before page modules and owns reusable presenta
   const firstPageModule = shell.indexOf('/static/purchase-returns.js');
   assert.ok(framework >= 0);
   assert.ok(framework < firstPageModule);
-  for (const contract of ['workflow', 'panel', 'form', 'caption', 'feedback', 'controlNote', 'migrate', 'observe']) {
+  for (const contract of ['workflow', 'panel', 'form', 'caption', 'feedback', 'controlNote', 'taskWorkspace', 'migrate', 'observe']) {
     assert.match(components, new RegExp(`const ${contract} =|${contract},`));
   }
   assert.match(components, /window\.WorkspaceUI = Object\.freeze/);
   assert.doesNotMatch(components, /fetch\(|XMLHttpRequest|\/api\/v1/);
+});
+
+test('central task workspace progressively discloses dense routes without business API calls', () => {
+  assert.match(components, /const taskWorkspace = \(root, options = \{\}\)/);
+  assert.match(components, /workspace-taskbar/);
+  assert.match(components, /workspace-task-tab/);
+  assert.match(components, /workspace-task-pane/);
+  assert.match(components, /workspace-action-drawer/);
+  assert.match(components, /role', 'tablist/);
+  assert.match(components, /ArrowLeft.*ArrowRight.*Home.*End/);
+  assert.match(components, /sessionStorage\.setItem\(storageKey, item\.key\)/);
+  assert.match(components, /history\.replaceState/);
+  assert.doesNotMatch(components, /fetch\(|XMLHttpRequest|\/api\/v1/);
+  assert.match(styles, /\.workspace-taskbar\{/);
+  assert.match(styles, /backdrop-filter:blur\(18px\) saturate\(1\.14\)/);
+  assert.match(styles, /@keyframes task-pane-enter/);
+  assert.match(styles, /@keyframes task-drawer-enter/);
+  assert.match(styles, /data-motion=reduced/);
+  assert.match(shell, /workspace-components\.css\?v=20260922-pricing-control-4/);
+  assert.match(shell, /workspace-components\.js\?v=20260922-task-workspace-3/);
 });
 
 test('every routed workspace is centrally migrated on initial render and later rerenders', () => {
@@ -80,6 +100,10 @@ test('sales-order pilot applies semantic presentation without replacing workflow
   assert.match(source, /\/api\/v1\/sales-orders\/quotations/);
   assert.match(source, /expected_revision/);
   assert.match(source, /\/api\/v1\/commercial-pricing\/price-lists/);
+  assert.match(source, /formElement\.promotion_code\.value=q\.promotion_code\|\|''/);
+  assert.match(source, /const applyPricingAssist=/);
+  assert.match(source, /Approved prices are locked/);
+  assert.match(source, /price\.readOnly=Boolean\(item\)/);
 });
 
 test('component layer includes responsive forms, line editors and feedback states', () => {
@@ -87,6 +111,38 @@ test('component layer includes responsive forms, line editors and feedback state
     assert.ok(styles.includes(selector), `missing ${selector}`);
   }
   assert.match(styles, /@media\(max-width:620px\)/);
+});
+
+test('legacy workspaces are normalized into the responsive enterprise form system', () => {
+  assert.match(components, /:scope > \.draft-fields:not\(\.form-grid\)/);
+  assert.match(components, /\['form-grid', 'central-form-grid'\]/);
+  assert.match(components, /legacy-workspace-form/);
+  assert.match(components, /legacy-form-actions/);
+  assert.match(styles, /\.legacy-workspace-form/);
+  assert.match(styles, /repeat\(auto-fit,minmax\(min\(100%,180px\),1fr\)\)/);
+});
+
+test('central table regions align both header corners without a reserved scrollbar gutter', () => {
+  assert.match(styles, /\.central-table-region\{[^}]*overflow-x:auto[^}]*overflow-y:hidden[^}]*scrollbar-gutter:auto/);
+  assert.doesNotMatch(styles, /scrollbar-gutter:stable/);
+  assert.match(shell, /workspace-components\.css\?v=20260922-pricing-control-4/);
+});
+
+test('shared workspace surfaces use restrained blur while preserving contrast mode', () => {
+  assert.match(styles, /\.component-form,.legacy-workspace-form,.central-toolbar,.workflow-steps,.control-note,.close-package-actions/);
+  assert.match(styles, /backdrop-filter:blur\(10px\) saturate\(1\.06\)/);
+  assert.match(styles, /data-theme=contrast.*backdrop-filter:none!important/);
+  assert.match(shell, /workspace-components\.css\?v=20260922-pricing-control-4/);
+  assert.match(inspectorStyles, /\.workspace-drawer\{background:var\(--glass-elevated\)/);
+  assert.match(inspectorStyles, /workspace-drawer::backdrop.*backdrop-filter:blur\(8px\)/);
+});
+
+test('record inspector keeps its body and actions in fixed drawer rows with readable cell separation', () => {
+  assert.match(inspectorStyles, /\.record-inspector>form\{grid-template-rows:auto minmax\(0,1fr\) auto auto\}/);
+  assert.match(inspectorStyles, /\.attention-center>form\{grid-template-rows:auto auto minmax\(0,1fr\) auto\}/);
+  assert.match(inspector, /const renderedText = node/);
+  assert.match(inspector, /\.map\(renderedText\)/);
+  assert.match(components, /const readableText = element/);
 });
 
 test('delivery pilot reuses the component layer without changing workflow endpoints', () => {

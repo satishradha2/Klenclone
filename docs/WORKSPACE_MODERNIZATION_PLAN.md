@@ -156,3 +156,69 @@ unchanged.
 Automated verification covers both the responsive visual contract and the
 unchanged `/api/v1/auth/login` integration. Browser acceptance is performed at
 desktop and 390px widths after rebuilding the read-only preview image.
+
+## Enterprise navigation information architecture
+
+The sidebar now organizes every existing workspace into six stable business
+domains: Commercial, Procurement, Inventory & Logistics, Finance & Tax,
+Organization, and Controls & Insights. Overview and My Workspace remain the
+priority entry points. No route, permission check, workflow, API or posting
+boundary was removed or replaced.
+
+Domain sections use a single-open accordion and remember the signed-in user's
+open module. Opening one module closes every other module; selecting a page opens
+only its owning module, while selecting Overview or My Workspace closes all
+business modules. Page counts reflect only navigation links allowed by the
+existing server-owned permission policy. Collapsed groups remain available to
+the permission-aware command center, and compact-rail and mobile layouts retain
+access to every permitted route.
+
+Automated verification confirms 42 unique routes, stable domain order,
+accessible expanded state and responsive section treatment. Desktop and mobile
+browser acceptance is performed after rebuilding the controlled preview image.
+
+## Legacy workspace form normalization
+
+A route-by-route browser audit of all 42 permitted workspaces identified seven
+pages still rendering pre-framework form markup: CRM, POS, Van Sales,
+Procurement, Goods Receipts, Purchase Returns and Stock Operations. Their
+business workflows were already controlled, but the legacy four-column field
+layout became cramped at medium desktop widths and their headings/actions did
+not follow the shared visual hierarchy.
+
+The central presentation migrator now promotes legacy field groups into the
+same responsive form grid, action bar and section-heading system used by newer
+workspaces. This is a presentation-only transformation: field names, submitted
+values, endpoints, permissions and workflow event handlers remain unchanged.
+
+The record inspector also now uses drawer-specific grid rows so its action bar
+cannot consume the flexible content height. Multi-line table cells are read
+through rendered text, preserving spaces between references, revisions, dates
+and secondary values. Automated contracts cover both corrections; browser
+acceptance repeats the complete 42-route audit after rebuilding the preview.
+
+## Central task workspace and progressive disclosure
+
+The shared presentation layer now converts dense operational pages into a
+single-active-task workspace. Summary context and KPIs remain visible, while
+registers, queues, filters and workflow views are exposed through a sticky glass
+task strip. Only the selected task participates in the active layout; keyboard
+users can move between tasks with Arrow, Home and End keys, and the selected
+view is retained per route and represented in the URL.
+
+Safe create and prepare forms are promoted into focused right-side action
+drawers with a blurred, inert background. This reduces long document scrolling
+without changing form fields, listeners, API calls, permission checks,
+maker-checker rules or posting boundaries. Bounded data regions, compact KPI
+summaries, responsive mobile drawers, reduced-motion handling and high-contrast
+fallbacks are applied centrally so current and future migrated workspaces share
+the same interaction system.
+
+The controlled preview was rebuilt and all 42 permitted routes were inspected
+for horizontal overflow, duplicate IDs and single-pane state. Focused live
+browser checks confirmed Credit Control labels, Review Center empty-state
+wording, Sales Orders drawer behavior, URL-backed task switching and a clean
+browser console. Verification for this increment: 36/36 JavaScript tests and
+249 Python tests passed with 1 existing external-integration skip. The skip and
+purpose-provisioned restricted-role UAT remain acceptance gates and are not
+represented as production readiness.

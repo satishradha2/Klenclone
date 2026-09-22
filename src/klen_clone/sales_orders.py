@@ -170,9 +170,18 @@ def create_sales_quotation(session: Session, *, customer_code: str, customer_nam
                            location_code: str, quotation_date: date, valid_until: date,
                            discount_amount: Decimal, payment_terms: str | None,
                            delivery_terms: str | None, notes: str | None, actor: str,
-                           lines: list[dict], pricing: dict | None = None) -> OperationalSalesQuotation:
+                           lines: list[dict], promotion_code: str | None = None,
+                           pricing: dict | None = None) -> OperationalSalesQuotation:
     if valid_until < quotation_date:
         raise ValueError("Quotation valid-until date cannot be earlier than its quotation date")
+    from .commercial_pricing import enforce_quotation_pricing
+    enforced_pricing = enforce_quotation_pricing(
+        session, customer_code=customer_code, quotation_date=quotation_date, lines=lines,
+        discount_amount=discount_amount, promotion_code=promotion_code)
+    if pricing is not None and any(pricing.get(key) != enforced_pricing.get(key)
+                                   for key in ("customer_group", "price_list_key", "promotion_key")):
+        raise ValueError("Quotation pricing decision is stale or does not match current approved controls")
+    pricing = enforced_pricing
     key = str(uuid.uuid4())
     document = OperationalSalesQuotation(
         quotation_key=key, quotation_no=f"SQ-{quotation_date:%Y%m%d}-{key[:8].upper()}",
@@ -194,13 +203,23 @@ def replace_sales_quotation(session: Session, document: OperationalSalesQuotatio
                             customer_code: str, customer_name_snapshot: str, location_code: str,
                             quotation_date: date, valid_until: date, discount_amount: Decimal,
                             payment_terms: str | None, delivery_terms: str | None,
-                            notes: str | None, actor: str, lines: list[dict], pricing: dict | None = None) -> OperationalSalesQuotation:
+                            notes: str | None, actor: str, lines: list[dict],
+                            promotion_code: str | None = None,
+                            pricing: dict | None = None) -> OperationalSalesQuotation:
     if document.status not in {"draft", "rejected"}:
         raise ValueError("Only draft or rejected quotations can be revised")
     if document.revision != expected_revision:
         raise ValueError(f"Sales quotation revision conflict; current revision is {document.revision}")
     if valid_until < quotation_date:
         raise ValueError("Quotation valid-until date cannot be earlier than its quotation date")
+    from .commercial_pricing import enforce_quotation_pricing
+    enforced_pricing = enforce_quotation_pricing(
+        session, customer_code=customer_code, quotation_date=quotation_date, lines=lines,
+        discount_amount=discount_amount, promotion_code=promotion_code)
+    if pricing is not None and any(pricing.get(key) != enforced_pricing.get(key)
+                                   for key in ("customer_group", "price_list_key", "promotion_key")):
+        raise ValueError("Quotation pricing decision is stale or does not match current approved controls")
+    pricing = enforced_pricing
     document.customer_code=customer_code; document.customer_name_snapshot=customer_name_snapshot
     document.location_code=location_code; document.quotation_date=quotation_date; document.valid_until=valid_until
     document.discount_amount=discount_amount; document.payment_terms=payment_terms

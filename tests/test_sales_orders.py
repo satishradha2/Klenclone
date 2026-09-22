@@ -13,6 +13,10 @@ from klen_clone.sales_orders import (
     accept_sales_quotation, convert_sales_quotation, create_sales_quotation,
     replace_sales_quotation, transition_sales_quotation,
 )
+from klen_clone.commercial_pricing import (
+    approve_price_list, assign_customer_price_group, create_customer_price_group,
+    create_price_list,
+)
 
 
 def line(sku="SKU-1", quantity="2", price="10"):
@@ -104,3 +108,21 @@ def test_expired_approved_quotation_cannot_be_accepted(session):
     with pytest.raises(ValueError, match="expired"):
         accept_sales_quotation(session, quote, expected_revision=3, actor="maker",
                                acceptance_reference="Late customer email")
+
+
+def test_domain_quotation_creation_cannot_bypass_approved_pricing(session):
+    create_customer_price_group(session, group_code="TRADE", name="Trade customers", actor="pricing-maker")
+    assign_customer_price_group(session, customer_code="C-1", group_code="TRADE", actor="pricing-maker")
+    price_list = create_price_list(
+        session, name="Approved trade prices", customer_group="TRADE",
+        effective_from=date.today(), effective_to=date.today() + timedelta(days=30),
+        max_discount_percent=Decimal("0"),
+        items=[{"sku": "SKU-1", "unit_price": "10"}], actor="pricing-maker")
+    approve_price_list(session, key=price_list.price_list_key, actor="pricing-checker")
+    with pytest.raises(ValueError, match="does not match"):
+        create_sales_quotation(
+            session, customer_code="C-1", customer_name_snapshot="Customer One",
+            location_code="MAIN", quotation_date=date.today(),
+            valid_until=date.today() + timedelta(days=7), discount_amount=Decimal("0"),
+            payment_terms=None, delivery_terms=None, notes=None, actor="sales-maker",
+            lines=[line(price="9")])

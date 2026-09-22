@@ -5,10 +5,16 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#15243b">
   <title>Sign in | Asas ERP</title>
-  <link rel="stylesheet" href="/static/asas-login.css?v=20260922-modern-1">
+  <link rel="stylesheet" href="/static/asas-login.css?v=20260922-login-motion-1">
 </head>
 <body>
   <a class="skip-link" href="#login-form">Skip to sign in</a>
+  <div id="login-transition" class="login-transition" role="status" aria-live="polite" aria-atomic="true">
+    <div class="transition-mark" aria-hidden="true"><span>A</span><i></i><i></i></div>
+    <p id="transition-title">Loading secure access</p>
+    <small id="transition-detail">Preparing your controlled ERP environment</small>
+    <span class="transition-progress" aria-hidden="true"><i></i></span>
+  </div>
   <main class="login-shell">
     <section class="identity" aria-labelledby="login-welcome">
       <div class="identity-top">
@@ -42,13 +48,13 @@
           <label for="username"><span>Username</span><input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
           <label for="password"><span>Password</span><input id="password" name="password" type="password" autocomplete="current-password" required></label>
           <p id="error" class="error" role="alert" aria-live="assertive"></p>
-          <button type="submit"><span>Sign in to workspace</span><span aria-hidden="true">→</span></button>
+          <button type="submit"><span id="sign-in-label">Sign in to workspace</span><span class="button-indicator" aria-hidden="true">→</span></button>
           <div class="safety"><span class="safety-mark" aria-hidden="true">✓</span><p><b>Controlled preview</b><small>Authentication is independent. Transaction posting and production activation are disabled.</small></p></div>
         </form>
         <footer>Need access? Contact your Asas ERP administrator. Source-system passwords are never copied.</footer>
       </div>
     </section>
   </main>
-  <script src="/static/asas-login.js?v=20260922-modern-1" defer></script>
+  <script src="/static/asas-login.js?v=20260922-login-motion-2" defer></script>
 </body>
 </html>

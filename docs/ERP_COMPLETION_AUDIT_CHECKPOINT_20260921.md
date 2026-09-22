@@ -19,7 +19,6 @@ Twenty-one route-backed capability groups are implemented in controlled staging.
 ## High-priority gaps
 
 - Operational CRM.
-- Effective-dated price lists, discounts and promotions.
 - Advanced warehouse traceability and execution.
 - Multi-currency and FX.
 - Budgets, consolidation and UAE corporate tax.
@@ -31,6 +30,13 @@ Twenty-one route-backed capability groups are implemented in controlled staging.
 
 - Controlled cash transfers and daily cash close.
 - Notifications, webhooks and integration monitoring.
+
+## Subsequent resolution
+
+Effective-dated price lists, customer price groups, discount ceilings and
+maker-checker promotions are now enforced inside customer quotation creation
+and revision. The completed control path and its remaining business-acceptance
+gates are recorded in `COMMERCIAL_PRICING_CHECKPOINT_20260922.md`.
 
 ## Corrections made during the audit
 

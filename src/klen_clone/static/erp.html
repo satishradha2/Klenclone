@@ -11,18 +11,19 @@
   <link rel="stylesheet" href="/static/review.css">
   <link rel="stylesheet" href="/static/general-ledger.css">
   <link rel="stylesheet" href="/static/warehouse-controls.css?v=20260922-1">
-  <link rel="stylesheet" href="/static/workspace-shell.css?v=20260922-foundation-3">
-  <link rel="stylesheet" href="/static/workspace-components.css?v=20260922-central-all-1">
-  <link rel="stylesheet" href="/static/workspace-inspector.css?v=20260922-inspector-2">
+  <link rel="stylesheet" href="/static/workspace-shell.css?v=20260922-login-motion-1">
+  <link rel="stylesheet" href="/static/workspace-components.css?v=20260922-pricing-control-4">
+  <link rel="stylesheet" href="/static/workspace-inspector.css?v=20260922-glass-2">
 </head>
 <body>
   <a class="skip-link" href="#content">Skip to main content</a>
   <aside class="sidebar">
     <div class="brand"><span class="brand-mark">A</span><div><b>ASAS ERP</b><small>Trade operations</small></div></div>
     <nav id="nav">
-      <a href="#overview" data-route="overview" class="active"><span>◫</span>Overview</a>
-      <a href="#my-workspace" data-route="my-workspace"><span>✓</span>My workspace</a>
-      <p>OPERATIONS</p>
+      <a href="#overview" data-route="overview" class="active nav-priority"><span>⌂</span>Overview</a>
+      <a href="#my-workspace" data-route="my-workspace" class="nav-priority"><span>✓</span>My workspace</a>
+
+      <p class="nav-section" data-nav-section="commercial"><button type="button" aria-expanded="true"><span>Commercial</span><small></small><i aria-hidden="true">⌄</i></button></p>
       <a href="#sales" data-route="sales"><span>↗</span>Sales</a>
       <a href="#crm" data-route="crm"><span>◇</span>CRM</a>
       <a href="#sales-orders" data-route="sales-orders"><span>⇢</span>Sales orders</a>
@@ -31,24 +32,22 @@
       <a href="#deliveries" data-route="deliveries"><span>▣</span>Delivery fulfilment</a>
       <a href="#customer-invoices" data-route="customer-invoices"><span>▤</span>Customer invoices</a>
       <a href="#sales-returns" data-route="sales-returns"><span>↩</span>Sales returns</a>
+      <a href="#customers" data-route="customers"><span>○</span>Customers</a>
+
+      <p class="nav-section" data-nav-section="procurement"><button type="button" aria-expanded="true"><span>Procurement</span><small></small><i aria-hidden="true">⌄</i></button></p>
       <a href="#purchases" data-route="purchases"><span>↙</span>Purchasing</a>
-      <a href="#procurement" data-route="procurement"><span>⌘</span>Procurement</a>
+      <a href="#procurement" data-route="procurement"><span>⌘</span>Procurement workspace</a>
+      <a href="#goods-receipts" data-route="goods-receipts"><span>✓</span>Goods receipts</a>
       <a href="#purchase-returns" data-route="purchase-returns"><span>↪</span>Purchase returns</a>
-      <a href="#drafts" data-route="drafts"><span>＋</span>Draft entry</a>
+      <a href="#suppliers" data-route="suppliers"><span>△</span>Suppliers</a>
+
+      <p class="nav-section" data-nav-section="inventory"><button type="button" aria-expanded="true"><span>Inventory & logistics</span><small></small><i aria-hidden="true">⌄</i></button></p>
       <a href="#inventory" data-route="inventory"><span>▦</span>Inventory</a>
       <a href="#inventory-operations" data-route="inventory-operations"><span>⇄</span>Stock operations</a>
       <a href="#warehouse-controls" data-route="warehouse-controls"><span>▤</span>Warehouse controls</a>
-      <a href="#goods-receipts" data-route="goods-receipts"><span>✓</span>Goods receipts</a>
-      <p>MASTERS</p>
-      <a href="#company-setup" data-route="company-setup"><span>⚙</span>Company setup</a>
-      <a href="#users-roles" data-route="users-roles"><span>♙</span>Users & roles</a>
-      <a href="#chart-of-accounts" data-route="chart-of-accounts"><span>≡</span>Chart of accounts</a>
       <a href="#products" data-route="products"><span>◇</span>Products</a>
-      <a href="#customers" data-route="customers"><span>○</span>Customers</a>
-      <a href="#suppliers" data-route="suppliers"><span>△</span>Suppliers</a>
-      <p>PEOPLE</p>
-      <a href="#hrm" data-route="hrm"><span>♧</span>HRM</a>
-      <p>FINANCE</p>
+
+      <p class="nav-section" data-nav-section="finance"><button type="button" aria-expanded="true"><span>Finance & tax</span><small></small><i aria-hidden="true">⌄</i></button></p>
       <a href="#payments" data-route="payments"><span>¤</span>Receipts & payments</a>
       <a href="#cash-management" data-route="cash-management"><span>▧</span>Bank & cash</a>
       <a href="#expenses" data-route="expenses"><span>◫</span>Expenses & petty cash</a>
@@ -61,7 +60,15 @@
       <a href="#credit-control" data-route="credit-control"><span>◈</span>Credit control</a>
       <a href="#accounting" data-route="accounting"><span>≋</span>Accounting</a>
       <a href="#general-ledger" data-route="general-ledger"><span>▤</span>General ledger</a>
-      <p>GOVERNANCE</p>
+      <a href="#chart-of-accounts" data-route="chart-of-accounts"><span>≡</span>Chart of accounts</a>
+
+      <p class="nav-section" data-nav-section="organization"><button type="button" aria-expanded="true"><span>Organization</span><small></small><i aria-hidden="true">⌄</i></button></p>
+      <a href="#company-setup" data-route="company-setup"><span>⚙</span>Company setup</a>
+      <a href="#users-roles" data-route="users-roles"><span>♙</span>Users & roles</a>
+      <a href="#hrm" data-route="hrm"><span>♧</span>HRM</a>
+
+      <p class="nav-section" data-nav-section="governance"><button type="button" aria-expanded="true"><span>Controls & insights</span><small></small><i aria-hidden="true">⌄</i></button></p>
+      <a href="#drafts" data-route="drafts"><span>＋</span>Draft entry</a>
       <a href="#audit-compliance" data-route="audit-compliance"><span>◈</span>Audit & compliance</a>
       <a href="#cutover-rehearsal" data-route="cutover-rehearsal"><span>⟳</span>Cutover rehearsal</a>
       <a href="#completion-audit" data-route="completion-audit"><span>◎</span>Completion audit</a>
@@ -73,7 +80,7 @@
   <main id="app-main">
     <header>
       <div class="page-context"><p class="eyebrow">ASAS GENERAL TRADING LLC</p><div class="breadcrumb" aria-label="Breadcrumb"><span>ERP</span><span aria-hidden="true">/</span><strong id="breadcrumb-current">Overview</strong></div><h1 id="page-title">Overview</h1></div>
-      <div class="header-actions"><button id="command-trigger" class="command-trigger" type="button" aria-label="Open command center"><span aria-hidden="true">⌘</span><span>Search or command</span><kbd>Ctrl K</kbd></button><button id="attention-trigger" class="attention-trigger" type="button" aria-label="Open attention center"><span>Attention</span><b id="attention-count" aria-label="0 items requiring attention">0</b></button><div class="display-controls" aria-label="Display preferences"><button id="density-toggle" class="utility-button" type="button" aria-label="Change data density">Density</button><button id="theme-toggle" class="utility-button" type="button" aria-label="Change color theme">Theme</button></div><span class="preview-pill">CONTROLLED STAGING</span><span id="signed-in-user" class="signed-user"></span><button id="logout" class="logout" type="button">Sign out</button><div class="avatar" aria-hidden="true">AA</div></div>
+      <div class="header-actions"><button id="command-trigger" class="command-trigger" type="button" aria-label="Open command center"><span aria-hidden="true">⌘</span><span>Search or command</span><kbd>Ctrl K</kbd></button><button id="attention-trigger" class="attention-trigger" type="button" aria-label="Open attention center"><span>Attention</span><b id="attention-count" aria-label="0 items requiring attention">0</b></button><div class="display-controls" aria-label="Display preferences"><button id="density-toggle" class="utility-button" type="button" aria-label="Change data density">Density</button><button id="theme-toggle" class="utility-button" type="button" aria-label="Change color theme">Theme</button><button id="motion-toggle" class="utility-button" type="button" aria-label="Change interface motion">Motion</button></div><span class="preview-pill">CONTROLLED STAGING</span><span id="signed-in-user" class="signed-user"></span><button id="logout" class="logout" type="button">Sign out</button><div class="avatar" aria-hidden="true">AA</div></div>
     </header>
     <section id="notice" class="notice"><b>Operational staging</b><span>Master data and controlled workflow documents are editable in this ERP. BizModo evidence remains protected; permanent posting and production activation are still disabled.</span></section>
     <section id="content" tabindex="-1" aria-live="polite"><div class="loading">Loading cloned data…</div></section>
@@ -81,8 +88,8 @@
   <dialog id="command-center" class="command-center" aria-labelledby="command-title"><form method="dialog"><div class="command-head"><div><p class="eyebrow">GLOBAL COMMAND CENTER</p><h2 id="command-title">Go to a workspace</h2></div><button value="cancel" aria-label="Close command center">×</button></div><label class="command-search"><span>Search pages and available actions</span><input id="command-search" autocomplete="off" placeholder="Type a workspace name…"></label><div id="command-results" class="command-results" role="listbox"></div><p class="footer-note">Deterministic navigation only. AI analysis and actions are not enabled.</p></form></dialog>
   <dialog id="attention-center" class="workspace-drawer attention-center" aria-labelledby="attention-title"><form method="dialog"><div class="drawer-head"><div><p class="eyebrow">AUTHORIZED WORK QUEUE</p><h2 id="attention-title">Attention center</h2><p>Approvals within your scope and signals on the current workspace.</p></div><button value="cancel" aria-label="Close attention center">×</button></div><div id="attention-summary" class="drawer-summary" role="status" aria-live="polite"></div><div id="attention-items" class="drawer-body"></div><p class="drawer-note">This center is read-only. Decisions remain in the owning workspace with its permission, revision and maker-checker controls.</p></form></dialog>
   <dialog id="record-inspector" class="workspace-drawer record-inspector" aria-labelledby="record-inspector-title"><form method="dialog"><div class="drawer-head"><div><p class="eyebrow">READ-ONLY RECORD VIEW</p><h2 id="record-inspector-title">Record inspector</h2><p id="record-inspector-context"></p></div><button value="cancel" aria-label="Close record inspector">×</button></div><div id="record-inspector-body" class="drawer-body"></div><div class="drawer-actions"><button id="record-inspector-workspace" type="button">Open owning workspace</button><button value="cancel" class="primary">Close inspector</button></div><p class="drawer-note">Only data already visible in your authorized workspace is shown. No record is changed by this inspector.</p></form></dialog>
-  <script src="/static/workspace-components.js?v=20260922-central-all-1" defer></script>
-  <script src="/static/workspace-inspector.js?v=20260922-inspector-1" defer></script>
+  <script src="/static/workspace-components.js?v=20260922-task-workspace-3" defer></script>
+  <script src="/static/workspace-inspector.js?v=20260922-drawer-2" defer></script>
   <script src="/static/purchase-returns.js" defer></script>
   <script src="/static/payments.js?v=20260922-components-1" defer></script>
   <script src="/static/cash-management.js?v=20260922-components-1" defer></script>
@@ -98,7 +105,7 @@
   <script src="/static/credit-control.js?v=20260919-credit-2" defer></script>
   <script src="/static/general-ledger.js" defer></script>
   <script src="/static/procurement.js" defer></script>
-  <script src="/static/sales-orders.js?v=20260919-sales-orders-2" defer></script>
+  <script src="/static/sales-orders.js?v=20260922-pricing-control-3" defer></script>
   <script src="/static/pos.js?v=20260921-pos-1" defer></script>
   <script src="/static/van-sales.js?v=20260921-van-sales-1" defer></script>
   <script src="/static/crm.js?v=20260922-central-all-1" defer></script>
@@ -109,6 +116,6 @@
   <script src="/static/hrm-lifecycle.js?v=20260921-hrm-lifecycle-1" defer></script>
   <script src="/static/glossary.js" defer></script>
   <script src="/static/table-pagination.js" defer></script>
-  <script src="/static/workspace-shell.js?v=20260922-foundation-3" defer></script>
+  <script src="/static/workspace-shell.js?v=20260922-login-motion-4" defer></script>
 </body>
 </html>
