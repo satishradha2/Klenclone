@@ -54,6 +54,14 @@ from .inventory_operations import (
     replace_inventory_document,
     transition_inventory_document,
 )
+from .warehouse_controls import (
+    OperationalBarcodeIdentity, OperationalCycleCountSession, OperationalQuarantineHold,
+    OperationalSerialUnit, barcode_payload, create_cycle_count, create_quarantine_hold,
+    cycle_count_payload, quarantine_payload, record_warehouse_scan, register_barcode,
+    register_serial, release_quarantine_hold, scan_payload, serial_payload,
+    transition_cycle_count, transition_serial, warehouse_control_payload,
+)
+from .approval_workspace import approval_workspace_payload
 from .goods_receipts import (
     OperationalGoodsReceipt,
     create_goods_receipt,
@@ -805,6 +813,47 @@ class InventoryDocumentRequest(BaseModel):
     lines: list[InventoryLineRequest] = Field(min_length=1, max_length=100)
 
 
+class CycleCountLineRequest(BaseModel):
+    sku: str = Field(min_length=1, max_length=100)
+    counted_quantity_base: Decimal = Field(ge=0, max_digits=18, decimal_places=6)
+
+
+class CycleCountRequest(BaseModel):
+    location_code: str = Field(min_length=1, max_length=80)
+    notes: str | None = Field(default=None, max_length=2000)
+    lines: list[CycleCountLineRequest] = Field(min_length=1, max_length=1000)
+
+
+class QuarantineHoldRequest(BaseModel):
+    location_code: str = Field(min_length=1, max_length=80)
+    sku: str = Field(min_length=1, max_length=100)
+    quantity_base: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class BarcodeRegistrationRequest(BaseModel):
+    barcode_value: str = Field(min_length=4, max_length=80, pattern="^[A-Za-z0-9][A-Za-z0-9._/-]+$")
+    sku: str = Field(min_length=1, max_length=100)
+    location_code: str = Field(min_length=1, max_length=80)
+    factor_to_base: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+
+
+class SerialRegistrationRequest(BaseModel):
+    serial_number: str = Field(min_length=4, max_length=80, pattern="^[A-Za-z0-9][A-Za-z0-9._/-]+$")
+    sku: str = Field(min_length=1, max_length=100)
+    location_code: str = Field(min_length=1, max_length=80)
+
+
+class WarehouseScanRequest(BaseModel):
+    scanned_value: str = Field(min_length=4, max_length=80, pattern="^[A-Za-z0-9][A-Za-z0-9._/-]+$")
+    location_code: str = Field(min_length=1, max_length=80)
+
+
+class SerialTransitionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
 class GoodsReceiptLineRequest(BaseModel):
     sku: str = Field(min_length=1, max_length=100)
     ordered_quantity: Decimal | None = Field(default=None, ge=0, max_digits=18, decimal_places=6)
@@ -1138,6 +1187,51 @@ class DataReviewActionRequest(BaseModel):
     corrected_payload: dict | None = None
 
 
+# Server-owned route policy consumed by the sidebar, hash router and command
+# centre. Routes omitted here are authenticated read workspaces for every user.
+NAVIGATION_PERMISSION_RULES: dict[str, frozenset[str]] = {
+    "company-setup": frozenset({"enterprise.setup", "enterprise.approve"}),
+    "users-roles": frozenset({"access.review", "user.manage", "role.manage", "enterprise.setup"}),
+    "hrm": frozenset({"hrm.read", "hrm.manage", "hrm.self.read", "enterprise.setup"}),
+    "crm": frozenset({"crm.read"}),
+    "pos": frozenset({"pos.read"}),
+    "van-sales": frozenset({"van.read"}),
+    "sales-orders": frozenset({"draft.create", "draft.approve", "price_list.manage", "discount.approve"}),
+    "deliveries": frozenset({"delivery.allocate", "delivery.pick", "delivery.dispatch", "delivery.pod", "delivery.cancel", "inventory.create", "inventory.edit", "inventory.submit", "inventory.approve", "inventory.cancel"}),
+    "customer-invoices": frozenset({"customer_invoice.create", "customer_invoice.submit", "customer_invoice.approve", "customer_invoice.rehearse", "draft.create", "draft.approve"}),
+    "procurement": frozenset({"purchase.requisition.create", "purchase.requisition.approve", "rfq.create", "supplier_quote.manage", "purchase_order.prepare", "purchase_order.approve", "supplier_bill.prepare", "supplier_bill.approve", "supplier_bill.tolerance.approve", "supplier_bill.rehearse", "supplier_adjustment.prepare", "supplier_adjustment.approve", "match_tolerance.prepare", "match_tolerance.approve", "enterprise.setup"}),
+    "drafts": frozenset({"draft.create", "draft.edit", "draft.submit", "draft.approve", "draft.cancel", "draft.rehearse"}),
+    "inventory-operations": frozenset({"inventory.create", "inventory.edit", "inventory.submit", "inventory.approve", "inventory.cancel", "inventory.rehearse"}),
+    "warehouse-controls": frozenset({"stock.count", "quarantine.manage", "barcode.manage", "serial.manage", "warehouse.scan", "inventory.submit", "inventory.approve"}),
+    "goods-receipts": frozenset({"goods_receipt.create", "goods_receipt.edit", "goods_receipt.submit", "goods_receipt.accept", "goods_receipt.reject", "goods_receipt.rehearse"}),
+    "sales-returns": frozenset({"sales_return.create", "sales_return.edit", "sales_return.submit", "sales_return.approve", "sales_return.cancel", "sales_return.rehearse"}),
+    "purchase-returns": frozenset({"purchase_return.create", "purchase_return.edit", "purchase_return.submit", "purchase_return.approve", "purchase_return.cancel", "purchase_return.rehearse"}),
+    "payments": frozenset({"payment.prepare", "payment.create", "payment.edit", "payment.submit", "payment.approve", "payment.cancel", "payment.rehearse"}),
+    "cash-management": frozenset({"cash.account.prepare", "cash.account.approve", "bank.statement.import", "bank.reconcile.prepare", "bank.reconcile.approve", "bank.reconcile.rehearse"}),
+    "expenses": frozenset({"expense.prepare", "expense.submit", "expense.approve", "expense.rehearse", "petty_cash.prepare", "petty_cash.approve", "petty_cash.manage"}),
+    "fixed-assets": frozenset({"fixed_asset.prepare", "fixed_asset.submit", "fixed_asset.approve", "fixed_asset.disposal.prepare", "fixed_asset.disposal.approve", "fixed_asset.rehearse"}),
+    "vat-control": frozenset({"vat.period.prepare", "vat.period.submit", "vat.period.approve", "vat.adjustment.prepare", "vat.adjustment.approve", "vat.rehearse"}),
+    "period-close": frozenset({"close.prepare", "close.submit", "close.approve", "close.adjustment.prepare", "close.adjustment.approve", "close.rehearse"}),
+    "chart-of-accounts": frozenset({"financial_report.read", "finance.chart.prepare", "finance.chart.approve", "finance.mapping.prepare", "finance.mapping.approve"}),
+    "financial-statements": frozenset({"financial_report.read", "financial_report.prepare", "financial_report.submit", "financial_report.approve", "financial_report.export"}),
+    "ageing": frozenset({"financial_report.read"}),
+    "customer-statements": frozenset({"financial_report.read"}),
+    "credit-control": frozenset({"financial_report.read", "credit.review", "credit.limit.manage", "credit.limit.prepare", "credit.limit.approve", "credit.hold.release", "credit.override.prepare", "credit.override.approve", "collection.manage", "collection.escalation.prepare", "collection.escalation.approve"}),
+    "accounting": frozenset({"financial_report.read", "finance.chart.prepare", "finance.chart.approve", "finance.mapping.prepare", "finance.mapping.approve", "finance.reconciliation.prepare", "finance.reconciliation.approve"}),
+    "general-ledger": frozenset({"financial_report.read", "journal.prepare", "journal.approve"}),
+    "audit-compliance": frozenset({"audit_compliance.read", "audit_compliance.prepare", "audit_compliance.submit", "audit_compliance.approve", "audit_compliance.export"}),
+    "cutover-rehearsal": frozenset({"cutover_rehearsal.read", "cutover_rehearsal.prepare", "cutover_rehearsal.submit", "cutover_rehearsal.approve", "cutover_rehearsal.export"}),
+    "reviews": frozenset({"migration.review"}),
+}
+
+
+def navigation_access(permissions) -> dict[str, object]:
+    granted = set(permissions)
+    return {"denied_routes": sorted(route for route, required in NAVIGATION_PERMISSION_RULES.items()
+                                     if required.isdisjoint(granted)),
+            "policy_version": "2026-09-21"}
+
+
 def create_app(database_url: str | None = None, snapshot_name: str | None = None,
                delta_capture: Path | bool | None = None) -> FastAPI:
     engine = make_engine(database_url)
@@ -1244,6 +1338,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         return {"login_name": user.username, "roles": list(user.roles),
                 "permissions": list(user.permissions),
                 "allowed_locations": list(user.allowed_locations),
+                "navigation": navigation_access(user.permissions),
                 "posting_enabled": app.state.posting_enabled}
 
     def location_allowed(user, location_code: str) -> bool:
@@ -1314,9 +1409,11 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         operational_mutation = (request.url.path.startswith("/api/v1/drafts")
                                 or request.url.path.startswith("/api/v1/journal-batches")
                                 or request.url.path.startswith("/api/v1/inventory-documents")
+                                or request.url.path.startswith("/api/v1/warehouse-controls")
                                 or request.url.path.startswith("/api/v1/goods-receipts")
                                 or request.url.path.startswith("/api/v1/sales-returns")
                                 or request.url.path.startswith("/api/v1/sales-orders")
+                                or request.url.path.startswith("/api/v1/commercial-pricing")
                                 or request.url.path.startswith("/api/v1/deliveries")
                                 or request.url.path.startswith("/api/v1/customer-invoices")
                                 or request.url.path.startswith("/api/v1/pos")
@@ -1470,7 +1567,9 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         return enterprise_setup_payload(operational_session)
 
     @app.get("/api/v1/finance/foundation")
-    def finance_foundation(operational_session=Depends(operational_session_dependency)):
+    def finance_foundation(request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        require_any_user(request, NAVIGATION_PERMISSION_RULES["chart-of-accounts"])
         return finance_foundation_payload(operational_session)
 
     def finance_permission(resource_type: str, action: str) -> str:
@@ -1525,7 +1624,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                                snapshot: SourceSnapshot = Depends(snapshot_dependency),
                                session: Session = Depends(session_dependency),
                                operational_session=Depends(operational_session_dependency)):
-        require_finance_report_scope(request, snapshot, session)
+        require_finance_report_scope(request, snapshot, session,
+                                     NAVIGATION_PERMISSION_RULES["accounting"] | {"financial_report.read"})
         return finance_reconciliation_payload(operational_session)
 
     @app.post("/api/v1/finance/reconciliation/{review_key}/request")
@@ -1571,7 +1671,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         session: Session = Depends(session_dependency),
         operational_session=Depends(operational_session_dependency),
     ):
-        require_finance_report_scope(request, snapshot, session)
+        require_finance_report_scope(request, snapshot, session,
+                                     NAVIGATION_PERMISSION_RULES["general-ledger"])
         if account_code and not operational_session.scalar(select(OperationalChartAccount.id).where(
             OperationalChartAccount.company_code == "ASAS",
             OperationalChartAccount.account_code == account_code,
@@ -2944,6 +3045,110 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             return rehearse_inventory_posting(operational_session, document, actor=user.username)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/warehouse-controls")
+    def warehouse_controls(request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_any_user(request, NAVIGATION_PERMISSION_RULES["warehouse-controls"])
+        return warehouse_control_payload(operational_session, allowed_locations=user.allowed_locations)
+
+    @app.post("/api/v1/warehouse-controls/cycle-counts", status_code=201)
+    def new_cycle_count(payload: CycleCountRequest, request: Request,
+                        operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "stock.count")
+        if not location_allowed(user, payload.location_code):
+            raise HTTPException(status_code=404, detail="Warehouse location not found")
+        try:
+            return cycle_count_payload(create_cycle_count(operational_session, location_code=payload.location_code,
+                lines=[line.model_dump() for line in payload.lines], notes=payload.notes, actor=user.username))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/cycle-counts/{count_key}/{action}")
+    def cycle_count_action(count_key: str, action: str, payload: DraftTransitionRequest, request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        if action not in {"submit", "cancel", "approve"}: raise HTTPException(status_code=404, detail="Cycle-count action not found")
+        user = require_csrf(request, "inventory.submit" if action in {"submit", "cancel"} else "inventory.approve")
+        record = operational_session.scalar(select(OperationalCycleCountSession).where(OperationalCycleCountSession.count_key == count_key).with_for_update())
+        if not record or not location_allowed(user, record.location_code): raise HTTPException(status_code=404, detail="Cycle-count session not found")
+        try: return cycle_count_payload(transition_cycle_count(operational_session, record, action=action, expected_revision=payload.expected_revision, actor=user.username, note=payload.note))
+        except PermissionError as exc: raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/quarantine-holds", status_code=201)
+    def new_quarantine_hold(payload: QuarantineHoldRequest, request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "quarantine.manage")
+        if not location_allowed(user, payload.location_code): raise HTTPException(status_code=404, detail="Warehouse location not found")
+        try: return quarantine_payload(create_quarantine_hold(operational_session, actor=user.username, **payload.model_dump()))
+        except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/quarantine-holds/{hold_key}/release")
+    def release_quarantine(hold_key: str, payload: DraftTransitionRequest, request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "quarantine.manage")
+        hold = operational_session.scalar(select(OperationalQuarantineHold).where(OperationalQuarantineHold.hold_key == hold_key).with_for_update())
+        if not hold or not location_allowed(user, hold.location_code): raise HTTPException(status_code=404, detail="Quarantine hold not found")
+        try: return quarantine_payload(release_quarantine_hold(operational_session, hold, expected_revision=payload.expected_revision, actor=user.username, note=payload.note or "Independent quarantine release"))
+        except PermissionError as exc: raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc: raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/barcodes", status_code=201)
+    def new_barcode_identity(payload: BarcodeRegistrationRequest, request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "barcode.manage")
+        if not location_allowed(user, payload.location_code):
+            raise HTTPException(status_code=404, detail="Warehouse location not found")
+        try:
+            return barcode_payload(register_barcode(
+                operational_session, actor=user.username, **payload.model_dump()))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/serials", status_code=201)
+    def new_serial_identity(payload: SerialRegistrationRequest, request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "serial.manage")
+        if not location_allowed(user, payload.location_code):
+            raise HTTPException(status_code=404, detail="Warehouse location not found")
+        try:
+            return serial_payload(register_serial(
+                operational_session, actor=user.username, **payload.model_dump()))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/serials/{serial_key}/{action}")
+    def serial_identity_action(serial_key: str, action: str, payload: SerialTransitionRequest,
+                               request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        if action not in {"quarantine", "release", "retire"}:
+            raise HTTPException(status_code=404, detail="Serial action not found")
+        permission = "quarantine.manage" if action in {"quarantine", "release"} else "serial.manage"
+        user = require_csrf(request, permission)
+        row = operational_session.scalar(select(OperationalSerialUnit).where(
+            OperationalSerialUnit.serial_key == serial_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Serial identity not found")
+        try:
+            return serial_payload(transition_serial(
+                operational_session, row, action=action,
+                expected_revision=payload.expected_revision, actor=user.username,
+                note=payload.note))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/warehouse-controls/scans", status_code=201)
+    def warehouse_scan(payload: WarehouseScanRequest, request: Request,
+                       operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "warehouse.scan")
+        if not location_allowed(user, payload.location_code):
+            raise HTTPException(status_code=404, detail="Warehouse location not found")
+        try:
+            return scan_payload(record_warehouse_scan(
+                operational_session, actor=user.username, **payload.model_dump()))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     def goods_receipt_payload(receipt: OperationalGoodsReceipt) -> dict:
         return {
@@ -5263,6 +5468,19 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "verification_scope": "immutable_raw_clone_evidence",
                 "posting_enabled": False, "promotion_executed": False}
 
+    @app.get("/api/v1/my-workspace")
+    def my_workspace(request: Request,
+                     operational_session=Depends(operational_session_dependency)):
+        user = current_user(request)
+        if app.state.auth_enabled and not user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        return approval_workspace_payload(
+            operational_session,
+            username=user.username if user else None,
+            permissions=user.permissions if user else None,
+            allowed_locations=user.allowed_locations if user else ("*",),
+        )
+
     @app.get("/api/v1/overview")
     def overview(snapshot: SourceSnapshot = Depends(snapshot_dependency), session: Session = Depends(session_dependency)):
         count = lambda model: session.scalar(select(func.count(model.id)).where(model.snapshot_id == snapshot.id)) or 0
@@ -5694,10 +5912,11 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         rows = session.execute(grouped.order_by(ErpProductMaster.sku, ErpLocation.code).offset(offset).limit(limit)).all()
         return page(limit, offset, total, rows)
 
-    def require_finance_report_scope(request: Request, snapshot: SourceSnapshot, session: Session):
+    def require_finance_report_scope(request: Request, snapshot: SourceSnapshot, session: Session,
+                                     permissions: frozenset[str] | set[str] = frozenset({"financial_report.read"})):
         user = current_user(request)
-        if not user or "financial_report.read" not in user.permissions:
-            raise HTTPException(status_code=403, detail="Permission financial_report.read is required")
+        if not user or set(permissions).isdisjoint(user.permissions):
+            raise HTTPException(status_code=403, detail="A permitted finance workspace role is required")
         location_codes = {row[0].upper() for row in session.execute(select(ErpLocation.code).where(
             ErpLocation.snapshot_id == snapshot.id)).all()}
         allowed = set(user.allowed_locations)
@@ -5708,7 +5927,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     @app.get("/api/v1/accounting")
     def accounting(request: Request, snapshot: SourceSnapshot = Depends(snapshot_dependency), session: Session = Depends(session_dependency),
                    operational_session=Depends(operational_session_dependency)):
-        require_finance_report_scope(request, snapshot, session)
+        require_finance_report_scope(request, snapshot, session,
+                                     NAVIGATION_PERMISSION_RULES["accounting"] | {"financial_report.read"})
         openings = session.execute(select(
             ErpOpeningBalanceQueue.balance_kind,
             func.count(ErpOpeningBalanceQueue.id).label("rows"),
@@ -5775,7 +5995,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                                  snapshot: SourceSnapshot = Depends(snapshot_dependency),
                                  session: Session = Depends(session_dependency),
                                  operational_session=Depends(operational_session_dependency)):
-        require_finance_report_scope(request, snapshot, session)
+        require_finance_report_scope(request, snapshot, session,
+                                     NAVIGATION_PERMISSION_RULES["credit-control"])
         filters = [ErpParty.snapshot_id == snapshot.id,
                    ErpParty.party_kind.in_(("customer", "both"))]
         if q.strip():

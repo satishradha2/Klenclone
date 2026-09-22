@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from klen_clone.auth import hash_password
 from klen_clone.db import Base, make_engine
-from klen_clone.erp_preview import create_app
+from klen_clone.erp_preview import create_app, navigation_access
 from klen_clone.data_reviews import OperationalDataReview, start_review, transition_review
 from klen_clone.models import (
     ErpAuditEvent, ErpLocation, ErpOrganization, ErpParty, ErpProductMaster, ErpProductUom,
@@ -210,6 +210,244 @@ def test_preview_is_independent_read_only_with_hrm_enabled_and_payroll_excluded(
     assert rejected.status_code == 405
     assert rejected.headers["x-content-type-options"] == "nosniff"
     assert rejected.headers["x-request-id"]
+
+
+def test_navigation_policy_is_server_owned_and_mutation_middleware_allows_controlled_workflows(tmp_path, monkeypatch):
+    password = "navigation policy test password"
+    users_file = tmp_path / "navigation-users.json"
+    users_file.write_text(json.dumps({"users": [{
+        "id": 1, "username": "quality-user", "password_hash": hash_password(password),
+        "roles": ["quality_controller"],
+        "permissions": ["clone.read", "quarantine.manage", "price_list.manage"],
+        "allowed_locations": ["SHJ"],
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'operational.db'}")
+    client = preview_client(tmp_path)
+    login = client.post("/api/v1/auth/login", json={"username": "quality-user", "password": password})
+    assert login.status_code == 200
+    principal = login.json()["principal"]
+    assert principal["navigation"]["policy_version"] == "2026-09-21"
+    assert "warehouse-controls" not in principal["navigation"]["denied_routes"]
+    assert "sales-orders" not in principal["navigation"]["denied_routes"]
+    assert {"pos", "van-sales", "hrm"}.issubset(principal["navigation"]["denied_routes"])
+    headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    assert client.get("/api/v1/warehouse-controls").status_code == 200
+    invalid_hold = client.post("/api/v1/warehouse-controls/quarantine-holds", headers=headers, json={})
+    assert invalid_hold.status_code == 422
+    assert invalid_hold.status_code != 405
+    group = client.post("/api/v1/commercial-pricing/groups", headers=headers,
+                        json={"group_code": "QA", "name": "Quality controlled"})
+    assert group.status_code == 201
+    assert group.json()["group_code"] == "QA"
+
+
+def test_warehouse_traceability_api_enforces_identity_scope_and_maker_checker(tmp_path, monkeypatch):
+    password = "warehouse traceability test password"
+    users_file = tmp_path / "warehouse-traceability-users.json"
+    users_file.write_text(json.dumps({"users": [{
+        "id": 1, "username": "trace-user", "password_hash": hash_password(password),
+        "roles": ["inventory_controller"],
+        "permissions": ["clone.read", "barcode.manage", "serial.manage", "warehouse.scan",
+                        "quarantine.manage"],
+        "allowed_locations": ["SHJ"],
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'operational.db'}")
+    client = preview_client(tmp_path)
+    seed_operational_controls(client, "2")
+    login = client.post("/api/v1/auth/login", json={"username": "trace-user", "password": password})
+    assert login.status_code == 200
+    headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+
+    barcode = client.post("/api/v1/warehouse-controls/barcodes", headers=headers, json={
+        "barcode_value": "BC-SHJ-001", "sku": "SKU-001", "location_code": "SHJ",
+        "factor_to_base": "1",
+    })
+    assert barcode.status_code == 201
+    assert barcode.json()["barcode_value"] == "BC-SHJ-001"
+    serial = client.post("/api/v1/warehouse-controls/serials", headers=headers, json={
+        "serial_number": "SN-SHJ-001", "sku": "SKU-001", "location_code": "SHJ",
+    })
+    assert serial.status_code == 201
+    serial_key = serial.json()["serial_key"]
+    scan = client.post("/api/v1/warehouse-controls/scans", headers=headers, json={
+        "scanned_value": "SN-SHJ-001", "location_code": "SHJ",
+    })
+    assert scan.status_code == 201
+    assert scan.json()["outcome"] == "matched"
+
+    quarantine = client.post(
+        f"/api/v1/warehouse-controls/serials/{serial_key}/quarantine", headers=headers,
+        json={"expected_revision": 1, "note": "Damaged packaging under quality review"},
+    )
+    assert quarantine.status_code == 200
+    assert quarantine.json()["status"] == "quarantined"
+    self_release = client.post(
+        f"/api/v1/warehouse-controls/serials/{serial_key}/release", headers=headers,
+        json={"expected_revision": 2, "note": "Attempted release by the same operator"},
+    )
+    assert self_release.status_code == 403
+    wrong_location = client.post("/api/v1/warehouse-controls/serials", headers=headers, json={
+        "serial_number": "SN-DXB-001", "sku": "SKU-001", "location_code": "DXB",
+    })
+    assert wrong_location.status_code == 404
+
+    payload = client.get("/api/v1/warehouse-controls").json()
+    assert payload["controls"]["active_barcodes"] == 1
+    assert payload["controls"]["tracked_serials"] == 1
+    assert payload["serial_units"][0]["status"] == "quarantined"
+    approval_items = client.get("/api/v1/my-workspace").json()["items"]
+    serial_approval = next(item for item in approval_items if item["resource_key"] == serial_key)
+    assert serial_approval["workflow"] == "Serial quarantine release"
+    assert serial_approval["action_eligible"] is False
+    assert serial_approval["eligibility_reason"] == "independent_approver_required"
+
+
+def test_navigation_policy_denies_restricted_workspaces_without_matching_permission():
+    denied = navigation_access({"clone.read"})["denied_routes"]
+    assert {"users-roles", "warehouse-controls", "sales-orders", "reviews",
+            "chart-of-accounts", "ageing", "customer-statements", "accounting"}.issubset(denied)
+    assert "overview" not in denied
+    router = (Path(__file__).parents[1] / "src" / "klen_clone" / "static" / "erp.js").read_text(encoding="utf-8")
+    assert "s.principal.navigation?.denied_routes" in router
+    assert "deniedRoutes.has(active)" in router
+    assert "restrictedLinks" not in router
+
+
+def test_finance_workspace_read_guards_match_navigation_permissions(tmp_path, monkeypatch):
+    password = "finance navigation test password"
+    users_file = tmp_path / "finance-navigation-users.json"
+    users_file.write_text(json.dumps({"users": [{
+        "id": 1, "username": "finance-workspace-user", "password_hash": hash_password(password),
+        "roles": ["custom_finance_workspace"],
+        "permissions": ["finance.reconciliation.prepare", "journal.prepare", "credit.limit.prepare"],
+        "allowed_locations": ["*"],
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'operational.db'}")
+    client = preview_client(tmp_path)
+    login = client.post("/api/v1/auth/login", json={"username": "finance-workspace-user", "password": password})
+    assert login.status_code == 200
+    denied = set(login.json()["principal"]["navigation"]["denied_routes"])
+    assert {"accounting", "general-ledger", "credit-control"}.isdisjoint(denied)
+    assert client.get("/api/v1/accounting").status_code == 200
+    assert client.get("/api/v1/finance/reconciliation").status_code == 200
+    assert client.get("/api/v1/general-ledger").status_code == 200
+    assert client.get("/api/v1/credit-control").status_code == 200
+
+
+def test_financial_report_reader_navigation_matches_read_endpoints(tmp_path, monkeypatch):
+    password = "financial report reader password"
+    users_file = tmp_path / "financial-report-reader-users.json"
+    users_file.write_text(json.dumps({"users": [{
+        "id": 1, "username": "financial-report-reader", "password_hash": hash_password(password),
+        "roles": ["custom_financial_report_reader"],
+        "permissions": ["financial_report.read"],
+        "allowed_locations": ["*"],
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'operational.db'}")
+    client = preview_client(tmp_path)
+    login = client.post("/api/v1/auth/login", json={"username": "financial-report-reader", "password": password})
+    assert login.status_code == 200
+    denied = set(login.json()["principal"]["navigation"]["denied_routes"])
+    assert {"chart-of-accounts", "financial-statements", "ageing", "customer-statements",
+            "credit-control", "accounting", "general-ledger"}.isdisjoint(denied)
+    assert client.get("/api/v1/finance/foundation").status_code == 200
+    assert client.get("/api/v1/accounting").status_code == 200
+    assert client.get("/api/v1/reports/ageing?ledger_kind=receivable").status_code == 200
+    assert client.get("/api/v1/general-ledger").status_code == 200
+
+
+def test_my_workspace_filters_approvals_by_permission_location_and_maker(tmp_path, monkeypatch):
+    password = "approval workspace test password"
+    users_file = tmp_path / "approval-workspace-users.json"
+    users_file.write_text(json.dumps({"users": [{
+        "id": 1, "username": "draft-approver", "password_hash": hash_password(password),
+        "roles": ["custom_draft_approver"], "permissions": ["draft.approve"],
+        "allowed_locations": ["SHJ"],
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'operational.db'}")
+    client = preview_client(tmp_path)
+    with client.app.state.operational_sessions() as session:
+        for key, location, creator in (("visible-other", "SHJ", "sales-maker"),
+                                       ("visible-own", "SHJ", "draft-approver"),
+                                       ("hidden-location", "DXB", "sales-maker")):
+            session.add(OperationalDraft(
+                draft_key=key, draft_no=f"D-{key}", document_type="sale", party_code="CO-1",
+                party_name_snapshot="Approval customer", location_code=location, currency_code="AED",
+                subtotal=10, discount_amount=0, tax_amount=0, total_amount=10,
+                status="submitted", posting_enabled=False, created_by=creator,
+                state_changed_by=creator,
+            ))
+        session.commit()
+    login = client.post("/api/v1/auth/login", json={"username": "draft-approver", "password": password})
+    assert login.status_code == 200
+    response = client.get("/api/v1/my-workspace")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["controls"]["visible_pending"] == 2
+    assert payload["controls"]["actionable"] == 1
+    assert payload["controls"]["self_submitted"] == 1
+    assert {item["resource_key"] for item in payload["items"]} == {"visible-other", "visible-own"}
+    own = next(item for item in payload["items"] if item["resource_key"] == "visible-own")
+    assert own["action_eligible"] is False
+    assert own["eligibility_reason"] == "independent_approver_required"
+    assert all(item["route"] == "drafts" and item["posting_enabled"] is False
+               for item in payload["items"])
+
+
+def test_my_workspace_is_registered_in_shell_and_requires_authentication(tmp_path, monkeypatch):
+    password = "workspace authentication test password"
+    users_file = tmp_path / "workspace-auth-users.json"
+    users_file.write_text(json.dumps({"users": [{
+        "id": 1, "username": "workspace-reader", "password_hash": hash_password(password),
+        "roles": ["workspace_reader"], "permissions": ["clone.read"],
+        "allowed_locations": ["SHJ"],
+    }]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'operational.db'}")
+    client = preview_client(tmp_path)
+    assert client.get("/api/v1/my-workspace").status_code == 401
+    shell = (Path(__file__).parents[1] / "src" / "klen_clone" / "static" / "erp.html").read_text(encoding="utf-8")
+    router = (Path(__file__).parents[1] / "src" / "klen_clone" / "static" / "erp.js").read_text(encoding="utf-8")
+    assert 'data-route="my-workspace"' in shell
+    assert "async function myWorkspace()" in router
+    assert "api('/my-workspace')" in router
+    assert "else if(active==='my-workspace')await myWorkspace()" in router
+
+
+def test_record_inspector_and_attention_center_are_centralized_read_only_surfaces():
+    static_root = Path(__file__).parents[1] / "src" / "klen_clone" / "static"
+    shell = (static_root / "erp.html").read_text(encoding="utf-8")
+    components = (static_root / "workspace-components.js").read_text(encoding="utf-8")
+    inspector = (static_root / "workspace-inspector.js").read_text(encoding="utf-8")
+
+    assert 'id="attention-trigger"' in shell
+    assert 'id="attention-center"' in shell
+    assert 'id="record-inspector"' in shell
+    assert "/static/workspace-inspector.css?v=" in shell
+    assert "/static/workspace-inspector.js?v=" in shell
+    assert "inspectable-row" in components
+    assert "fetch('/api/v1/my-workspace'" in inspector
+    assert "tr.inspectable-row" in inspector
+    assert "method: 'POST'" not in inspector
+    assert 'method: "POST"' not in inspector
+    assert "method: 'PUT'" not in inspector
+    assert 'method: "PUT"' not in inspector
+    assert "method: 'PATCH'" not in inspector
+    assert 'method: "PATCH"' not in inspector
+    assert "method: 'DELETE'" not in inspector
+    assert 'method: "DELETE"' not in inspector
+    assert "X-CSRF-Token" not in inspector
 
 
 def test_hrm_test_workspace_promotes_sealed_evidence_without_payroll(tmp_path, monkeypatch):
@@ -1135,7 +1373,11 @@ def test_preview_authentication_session_csrf_and_audit(tmp_path, monkeypatch):
     client = preview_client(tmp_path)
 
     assert client.get("/api/v1/overview").status_code == 401
-    assert "Sign in to Asas ERP" in client.get("/").text
+    login_page = client.get("/").text
+    assert "Welcome back" in login_page
+    assert "Controlled staging" in login_page
+    assert "Source protected" in login_page
+    assert "/static/asas-login.css?v=20260922-modern-1" in login_page
     denied = client.post("/api/v1/auth/login", json={"username": "asas-admin", "password": "wrong"})
     assert denied.status_code == 401
     login = client.post("/api/v1/auth/login", json={

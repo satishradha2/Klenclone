@@ -1,3 +1,29 @@
+function enhancePeriodClosePresentation(){
+  const ui=WorkspaceUI,panels=[...content.querySelectorAll(':scope > .panel')],firstPanel=panels[0];
+  ui.workflow({anchor:firstPanel,className:'close-flow',label:'Month-end close workflow',steps:[
+    {title:'Prepare package',detail:'Select an eligible open fiscal period'},
+    {title:'Resolve checklist',detail:'Review balances, exceptions and evidence'},
+    {title:'Approve adjustments',detail:'Independent maker-checker decisions'},
+    {title:'Approve & rehearse',detail:'Freeze snapshot without locking the period'}
+  ]});
+  const createForm=document.querySelector('#close-form');
+  if(createForm)ui.form(createForm,{panel:createForm.closest('.panel'),panelClasses:['close-control-form'],fields:'.draft-fields',wrapSubmit:{classes:['close-form-actions']},feedback:[{selector:'#close-form-result'}]});
+  panels.forEach(element=>{
+    const heading=element.querySelector('.panel-head h3')?.textContent.trim();
+    if(!heading||heading==='Start month-end close'||heading==='Closing adjustment register')return;
+    ui.panel(element,{classes:['record-panel','close-package-board']});
+    ui.addClasses(element.querySelector('.metrics'),'close-package-metrics');
+    ui.addClasses(element.querySelector(':scope > .draft-fields'),'close-package-grid');
+    ui.addClasses(element.querySelector(':scope > .draft-fields > div:last-child'),'close-package-actions');
+    element.querySelectorAll('.control-list li').forEach(item=>item.classList.add('close-control-item'));
+  });
+  content.querySelectorAll('.close-adjustment-form').forEach(form=>{ui.addClasses(form,'inline-control-form');ui.feedback(form.querySelector('.footer-note'))});
+  const register=ui.findPanel(content,'Closing adjustment register');
+  if(register)ui.panel(register,{classes:['record-panel','close-adjustment-board'],caption:'Evidence-backed month-end adjustment approval register',financialSelector:'td.money'});
+  ui.feedback(document.querySelector('#close-result'),['close-workflow-feedback']);
+  ui.controlNote(register,'Month-end close approval freezes a controlled evidence snapshot only. The fiscal period remains open and no permanent journal or period lock is created.');
+}
+
 async function periodCloseWorkspace(){
   const data=await api('/period-close/workspace'),can=p=>currentPermissions.has(p),c=data.controls||{};
   const mutate=async(url,payload={})=>{const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify(payload)}),reply=await response.json().catch(()=>({}));if(!response.ok)throw Error(reply.detail||'Period-close action failed');return reply};
@@ -9,6 +35,7 @@ async function periodCloseWorkspace(){
   const packages=data.closes.map(x=>`<section class="panel"><div class="panel-head"><h3>${esc(x.close_no)}</h3><span>${esc(x.period_key)} · ${esc(x.starts_on)} to ${esc(x.ends_on)}</span></div><div class="metrics">${metric('Status',esc(x.status.replaceAll('_',' ')),'Close package')}${metric('Inventory value',money(x.snapshot.inventory_value||0),`${num(x.snapshot.stock_positions||0)} positions`)}${metric('Close adjustments',num(x.snapshot.approved_adjustments||0),money(x.snapshot.approved_adjustment_total||0))}${metric('Permanent journals',num(x.snapshot.permanent_journal_batches||0),'Balance checked')}</div><div class="draft-fields"><div><h4>Close checklist</h4><ul class="control-list">${controls(x)}</ul></div><div><h4>Actions</h4>${actions(x)}${adjForm(x)}</div></div></section>`).join('')||'<section class="panel"><div class="empty">No close package has been created.</div></section>';
   const adjRows=data.closes.flatMap(x=>x.adjustments.map(a=>`<tr><td>${esc(a.adjustment_no)}<small>${esc(x.period_key)}</small></td><td>${esc(a.adjustment_type.replaceAll('_',' '))}<small>${esc(a.adjustment_date)}</small></td><td>${esc(a.debit_account)}<small>Dr</small></td><td>${esc(a.credit_account)}<small>Cr</small></td><td class="money">${money(a.amount)}</td><td>${esc(a.evidence_reference)}<small>${esc(a.reason)}</small></td><td><span class="status ${esc(a.status)}">${esc(a.status)}</span></td><td>${a.status==='pending'&&can('close.adjustment.approve')?`<input class="close-adj-note" placeholder="Decision note"><button class="close-adj-action primary-small" data-key="${esc(a.adjustment_key)}" data-action="approve" data-revision="${a.revision}">Approve</button><button class="close-adj-action" data-key="${esc(a.adjustment_key)}" data-action="reject" data-revision="${a.revision}">Reject</button>`:a.status==='pending'&&can('close.adjustment.prepare')?`<button class="close-adj-action" data-key="${esc(a.adjustment_key)}" data-action="cancel" data-revision="${a.revision}">Cancel</button>`:esc(a.decision_note||'—')}</td></tr>`)).join('')||'<tr><td colspan="8" class="empty">No period-close adjustments.</td></tr>';
   content.innerHTML=hero('Month-end close','Checklist, closing adjustments and independently approved lock rehearsal','No permanent posting · period remains open')+`<div class="metrics control-metrics">${metric('Close packages',num(c.packages||0),'Controlled register')}${metric('Awaiting approval',num(c.awaiting_approval||0),'Maker-checker')}${metric('Pending adjustments',num(c.pending_adjustments||0),'Evidence required')}${metric('Approved closes',num(c.approved||0),'Frozen snapshot')}${metric('Rehearsals',num(c.rehearsals||0),'Balanced')}${metric('Period locks',num(c.period_locks||0),'Disabled in staging')}</div>${createForm}${packages}<section class="panel"><div class="panel-head"><h3>Closing adjustment register</h3><span>Accruals · prepayments · FX · inventory valuation</span></div><div class="table-wrap"><table><thead><tr><th>Adjustment</th><th>Type / date</th><th>Debit</th><th>Credit</th><th>Amount</th><th>Evidence</th><th>Status</th><th>Actions</th></tr></thead><tbody>${adjRows}</tbody></table></div></section><p id="close-result" class="footer-note"></p>`;
+  enhancePeriodClosePresentation();
   const result=()=>document.querySelector('#close-result');
   const f=document.querySelector('#close-form');if(f)f.onsubmit=async e=>{e.preventDefault();try{await mutate('/api/v1/period-close',Object.fromEntries(new FormData(f).entries()));await periodCloseWorkspace()}catch(error){document.querySelector('#close-form-result').textContent=error.message}};
   document.querySelectorAll('.close-adjustment-form').forEach(f=>f.onsubmit=async e=>{e.preventDefault();const p=Object.fromEntries(new FormData(f).entries());p.reversal_on=p.reversal_on||null;try{await mutate(`/api/v1/period-close/${f.dataset.key}/adjustments`,p);await periodCloseWorkspace()}catch(error){f.querySelector('.footer-note').textContent=error.message}});

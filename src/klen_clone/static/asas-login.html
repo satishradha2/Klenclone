@@ -3,29 +3,52 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#15243b">
   <title>Sign in | Asas ERP</title>
-  <link rel="stylesheet" href="/static/asas-login.css">
+  <link rel="stylesheet" href="/static/asas-login.css?v=20260922-modern-1">
 </head>
 <body>
+  <a class="skip-link" href="#login-form">Skip to sign in</a>
   <main class="login-shell">
-    <section class="identity">
-      <div class="brand"><span>A</span><div><b>ASAS ERP</b><small>Asas General Trading LLC</small></div></div>
-      <div><p>INDEPENDENT BUSINESS PLATFORM</p><h1>Your trade operations,<br>preserved and controlled.</h1><p class="copy">Review the cloned BizModo registers in the new Asas environment. HRM is included; payroll is excluded.</p></div>
-      <small>BizModo source access remains read-only.</small>
+    <section class="identity" aria-labelledby="login-welcome">
+      <div class="identity-top">
+        <div class="brand"><span aria-hidden="true">A</span><div><b>ASAS ERP</b><small>Asas General Trading LLC</small></div></div>
+        <span class="environment"><i aria-hidden="true"></i>Controlled staging</span>
+      </div>
+      <div class="identity-content">
+        <p class="eyebrow light">INDEPENDENT BUSINESS PLATFORM</p>
+        <h1 id="login-welcome">One workspace.<br>Controlled operations.</h1>
+        <p class="identity-copy">Enter the protected Asas environment for sales, purchasing, inventory, finance and governed approvals.</p>
+        <div class="assurance-grid" aria-label="Environment controls">
+          <div><span>01</span><p><b>Source protected</b><small>BizModo access remains read-only.</small></p></div>
+          <div><span>02</span><p><b>Access scoped</b><small>Roles and locations control visibility.</small></p></div>
+          <div><span>03</span><p><b>Posting locked</b><small>Production posting remains disabled.</small></p></div>
+        </div>
+      </div>
+      <div class="identity-foot"><span>ASAS GENERAL TRADING LLC</span><span>ERP CONTROL ENVIRONMENT</span></div>
     </section>
-    <section class="form-side">
-      <form id="login-form" autocomplete="on">
-        <p class="eyebrow">PROVISIONED ACCESS</p>
-        <h2>Sign in to Asas ERP</h2>
-        <p class="intro">Use the independent administrator credentials created for this preview.</p>
-        <label>Username<input id="username" name="username" autocomplete="username" required></label>
-        <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
-        <button type="submit">Sign in</button>
-        <p id="error" class="error" role="alert"></p>
-        <div class="safety"><b>Read-only preview</b><span>Transaction posting and production activation are disabled.</span></div>
-      </form>
+
+    <section class="form-side" aria-label="Sign in">
+      <div class="auth-wrap">
+        <header class="auth-heading">
+          <span class="auth-icon" aria-hidden="true">A</span>
+          <div><p class="eyebrow">SECURE ERP ACCESS</p><span>Authorized personnel only</span></div>
+        </header>
+        <form id="login-form" autocomplete="on">
+          <div class="form-title">
+            <h2>Welcome back</h2>
+            <p>Use your independently provisioned ERP credentials.</p>
+          </div>
+          <label for="username"><span>Username</span><input id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+          <label for="password"><span>Password</span><input id="password" name="password" type="password" autocomplete="current-password" required></label>
+          <p id="error" class="error" role="alert" aria-live="assertive"></p>
+          <button type="submit"><span>Sign in to workspace</span><span aria-hidden="true">→</span></button>
+          <div class="safety"><span class="safety-mark" aria-hidden="true">✓</span><p><b>Controlled preview</b><small>Authentication is independent. Transaction posting and production activation are disabled.</small></p></div>
+        </form>
+        <footer>Need access? Contact your Asas ERP administrator. Source-system passwords are never copied.</footer>
+      </div>
     </section>
   </main>
-  <script src="/static/asas-login.js" defer></script>
+  <script src="/static/asas-login.js?v=20260922-modern-1" defer></script>
 </body>
 </html>

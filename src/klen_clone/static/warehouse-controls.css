@@ -1,0 +1,86 @@
+.warehouse-entry-grid,
+.warehouse-section-panel {
+  margin-bottom: 18px;
+}
+
+.warehouse-control-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  padding: 18px;
+}
+
+.warehouse-control-form label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+
+.warehouse-control-form input,
+.warehouse-control-form textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid #cfdcd8;
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  color: var(--text-primary, var(--ink));
+  font: inherit;
+  font-size: 11px;
+}
+
+.warehouse-control-form textarea {
+  min-height: 76px;
+  resize: vertical;
+}
+
+.warehouse-control-form button {
+  align-self: end;
+  justify-self: start;
+  padding: 10px 15px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--green);
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.warehouse-control-form button:disabled {
+  cursor: not-allowed;
+  opacity: .48;
+}
+
+.warehouse-control-form .footer-note {
+  grid-column: 1 / -1;
+  min-height: 14px;
+  margin: 0;
+}
+
+.warehouse-scan-form {
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto;
+}
+
+.warehouse-table {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+@media (max-width: 820px) {
+  .warehouse-control-form,
+  .warehouse-scan-form {
+    grid-template-columns: 1fr;
+  }
+
+  .warehouse-control-form button {
+    width: 100%;
+  }
+}

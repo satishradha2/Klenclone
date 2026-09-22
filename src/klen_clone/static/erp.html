@@ -10,12 +10,18 @@
   <link rel="stylesheet" href="/static/pagination.css">
   <link rel="stylesheet" href="/static/review.css">
   <link rel="stylesheet" href="/static/general-ledger.css">
+  <link rel="stylesheet" href="/static/warehouse-controls.css?v=20260922-1">
+  <link rel="stylesheet" href="/static/workspace-shell.css?v=20260922-foundation-3">
+  <link rel="stylesheet" href="/static/workspace-components.css?v=20260922-central-all-1">
+  <link rel="stylesheet" href="/static/workspace-inspector.css?v=20260922-inspector-2">
 </head>
 <body>
+  <a class="skip-link" href="#content">Skip to main content</a>
   <aside class="sidebar">
     <div class="brand"><span class="brand-mark">A</span><div><b>ASAS ERP</b><small>Trade operations</small></div></div>
     <nav id="nav">
       <a href="#overview" data-route="overview" class="active"><span>◫</span>Overview</a>
+      <a href="#my-workspace" data-route="my-workspace"><span>✓</span>My workspace</a>
       <p>OPERATIONS</p>
       <a href="#sales" data-route="sales"><span>↗</span>Sales</a>
       <a href="#crm" data-route="crm"><span>◇</span>CRM</a>
@@ -31,6 +37,7 @@
       <a href="#drafts" data-route="drafts"><span>＋</span>Draft entry</a>
       <a href="#inventory" data-route="inventory"><span>▦</span>Inventory</a>
       <a href="#inventory-operations" data-route="inventory-operations"><span>⇄</span>Stock operations</a>
+      <a href="#warehouse-controls" data-route="warehouse-controls"><span>▤</span>Warehouse controls</a>
       <a href="#goods-receipts" data-route="goods-receipts"><span>✓</span>Goods receipts</a>
       <p>MASTERS</p>
       <a href="#company-setup" data-route="company-setup"><span>⚙</span>Company setup</a>
@@ -63,38 +70,45 @@
     </nav>
     <div class="source-card"><span class="dot"></span><div><b>Clone database online</b><small>BizModo remains read-only</small></div></div>
   </aside>
-  <main>
+  <main id="app-main">
     <header>
-      <div><p class="eyebrow">ASAS GENERAL TRADING LLC</p><h1 id="page-title">Overview</h1></div>
-      <div class="header-actions"><span class="preview-pill">CONTROLLED STAGING</span><span id="signed-in-user" class="signed-user"></span><button id="logout" class="logout" type="button">Sign out</button><div class="avatar">AA</div></div>
+      <div class="page-context"><p class="eyebrow">ASAS GENERAL TRADING LLC</p><div class="breadcrumb" aria-label="Breadcrumb"><span>ERP</span><span aria-hidden="true">/</span><strong id="breadcrumb-current">Overview</strong></div><h1 id="page-title">Overview</h1></div>
+      <div class="header-actions"><button id="command-trigger" class="command-trigger" type="button" aria-label="Open command center"><span aria-hidden="true">⌘</span><span>Search or command</span><kbd>Ctrl K</kbd></button><button id="attention-trigger" class="attention-trigger" type="button" aria-label="Open attention center"><span>Attention</span><b id="attention-count" aria-label="0 items requiring attention">0</b></button><div class="display-controls" aria-label="Display preferences"><button id="density-toggle" class="utility-button" type="button" aria-label="Change data density">Density</button><button id="theme-toggle" class="utility-button" type="button" aria-label="Change color theme">Theme</button></div><span class="preview-pill">CONTROLLED STAGING</span><span id="signed-in-user" class="signed-user"></span><button id="logout" class="logout" type="button">Sign out</button><div class="avatar" aria-hidden="true">AA</div></div>
     </header>
     <section id="notice" class="notice"><b>Operational staging</b><span>Master data and controlled workflow documents are editable in this ERP. BizModo evidence remains protected; permanent posting and production activation are still disabled.</span></section>
-    <section id="content" aria-live="polite"><div class="loading">Loading cloned data…</div></section>
+    <section id="content" tabindex="-1" aria-live="polite"><div class="loading">Loading cloned data…</div></section>
   </main>
+  <dialog id="command-center" class="command-center" aria-labelledby="command-title"><form method="dialog"><div class="command-head"><div><p class="eyebrow">GLOBAL COMMAND CENTER</p><h2 id="command-title">Go to a workspace</h2></div><button value="cancel" aria-label="Close command center">×</button></div><label class="command-search"><span>Search pages and available actions</span><input id="command-search" autocomplete="off" placeholder="Type a workspace name…"></label><div id="command-results" class="command-results" role="listbox"></div><p class="footer-note">Deterministic navigation only. AI analysis and actions are not enabled.</p></form></dialog>
+  <dialog id="attention-center" class="workspace-drawer attention-center" aria-labelledby="attention-title"><form method="dialog"><div class="drawer-head"><div><p class="eyebrow">AUTHORIZED WORK QUEUE</p><h2 id="attention-title">Attention center</h2><p>Approvals within your scope and signals on the current workspace.</p></div><button value="cancel" aria-label="Close attention center">×</button></div><div id="attention-summary" class="drawer-summary" role="status" aria-live="polite"></div><div id="attention-items" class="drawer-body"></div><p class="drawer-note">This center is read-only. Decisions remain in the owning workspace with its permission, revision and maker-checker controls.</p></form></dialog>
+  <dialog id="record-inspector" class="workspace-drawer record-inspector" aria-labelledby="record-inspector-title"><form method="dialog"><div class="drawer-head"><div><p class="eyebrow">READ-ONLY RECORD VIEW</p><h2 id="record-inspector-title">Record inspector</h2><p id="record-inspector-context"></p></div><button value="cancel" aria-label="Close record inspector">×</button></div><div id="record-inspector-body" class="drawer-body"></div><div class="drawer-actions"><button id="record-inspector-workspace" type="button">Open owning workspace</button><button value="cancel" class="primary">Close inspector</button></div><p class="drawer-note">Only data already visible in your authorized workspace is shown. No record is changed by this inspector.</p></form></dialog>
+  <script src="/static/workspace-components.js?v=20260922-central-all-1" defer></script>
+  <script src="/static/workspace-inspector.js?v=20260922-inspector-1" defer></script>
   <script src="/static/purchase-returns.js" defer></script>
-  <script src="/static/payments.js?v=20260919-receivables-2" defer></script>
-  <script src="/static/cash-management.js?v=20260919-bank-2" defer></script>
-  <script src="/static/expenses.js?v=20260921-expense-1" defer></script>
-  <script src="/static/fixed-assets.js?v=20260921-assets-1" defer></script>
-  <script src="/static/vat-control.js?v=20260921-vat-1" defer></script>
-  <script src="/static/period-close.js?v=20260921-close-1" defer></script>
-  <script src="/static/close-reporting.js?v=20260921-reporting-1" defer></script>
+  <script src="/static/payments.js?v=20260922-components-1" defer></script>
+  <script src="/static/cash-management.js?v=20260922-components-1" defer></script>
+  <script src="/static/expenses.js?v=20260922-components-1" defer></script>
+  <script src="/static/fixed-assets.js?v=20260922-components-1" defer></script>
+  <script src="/static/vat-control.js?v=20260922-components-1" defer></script>
+  <script src="/static/period-close.js?v=20260922-components-1" defer></script>
+  <script src="/static/close-reporting.js?v=20260922-components-1" defer></script>
   <script src="/static/audit-compliance.js?v=20260921-audit-1" defer></script>
   <script src="/static/cutover-rehearsal.js?v=20260921-cutover-1" defer></script>
   <script src="/static/completion-audit.js?v=20260921-completion-1" defer></script>
-  <script src="/static/financial-reports.js?v=20260919-statements-1" defer></script>
+  <script src="/static/financial-reports.js?v=20260922-components-2" defer></script>
   <script src="/static/credit-control.js?v=20260919-credit-2" defer></script>
   <script src="/static/general-ledger.js" defer></script>
   <script src="/static/procurement.js" defer></script>
   <script src="/static/sales-orders.js?v=20260919-sales-orders-2" defer></script>
   <script src="/static/pos.js?v=20260921-pos-1" defer></script>
   <script src="/static/van-sales.js?v=20260921-van-sales-1" defer></script>
-  <script src="/static/crm.js?v=20260921-crm-1" defer></script>
-  <script src="/static/deliveries.js?v=20260919-deliveries-1" defer></script>
-  <script src="/static/customer-invoices.js?v=20260919-customer-invoices-2" defer></script>
-  <script src="/static/erp.js?v=20260919-credit-1" defer></script>
+  <script src="/static/crm.js?v=20260922-central-all-1" defer></script>
+  <script src="/static/deliveries.js?v=20260922-components-1" defer></script>
+  <script src="/static/customer-invoices.js?v=20260922-components-1" defer></script>
+  <script src="/static/warehouse-controls.js?v=20260922-traceability-1" defer></script>
+  <script src="/static/erp.js?v=20260922-central-all-1" defer></script>
   <script src="/static/hrm-lifecycle.js?v=20260921-hrm-lifecycle-1" defer></script>
   <script src="/static/glossary.js" defer></script>
   <script src="/static/table-pagination.js" defer></script>
+  <script src="/static/workspace-shell.js?v=20260922-foundation-3" defer></script>
 </body>
 </html>

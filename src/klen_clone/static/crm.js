@@ -8,4 +8,3 @@ async function crmWorkspace(){
  document.querySelectorAll('.crm-proposal').forEach(b=>b.onclick=async()=>{const title=prompt('Proposal title:'),value=prompt('AED value:');if(!title||!value)return;try{await post(`/crm/leads/${b.dataset.key}/proposals`,{title,value_aed:Number(value)});await crmWorkspace()}catch(e){alert(e.message)}});
  document.querySelectorAll('.crm-approve').forEach(b=>b.onclick=async()=>{const note=await askReason('Enter independent proposal approval evidence:');if(!note)return;try{await post(`/crm/proposals/${b.dataset.key}/approved`,{expected_revision:Number(b.dataset.revision),note});await crmWorkspace()}catch(e){alert(e.message)}})
 }
-window.addEventListener('hashchange',event=>{if(location.hash.split('?')[0]==='#crm'){event.stopImmediatePropagation();crmWorkspace().catch(e=>{content.innerHTML=`<div class="error"><b>Unable to load CRM.</b><br>${esc(e.message)}</div>`})}});

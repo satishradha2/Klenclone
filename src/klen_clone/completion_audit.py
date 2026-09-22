@@ -38,7 +38,7 @@ IMPLEMENTED_CAPABILITIES = (
 
 REMAINING_GAPS = (
     {"priority": "high", "area": "Inventory", "capability": "Advanced traceability and warehouse control",
-     "gap": "Batch and expiry are captured at receipt; serial registry, barcode execution, cycle-count sessions, quarantine release, recall and warehouse task controls are not complete."},
+     "gap": "Batch and expiry are captured at receipt, and controlled cycle-count sessions plus independent quarantine release are available. Serial registry, barcode execution, recall and warehouse task controls remain incomplete."},
     {"priority": "high", "area": "Finance", "capability": "Multi-currency and foreign exchange",
      "gap": "The current operational model is AED-focused; currency masters, rates, realized/unrealized FX and revaluation are not implemented."},
     {"priority": "high", "area": "Finance", "capability": "Budgets, consolidation and corporate tax",

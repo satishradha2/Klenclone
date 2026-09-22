@@ -431,6 +431,7 @@ def initialize_operational_database(engine) -> None:
     from . import sales_returns as _sales_returns  # noqa: F401
     from . import security_runtime as _security_runtime  # noqa: F401
     from . import source_verification as _source_verification  # noqa: F401
+    from . import warehouse_controls as _warehouse_controls  # noqa: F401
 
     OperationalBase.metadata.create_all(engine)
     dialect = engine.dialect.name
@@ -602,6 +603,7 @@ def initialize_operational_database(engine) -> None:
             "0047": "11b9d25d59b2cf786aa33e4e44d539d322b713609f0c4d7f44a2904e0a389b21",
             "0048": "f08e38111cf7257615fe35cf80f02b6a52ff620689155d02944f6f9db987e663",
             "0049": "b203dc9e76f6f2516d4c1f1012b1ec39308bbd0ff5f2b54b30ef5f27ba279815",
+            "0050": "3fd76d5094d3c35ae730b2c5fdda66c32b0f6e3bd55c8a73d0d82d9c6d8e67c2",
         }
         for version, checksum in migrations.items():
             if version in applied and applied[version] != checksum:
