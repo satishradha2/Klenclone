@@ -13,6 +13,7 @@ from .operational import (
     MONEY, OperationalAuditEvent, OperationalBase, OperationalFiscalPeriod,
     OperationalJournalBatch, OperationalJournalLine, OperationalStockPosition, utc_now,
 )
+from .posting_integration import OperationalIntegratedPostingBatch, OperationalIntegratedJournalLine
 from .vat_control import OperationalVatPeriod
 
 
@@ -98,6 +99,35 @@ def _money(value) -> Decimal:
     return Decimal(str(value or 0)).quantize(MONEY, rounding=ROUND_HALF_UP)
 
 
+def posted_journal_evidence(session: Session, period: OperationalFiscalPeriod) -> dict:
+    """The actual, period-scoped journal source shared by close and statements."""
+    legacy = list(session.scalars(select(OperationalJournalBatch).where(
+        func.date(OperationalJournalBatch.posted_at) >= period.starts_on,
+        func.date(OperationalJournalBatch.posted_at) <= period.ends_on,
+        OperationalJournalBatch.status.in_(("posted", "reversed"))).order_by(OperationalJournalBatch.id)))
+    integrated = list(session.scalars(select(OperationalIntegratedPostingBatch).where(
+        OperationalIntegratedPostingBatch.fiscal_period_key == period.period_key,
+        OperationalIntegratedPostingBatch.status.in_(("posted", "reversed"))).order_by(
+            OperationalIntegratedPostingBatch.id)))
+    lines = []
+    for source_kind, batches, line_model in (
+        ("legacy", legacy, OperationalJournalLine),
+        ("integrated", integrated, OperationalIntegratedJournalLine),
+    ):
+        for batch in batches:
+            for line in session.scalars(select(line_model).where(line_model.batch_id == batch.id).order_by(
+                    line_model.line_no)):
+                lines.append({"source_kind": source_kind, "batch_key": batch.batch_key,
+                    "batch_status": batch.status, "posting_fingerprint": batch.posting_fingerprint,
+                    "line_no": line.line_no, "account_code": line.account_code,
+                    "debit": _money(line.debit), "credit": _money(line.credit)})
+    document = json.dumps(lines, default=str, sort_keys=True)
+    return {"lines": lines, "legacy_batches": len(legacy), "integrated_batches": len(integrated),
+        "batch_count": len(legacy) + len(integrated),
+        "imbalance": _money(sum((line["debit"] - line["credit"] for line in lines), Decimal("0"))),
+        "fingerprint": hashlib.sha256(document.encode()).hexdigest()}
+
+
 def create_period_close(session: Session, *, fiscal_period_key: str, actor: str) -> OperationalPeriodClose:
     period = session.scalar(select(OperationalFiscalPeriod).where(OperationalFiscalPeriod.period_key == fiscal_period_key))
     if not period:
@@ -178,25 +208,23 @@ def _close_snapshot(session: Session, row: OperationalPeriodClose) -> tuple[list
     positions = list(session.scalars(select(OperationalStockPosition)))
     negative_positions = sum(_money(item.quantity_on_hand) < 0 for item in positions)
     inventory_value = _money(sum((Decimal(str(item.quantity_on_hand)) * Decimal(str(item.average_unit_cost)) for item in positions), Decimal("0")))
-    journals = list(session.scalars(select(OperationalJournalBatch).where(
-        func.date(OperationalJournalBatch.posted_at) >= period.starts_on,
-        func.date(OperationalJournalBatch.posted_at) <= period.ends_on,
-        OperationalJournalBatch.status == "posted")))
-    imbalance = Decimal("0")
-    for batch in journals:
-        lines = session.scalars(select(OperationalJournalLine).where(OperationalJournalLine.batch_id == batch.id))
-        imbalance += sum((_money(line.debit) - _money(line.credit) for line in lines), Decimal("0"))
+    journal_evidence = posted_journal_evidence(session, period)
+    imbalance, journal_count = journal_evidence["imbalance"], journal_evidence["batch_count"]
     checklist = [
         {"control": "fiscal_period_open", "status": "pass", "detail": "Fiscal period is open and rehearsal-enabled"},
         {"control": "pending_close_adjustments", "status": "block" if pending_adjustments else "pass", "detail": f"{pending_adjustments} pending close adjustments"},
         {"control": "vat_return_approved", "status": "pass" if vat else "warning", "detail": vat.period_code if vat else "No approved VAT return covers the full fiscal period"},
         {"control": "inventory_negative_positions", "status": "warning" if negative_positions else "pass", "detail": f"{negative_positions} negative stock positions"},
-        {"control": "permanent_journal_balance", "status": "pass" if _money(imbalance) == 0 else "block", "detail": f"AED {_money(imbalance)} difference across {len(journals)} posted batches"},
+        {"control": "permanent_journal_balance", "status": "pass" if _money(imbalance) == 0 else "block", "detail": f"AED {_money(imbalance)} difference across {journal_count} posted batches"},
     ]
     snapshot = {"period_key": period.period_key, "starts_on": period.starts_on, "ends_on": period.ends_on,
         "approved_adjustments": len(approved_adjustments), "approved_adjustment_total": _money(sum((item.amount for item in approved_adjustments), Decimal("0"))),
         "stock_positions": len(positions), "inventory_value": inventory_value,
-        "permanent_journal_batches": len(journals), "vat_period": vat.period_code if vat else None}
+        "permanent_journal_batches": journal_count,
+        "legacy_journal_batches": journal_evidence["legacy_batches"],
+        "integrated_journal_batches": journal_evidence["integrated_batches"],
+        "permanent_journal_fingerprint": journal_evidence["fingerprint"],
+        "vat_period": vat.period_code if vat else None}
     return checklist, snapshot
 
 

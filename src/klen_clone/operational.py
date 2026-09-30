@@ -4,7 +4,7 @@ import uuid
 import json
 import hashlib
 from datetime import date, datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
 from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, create_engine, event, func, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -418,6 +418,7 @@ def initialize_operational_database(engine) -> None:
     from . import vat_control as _vat_control  # noqa: F401
     from . import period_close as _period_close  # noqa: F401
     from . import close_reporting as _close_reporting  # noqa: F401
+    from . import opening_ledger as _opening_ledger  # noqa: F401
     from . import audit_compliance as _audit_compliance  # noqa: F401
     from . import cutover_rehearsal as _cutover_rehearsal  # noqa: F401
     from . import procurement as _procurement  # noqa: F401
@@ -429,13 +430,66 @@ def initialize_operational_database(engine) -> None:
     from . import sales_invoices as _sales_invoices  # noqa: F401
     from . import sales_orders as _sales_orders  # noqa: F401
     from . import sales_returns as _sales_returns  # noqa: F401
+    from . import customer_price_credits as _customer_price_credits  # noqa: F401
+    from . import customer_refunds as _customer_refunds  # noqa: F401
     from . import security_runtime as _security_runtime  # noqa: F401
     from . import source_verification as _source_verification  # noqa: F401
     from . import warehouse_controls as _warehouse_controls  # noqa: F401
+    from . import product_creation as _product_creation  # noqa: F401
+    from . import product_taxonomy as _product_taxonomy  # noqa: F401
+    from . import lot_traceability as _lot_traceability  # noqa: F401
+    from . import party_creation as _party_creation  # noqa: F401
+    from . import fx_controls as _fx_controls  # noqa: F401
+    from . import quote_trade_controls as _quote_trade_controls  # noqa: F401
+    from . import cross_border_order_controls as _cross_border_order_controls  # noqa: F401
+    from . import cross_border_delivery_readiness as _cross_border_delivery_readiness  # noqa: F401
+    from . import cross_border_dispatch_release as _cross_border_dispatch_release  # noqa: F401
+    from . import cross_border_invoice_tax as _cross_border_invoice_tax  # noqa: F401
 
     OperationalBase.metadata.create_all(engine)
     dialect = engine.dialect.name
     with engine.begin() as connection:
+        statement_line_columns = {column["name"] for column in inspect(connection).get_columns(
+            "operational_statement_lines")}
+        if "matched_refund_id" not in statement_line_columns:
+            connection.execute(text(
+                "ALTER TABLE operational_statement_lines ADD COLUMN matched_refund_id INTEGER"))
+        added_recovery_column = "matched_recovery_id" not in statement_line_columns
+        if added_recovery_column:
+            connection.execute(text(
+                "ALTER TABLE operational_statement_lines ADD COLUMN matched_recovery_id INTEGER"))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_statement_matched_recovery "
+            "ON operational_statement_lines (matched_recovery_id)"))
+        refund_columns = {column["name"] for column in inspect(connection).get_columns(
+            "operational_customer_refunds")}
+        added_price_credit_column = "price_credit_id" not in refund_columns
+        if added_price_credit_column:
+            connection.execute(text(
+                "ALTER TABLE operational_customer_refunds ADD COLUMN price_credit_id INTEGER"))
+        if dialect == "postgresql":
+            if added_recovery_column:
+                connection.execute(text(
+                    "ALTER TABLE operational_statement_lines ADD CONSTRAINT fk_statement_recovery "
+                    "FOREIGN KEY (matched_recovery_id) REFERENCES operational_customer_refund_recoveries(id)"))
+            if added_price_credit_column:
+                connection.execute(text(
+                    "ALTER TABLE operational_customer_refunds ADD CONSTRAINT fk_customer_refund_price_credit "
+                    "FOREIGN KEY (price_credit_id) REFERENCES operational_customer_price_credits(id)"))
+            connection.execute(text(
+                "ALTER TABLE operational_customer_refunds ALTER COLUMN sales_return_id DROP NOT NULL"))
+            connection.execute(text(
+                "ALTER TABLE operational_customer_refunds DROP CONSTRAINT IF EXISTS ck_customer_refund_one_credit_source"))
+            connection.execute(text(
+                "ALTER TABLE operational_customer_refunds ADD CONSTRAINT ck_customer_refund_one_credit_source "
+                "CHECK ((sales_return_id IS NOT NULL AND price_credit_id IS NULL) OR "
+                "(sales_return_id IS NULL AND price_credit_id IS NOT NULL))"))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_operational_customer_refunds_price_credit_id "
+                "ON operational_customer_refunds (price_credit_id)"))
+        connection.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_statement_matched_refund "
+            "ON operational_statement_lines (matched_refund_id)"))
         columns = {column["name"] for column in inspect(connection).get_columns("operational_drafts")}
         draft_additions = {
             "revision": "INTEGER NOT NULL DEFAULT 1",
@@ -524,17 +578,107 @@ def initialize_operational_database(engine) -> None:
             "customer_price_group": "VARCHAR(80)",
             "price_list_key": "VARCHAR(36)",
             "promotion_key": "VARCHAR(36)",
+            "customer_country_code": "VARCHAR(2)",
+            "fx_rate_key": "VARCHAR(36)",
+            "aed_per_unit_snapshot": "NUMERIC(20,8)",
+            "aed_total_snapshot": "NUMERIC(18,2)",
+            "trade_decision_key": "VARCHAR(36)",
         }
         for name, definition in quotation_additions.items():
             if name not in quotation_columns:
                 connection.execute(text(f"ALTER TABLE operational_sales_quotations ADD COLUMN {name} {definition}"))
+        order_columns = {column["name"] for column in inspect(connection).get_columns("operational_sales_orders")}
+        order_additions = {
+            "customer_country_code": "VARCHAR(2)",
+            "fx_rate_key": "VARCHAR(36)",
+            "aed_per_unit_snapshot": "NUMERIC(20,8)",
+            "aed_total_snapshot": "NUMERIC(18,2)",
+            "order_release_key": "VARCHAR(36)",
+        }
+        for name, definition in order_additions.items():
+            if name not in order_columns:
+                connection.execute(text(f"ALTER TABLE operational_sales_orders ADD COLUMN {name} {definition}"))
+        for table_name in ("operational_sales_quotation_lines", "operational_sales_order_lines",
+                           "operational_customer_invoice_lines"):
+            existing = {column["name"] for column in inspect(connection).get_columns(table_name)}
+            if "discount_amount" not in existing:
+                connection.execute(text(
+                    f"ALTER TABLE {table_name} ADD COLUMN discount_amount NUMERIC(18,2) NOT NULL DEFAULT 0"))
+        if dialect == "postgresql":
+            quote_types = {column["name"]: column["type"] for column in
+                           inspect(connection).get_columns("operational_sales_quotations")}
+            for column_name in ("subtotal", "discount_amount", "tax_amount", "total_amount"):
+                column_type = quote_types[column_name]
+                if (column_type.precision, column_type.scale) != (19, 3):
+                    connection.execute(text(
+                        f"ALTER TABLE operational_sales_quotations ALTER COLUMN {column_name} TYPE NUMERIC(19,3)"))
+            quote_line_types = {column["name"]: column["type"] for column in
+                                inspect(connection).get_columns("operational_sales_quotation_lines")}
+            for column_name in ("net_amount", "discount_amount", "tax_amount", "gross_amount"):
+                column_type = quote_line_types[column_name]
+                if (column_type.precision, column_type.scale) != (19, 3):
+                    connection.execute(text(
+                        f"ALTER TABLE operational_sales_quotation_lines ALTER COLUMN {column_name} TYPE NUMERIC(19,3)"))
+            for table_name, names in (
+                ("operational_sales_orders", ("subtotal", "discount_amount", "tax_amount", "total_amount")),
+                ("operational_sales_order_lines", ("net_amount", "discount_amount", "tax_amount", "gross_amount")),
+                ("operational_customer_invoices", ("subtotal", "discount_amount", "tax_amount", "total_amount")),
+                ("operational_customer_invoice_lines", ("net_amount", "discount_amount", "tax_amount", "gross_amount")),
+            ):
+                types = {column["name"]: column["type"] for column in inspect(connection).get_columns(table_name)}
+                for column_name in names:
+                    if (types[column_name].precision, types[column_name].scale) != (19, 3):
+                        connection.execute(text(
+                            f"ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE NUMERIC(19,3)"))
+        price_list_columns = {column["name"] for column in inspect(connection).get_columns("operational_price_lists")}
+        if "currency_code" not in price_list_columns:
+            connection.execute(text("ALTER TABLE operational_price_lists ADD COLUMN currency_code VARCHAR(3) NOT NULL DEFAULT 'AED'"))
+        party_columns = {
+            "country_code": "VARCHAR(2)",
+            "preferred_currency_code": "VARCHAR(3)",
+            "tax_registration_type": "VARCHAR(20)",
+            "tax_country_code": "VARCHAR(2)",
+        }
+        for table_name in ("operational_party_masters", "operational_party_creation_requests"):
+            existing = {column["name"] for column in inspect(connection).get_columns(table_name)}
+            for name, definition in party_columns.items():
+                if name not in existing:
+                    connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {name} {definition}"))
+        return_columns = {column["name"] for column in inspect(connection).get_columns("operational_sales_returns")}
+        if "original_invoice_origin" not in return_columns:
+            connection.execute(text(
+                "ALTER TABLE operational_sales_returns ADD COLUMN original_invoice_origin "
+                "VARCHAR(24) NOT NULL DEFAULT 'bizmodo_clone'"))
+        if "original_invoice_target_key" not in return_columns:
+            connection.execute(text(
+                "ALTER TABLE operational_sales_returns ADD COLUMN original_invoice_target_key VARCHAR(36)"))
+        connection.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_operational_sales_returns_original_invoice_target_key "
+            "ON operational_sales_returns (original_invoice_target_key)"))
+        dispatch_columns = {column["name"] for column in inspect(connection).get_columns("operational_delivery_stock_movements")}
+        for name, definition in {
+            "unit_cost_snapshot": "NUMERIC(18,6)",
+            "issue_value_snapshot": "NUMERIC(19,2)",
+        }.items():
+            if name not in dispatch_columns:
+                connection.execute(text(
+                    f"ALTER TABLE operational_delivery_stock_movements ADD COLUMN {name} {definition}"))
+        if dialect == "postgresql":
+            connection.execute(text(
+                "ALTER TABLE operational_delivery_stock_movements DROP CONSTRAINT IF EXISTS ck_delivery_stock_valuation_pair"))
+            connection.execute(text(
+                "ALTER TABLE operational_delivery_stock_movements ADD CONSTRAINT ck_delivery_stock_valuation_pair "
+                "CHECK ((unit_cost_snapshot IS NULL AND issue_value_snapshot IS NULL) OR "
+                "(unit_cost_snapshot >= 0 AND issue_value_snapshot >= 0))"))
         if dialect == "postgresql":
             connection.execute(text("ALTER TABLE operational_drafts DROP CONSTRAINT IF EXISTS ck_operational_draft_status"))
             connection.execute(text("ALTER TABLE operational_drafts ADD CONSTRAINT ck_operational_draft_status CHECK (status IN ('draft','submitted','approved','cancelled','posted','reversed'))"))
+            connection.execute(text("ALTER TABLE operational_customer_invoices DROP CONSTRAINT IF EXISTS ck_customer_invoice_status"))
+            connection.execute(text("ALTER TABLE operational_customer_invoices ADD CONSTRAINT ck_customer_invoice_status CHECK (status IN ('draft','submitted','approved','rejected','cancelled','posted','reversed'))"))
             connection.execute(text("ALTER TABLE operational_supplier_invoices DROP CONSTRAINT IF EXISTS ck_supplier_invoice_status"))
             connection.execute(text("ALTER TABLE operational_supplier_invoices ADD CONSTRAINT ck_supplier_invoice_status CHECK (status IN ('draft','matched','exception','approved','rejected','cancelled','posted','reversed'))"))
             connection.execute(text("ALTER TABLE operational_integrated_posting_batches DROP CONSTRAINT IF EXISTS ck_integrated_posting_resource_type"))
-            connection.execute(text("ALTER TABLE operational_integrated_posting_batches ADD CONSTRAINT ck_integrated_posting_resource_type CHECK (resource_type IN ('inventory_document','goods_receipt','sales_invoice','sales_return','purchase_return','payment','supplier_invoice','supplier_adjustment'))"))
+            connection.execute(text("ALTER TABLE operational_integrated_posting_batches ADD CONSTRAINT ck_integrated_posting_resource_type CHECK (resource_type IN ('inventory_document','goods_receipt','sales_invoice','customer_invoice','sales_return','customer_price_credit','customer_refund','customer_refund_recovery','purchase_return','payment','supplier_invoice','supplier_adjustment'))"))
             connection.execute(text("ALTER TABLE operational_supplier_adjustments DROP CONSTRAINT IF EXISTS ck_supplier_adjustment_status"))
             connection.execute(text("ALTER TABLE operational_supplier_adjustments ADD CONSTRAINT ck_supplier_adjustment_status CHECK (status IN ('draft','submitted','approved','rejected','cancelled','posted','reversed'))"))
             connection.execute(text("ALTER TABLE operational_supplier_adjustments DROP CONSTRAINT IF EXISTS ck_supplier_adjustment_treatment"))
@@ -604,6 +748,17 @@ def initialize_operational_database(engine) -> None:
             "0048": "f08e38111cf7257615fe35cf80f02b6a52ff620689155d02944f6f9db987e663",
             "0049": "b203dc9e76f6f2516d4c1f1012b1ec39308bbd0ff5f2b54b30ef5f27ba279815",
             "0050": "3fd76d5094d3c35ae730b2c5fdda66c32b0f6e3bd55c8a73d0d82d9c6d8e67c2",
+            "0051": "e8c34716e4d6a1cac868172004921089a7e4610d652931d0db763cf56fe2a9ff",
+            "0052": "46f830b3f3c03f38c4951b816df47f58fb5d20a7f6ddbc299883e9f727f29549",
+            "0053": "6de609e64994f4d67acd04ae348b8f0e89d90307197697b073a9503fc27831d8",
+            "0054": "d7010d62941af2e4f869b5dd46f50826778a3788eb64b1f178b9720587cf0ac2",
+            "0055": "f4bbacf7c0ef593b75d3584d772f0d2bf39b53f35f1d73ed37d6b668ff4aa040",
+            "0056": "1aae0dc321d97b421203b1c022ca32aa86f5ab23e90490d5897ce1ab53bc3a0a",
+            "0057": "8b4b0f9eab1d03a444ee45f3c62ea7dd53b5a8a9fc8b44e40e563d748ed96bc3",
+            "0058": "a6d3fb99ef48cf6a25fa04fa93f452a2db14567522e11f301875a77d99212745",
+            "0059": "b9e3b22e98ac452581359098f3a3835df880699a4a2ad3cab7cb288779835a91",
+            "0060": "b4cd4d0de1bdb29ea66c123bc15d843e84299724c3821a7c9f0d39591783f03e",
+            "0061": "89c84798b21a4c73a0a462e08b201b55baf85e062b13aa23d6237875d1ec46d6",
         }
         for version, checksum in migrations.items():
             if version in applied and applied[version] != checksum:
@@ -612,16 +767,75 @@ def initialize_operational_database(engine) -> None:
                 connection.execute(text(
                     "INSERT INTO operational_schema_migrations(version, checksum, applied_at) VALUES (:version, :checksum, CURRENT_TIMESTAMP)"
                 ), {"version": version, "checksum": checksum})
+    # Existing promoted product labels become real target-side master records.
+    # This is idempotent and does not read or modify the BizModo source.
+    with Session(engine) as session:
+        _product_taxonomy.backfill_product_taxonomy(session)
+        session.commit()
 
 
 def operational_session_factory(engine):
     return sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 
-def calculate_line(quantity: Decimal, unit_price: Decimal, tax_rate: Decimal) -> tuple[Decimal, Decimal, Decimal]:
-    net = (quantity * unit_price).quantize(MONEY, rounding=ROUND_HALF_UP)
-    tax = (net * tax_rate / Decimal("100")).quantize(MONEY, rounding=ROUND_HALF_UP)
+def calculate_line(quantity: Decimal, unit_price: Decimal, tax_rate: Decimal,
+                   quantum: Decimal = MONEY) -> tuple[Decimal, Decimal, Decimal]:
+    net = (quantity * unit_price).quantize(quantum, rounding=ROUND_HALF_UP)
+    tax = (net * tax_rate / Decimal("100")).quantize(quantum, rounding=ROUND_HALF_UP)
     return net, tax, net + tax
+
+
+def price_draft_lines(lines: list[dict], discount_amount: Decimal) -> tuple[list[dict], Decimal, Decimal, Decimal]:
+    """Price draft lines from entered facts, allocating the header discount before VAT."""
+    if not lines:
+        raise ValueError("At least one draft line is required")
+    discount = Decimal(str(discount_amount))
+    if not discount.is_finite() or discount < 0 or discount != discount.quantize(MONEY):
+        raise ValueError("Draft discount must be a non-negative AED amount at cent precision")
+    priced = []
+    for source in lines:
+        row = dict(source)
+        quantity = Decimal(str(row["quantity"]))
+        factor = Decimal(str(row["factor_to_base_snapshot"]))
+        unit_price = Decimal(str(row["unit_price"]))
+        tax_rate = Decimal(str(row["tax_rate"]))
+        quantity_base = quantity * factor
+        if (not all(value.is_finite() for value in (quantity, factor, unit_price, tax_rate))
+                or quantity <= 0 or factor <= 0 or unit_price < 0 or not 0 <= tax_rate <= 100
+                or quantity_base != quantity_base.quantize(Decimal("0.000001"))):
+            raise ValueError("Draft quantity, UOM factor, price or tax rate is invalid")
+        if Decimal(str(row["quantity_base"])) != quantity_base:
+            raise ValueError("Draft base quantity does not match entered quantity and UOM factor")
+        net, _, _ = calculate_line(quantity, unit_price, tax_rate)
+        row.update(quantity=quantity, factor_to_base_snapshot=factor, quantity_base=quantity_base,
+                   unit_price=unit_price, tax_rate=tax_rate, net_amount=net)
+        if row.get("unit_cost_snapshot") is not None:
+            unit_cost = Decimal(str(row["unit_cost_snapshot"]))
+            if not unit_cost.is_finite() or unit_cost < 0:
+                raise ValueError("Draft unit cost must be a non-negative finite amount")
+            row["unit_cost_snapshot"] = unit_cost
+            row["cost_amount"] = (quantity_base * unit_cost).quantize(MONEY, rounding=ROUND_HALF_UP)
+        priced.append(row)
+    subtotal = sum((row["net_amount"] for row in priced), Decimal("0.00"))
+    if discount > subtotal:
+        raise ValueError("Draft discount cannot exceed the subtotal")
+    if subtotal:
+        exact = [discount * row["net_amount"] / subtotal for row in priced]
+        allocations = [value.quantize(MONEY, rounding=ROUND_DOWN) for value in exact]
+        remaining = int((discount - sum(allocations, Decimal("0.00"))) / MONEY)
+        ranked = sorted(range(len(priced)), key=lambda index: (-(exact[index] - allocations[index]), index))
+        for index in ranked[:remaining]:
+            allocations[index] += MONEY
+    else:
+        allocations = [Decimal("0.00") for _ in priced]
+    for row, allocation in zip(priced, allocations):
+        taxable = row["net_amount"] - allocation
+        row["tax_amount"] = (taxable * row["tax_rate"] / Decimal("100")).quantize(
+            MONEY, rounding=ROUND_HALF_UP)
+        row["gross_amount"] = taxable + row["tax_amount"]
+    tax_amount = sum((row["tax_amount"] for row in priced), Decimal("0.00"))
+    total = sum((row["gross_amount"] for row in priced), Decimal("0.00"))
+    return priced, subtotal, tax_amount, total
 
 
 def create_draft(session: Session, *, document_type: str, party_code: str, party_name: str,
@@ -629,11 +843,7 @@ def create_draft(session: Session, *, document_type: str, party_code: str, party
                  actor: str, lines: list[dict]) -> OperationalDraft:
     draft_key = str(uuid.uuid4())
     draft_no = f"DR-{document_type[0].upper()}-{draft_key[:8].upper()}"
-    subtotal = sum((line["net_amount"] for line in lines), Decimal("0"))
-    tax_amount = sum((line["tax_amount"] for line in lines), Decimal("0"))
-    total = (subtotal - discount_amount + tax_amount).quantize(MONEY, rounding=ROUND_HALF_UP)
-    if total < 0:
-        raise ValueError("Discount cannot exceed the draft gross amount")
+    priced_lines, subtotal, tax_amount, total = price_draft_lines(lines, discount_amount)
     draft = OperationalDraft(
         draft_key=draft_key, draft_no=draft_no, document_type=document_type,
         party_code=party_code, party_name_snapshot=party_name, location_code=location_code,
@@ -641,14 +851,14 @@ def create_draft(session: Session, *, document_type: str, party_code: str, party
         tax_amount=tax_amount, total_amount=total, status="draft", posting_enabled=False,
         notes=notes, created_by=actor, state_changed_by=actor,
     )
-    for number, line in enumerate(lines, 1):
+    for number, line in enumerate(priced_lines, 1):
         draft.lines.append(OperationalDraftLine(line_no=number, **line))
     session.add(draft)
     session.flush()
     session.add(OperationalAuditEvent(
         event_key=str(uuid.uuid4()), event_type="draft.created", actor=actor,
         resource_key=draft.draft_key,
-        detail=f"{document_type} {draft.draft_no}; {len(lines)} lines; posting disabled",
+                  detail=f"{document_type} {draft.draft_no}; {len(priced_lines)} lines; posting disabled",
     ))
     session.commit()
     return draft
@@ -670,18 +880,14 @@ def replace_draft(session: Session, draft: OperationalDraft, *, expected_revisio
         raise ValueError("Only draft-state documents can be edited")
     if draft.revision != expected_revision:
         raise ValueError(f"Draft revision conflict; current revision is {draft.revision}")
-    subtotal = sum((line["net_amount"] for line in lines), Decimal("0"))
-    tax_amount = sum((line["tax_amount"] for line in lines), Decimal("0"))
-    total = (subtotal - discount_amount + tax_amount).quantize(MONEY, rounding=ROUND_HALF_UP)
-    if total < 0:
-        raise ValueError("Discount cannot exceed the draft gross amount")
+    priced_lines, subtotal, tax_amount, total = price_draft_lines(lines, discount_amount)
     draft.party_code, draft.party_name_snapshot = party_code, party_name
     draft.location_code, draft.discount_amount, draft.notes = location_code, discount_amount, notes
     draft.subtotal, draft.tax_amount, draft.total_amount = subtotal, tax_amount, total
     draft.revision += 1
     draft.state_changed_at, draft.state_changed_by = utc_now(), actor
     draft.lines.clear()
-    for number, line in enumerate(lines, 1):
+    for number, line in enumerate(priced_lines, 1):
         draft.lines.append(OperationalDraftLine(line_no=number, **line))
     session.add(OperationalAuditEvent(
         event_key=str(uuid.uuid4()), event_type="draft.edited", actor=actor,
@@ -888,7 +1094,7 @@ def _batch_payload(batch: OperationalJournalBatch, *, idempotent_replay: bool = 
 
 
 def execute_posting(session: Session, draft: OperationalDraft, *, actor: str,
-                    idempotency_key: str) -> dict:
+                    idempotency_key: str, enforce_approved_gl: bool = False) -> dict:
     existing = session.scalar(select(OperationalJournalBatch).where(
         OperationalJournalBatch.idempotency_key == idempotency_key))
     if existing:
@@ -898,6 +1104,14 @@ def execute_posting(session: Session, draft: OperationalDraft, *, actor: str,
     plan = rehearse_posting(session, draft, actor=actor)
     if idempotency_key != plan["idempotency_key"]:
         raise ValueError("Posting idempotency key does not match the approved draft revision and plan")
+    if enforce_approved_gl:
+        from .gl_mapping import require_posting_gl
+        gl_resolution = require_posting_gl(session, plan["journal"])
+        posting_fingerprint = hashlib.sha256((plan["posting_fingerprint"] + gl_resolution["fingerprint"]).encode()).hexdigest()
+        journal = gl_resolution["journal"]
+    else:
+        posting_fingerprint = plan["posting_fingerprint"]
+        journal = plan["journal"]
     locked = session.scalar(select(OperationalDraft).where(
         OperationalDraft.id == draft.id).with_for_update())
     if not locked or locked.status != "approved" or locked.revision != draft.revision:
@@ -906,12 +1120,12 @@ def execute_posting(session: Session, draft: OperationalDraft, *, actor: str,
     batch = OperationalJournalBatch(
         batch_key=str(uuid.uuid4()), idempotency_key=idempotency_key,
         draft_key=locked.draft_key, draft_revision=locked.revision,
-        posting_fingerprint=plan["posting_fingerprint"], status="posted",
+        posting_fingerprint=posting_fingerprint, status="posted",
         posted_at=utc_now(), posted_by=actor,
     )
     session.add(batch)
     session.flush()
-    for number, row in enumerate(plan["journal"], 1):
+    for number, row in enumerate(journal, 1):
         session.add(OperationalJournalLine(
             batch_id=batch.id, line_no=number, account_code=row["account"],
             debit=row["debit"], credit=row["credit"],
@@ -977,7 +1191,7 @@ def execute_posting(session: Session, draft: OperationalDraft, *, actor: str,
     session.add(OperationalAuditEvent(
         event_key=str(uuid.uuid4()), event_type="posting.executed", actor=actor,
         resource_key=locked.draft_key,
-        detail=f"batch {batch.batch_key}; fingerprint {plan['posting_fingerprint']}; atomic permanent posting",
+        detail=f"batch {batch.batch_key}; fingerprint {posting_fingerprint}; atomic permanent posting",
     ))
     session.commit()
     return _batch_payload(batch)

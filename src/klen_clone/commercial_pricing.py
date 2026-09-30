@@ -9,6 +9,7 @@ from sqlalchemy import CheckConstraint, Date, ForeignKey, Integer, Numeric, Stri
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from .operational import OperationalAuditEvent, OperationalBase
+from .country_catalog import currency_code as normalize_currency_code, quotation_money_quantum
 
 
 class OperationalCustomerPriceGroup(OperationalBase):
@@ -37,6 +38,7 @@ class OperationalPriceList(OperationalBase):
     price_list_key: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     customer_group: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    currency_code: Mapped[str] = mapped_column(String(3), nullable=False, default="AED", index=True)
     effective_from: Mapped[date] = mapped_column(Date, nullable=False)
     effective_to: Mapped[date | None] = mapped_column(Date)
     max_discount_percent: Mapped[Decimal] = mapped_column(Numeric(7, 2), nullable=False, default=0)
@@ -94,14 +96,16 @@ def assign_customer_price_group(session, *, customer_code, group_code, actor):
     _audit(session, actor, "pricing.customer_group.assigned", customer_code, f"group {code}; non-posting"); session.commit(); return row
 
 
-def create_price_list(session, *, name, customer_group, effective_from, effective_to, max_discount_percent, items, actor):
+def create_price_list(session, *, name, customer_group, effective_from, effective_to, max_discount_percent, items, actor,
+                      currency_code="AED"):
     _check_dates(effective_from, effective_to); group = customer_group.strip().upper(); clean_name = name.strip(); discount = Decimal(str(max_discount_percent))
+    currency = normalize_currency_code(currency_code)
     if not items: raise ValueError("At least one price item is required")
     if not clean_name: raise ValueError("Price-list name is required")
     if not session.scalar(select(OperationalCustomerPriceGroup.id).where(OperationalCustomerPriceGroup.group_code == group, OperationalCustomerPriceGroup.status == "active")): raise ValueError("Customer price group is not active")
     skus = [str(item["sku"]).strip() for item in items]
     if discount < 0 or discount > 100 or not all(skus) or len(skus) != len({sku.casefold() for sku in skus}) or any(Decimal(str(item["unit_price"])) < 0 for item in items): raise ValueError("Invalid price-list discount, SKU, or unit price")
-    key = str(uuid.uuid4()); row = OperationalPriceList(price_list_key=key, name=clean_name, customer_group=group, effective_from=effective_from, effective_to=effective_to, max_discount_percent=discount, created_by=actor); session.add(row); session.flush()
+    key = str(uuid.uuid4()); row = OperationalPriceList(price_list_key=key, name=clean_name, customer_group=group, currency_code=currency, effective_from=effective_from, effective_to=effective_to, max_discount_percent=discount, created_by=actor); session.add(row); session.flush()
     for item in items: session.add(OperationalPriceListItem(price_list_id=row.id, sku=str(item["sku"]).strip(), unit_price=Decimal(str(item["unit_price"]))))
     _audit(session, actor, "pricing.list.created", key, "draft commercial price list; non-posting"); session.commit(); return row
 
@@ -114,7 +118,8 @@ def approve_price_list(session, *, key, actor):
     if not row: raise ValueError("Price list not found")
     if row.created_by == actor: raise PermissionError("Maker-checker control prevents price-list self-approval")
     if row.status != "draft": raise ValueError("Price list is no longer awaiting approval")
-    approved = session.scalars(select(OperationalPriceList).where(OperationalPriceList.customer_group == row.customer_group, OperationalPriceList.status == "approved")).all()
+    approved = session.scalars(select(OperationalPriceList).where(OperationalPriceList.customer_group == row.customer_group,
+        OperationalPriceList.currency_code == row.currency_code, OperationalPriceList.status == "approved")).all()
     if any(_overlaps(row.effective_from, row.effective_to, old.effective_from, old.effective_to) for old in approved): raise ValueError("Approved price lists for a customer group cannot have overlapping effective periods")
     row.status = "approved"; row.approved_by = actor; _audit(session, actor, "pricing.list.approved", key, "independent commercial approval; non-posting"); session.commit(); return row
 
@@ -145,7 +150,11 @@ def approve_promotion(session, *, promotion_key, actor):
     row.status = "approved"; row.approved_by = actor; _audit(session, actor, "pricing.promotion.approved", row.promotion_key, "independent commercial approval; non-posting"); session.commit(); return row
 
 
-def enforce_quotation_pricing(session, *, customer_code, quotation_date, lines, discount_amount, promotion_code=None):
+def enforce_quotation_pricing(session, *, customer_code, quotation_date, lines, discount_amount, promotion_code=None,
+                              currency_code="AED"):
+    currency = normalize_currency_code(currency_code)
+    if currency != "AED" and promotion_code:
+        raise ValueError("Foreign-currency promotions require separate currency-aware approval")
     assignment = session.scalar(select(OperationalCustomerPriceGroupAssignment).where(OperationalCustomerPriceGroupAssignment.customer_code == customer_code))
     if not assignment:
         pricing_is_active = session.scalar(select(OperationalPriceList.id).where(
@@ -154,7 +163,8 @@ def enforce_quotation_pricing(session, *, customer_code, quotation_date, lines, 
             raise ValueError("Customer must be assigned to an active price group before a quotation can be priced")
         return {"customer_group": None, "price_list_key": None, "promotion_key": None,
                 "max_discount_amount": None}
-    group = assignment.group_code; lists = session.scalars(select(OperationalPriceList).where(OperationalPriceList.customer_group == group, OperationalPriceList.status == "approved", OperationalPriceList.effective_from <= quotation_date)).all(); lists = [row for row in lists if row.effective_to is None or row.effective_to >= quotation_date]
+    group = assignment.group_code; lists = session.scalars(select(OperationalPriceList).where(OperationalPriceList.customer_group == group,
+        OperationalPriceList.currency_code == currency, OperationalPriceList.status == "approved", OperationalPriceList.effective_from <= quotation_date)).all(); lists = [row for row in lists if row.effective_to is None or row.effective_to >= quotation_date]
     if len(lists) != 1: raise ValueError("Customer price group requires exactly one approved effective price list")
     price_list = lists[0]
     subtotal = sum((Decimal(str(line["net_amount"])) for line in lines), Decimal("0"))
@@ -176,9 +186,10 @@ def enforce_quotation_pricing(session, *, customer_code, quotation_date, lines, 
         incremental_rate = max(Decimal(str(promotion.discount_percent)) - base_rate, Decimal("0"))
         eligible_subtotal = sum((Decimal(str(line["net_amount"])) for line in eligible), Decimal("0"))
         max_discount += eligible_subtotal * incremental_rate / Decimal("100")
-    max_discount = max_discount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    quantum = quotation_money_quantum(currency)
+    max_discount = max_discount.quantize(quantum, rounding=ROUND_HALF_UP)
     if Decimal(str(discount_amount)) > max_discount:
-        raise ValueError(f"Requested discount exceeds the approved limit of {max_discount:.2f}")
+        raise ValueError(f"Requested discount exceeds the approved limit of {max_discount:.{abs(quantum.as_tuple().exponent)}f}")
     return {"customer_group": group, "price_list_key": price_list.price_list_key,
             "promotion_key": promotion.promotion_key if promotion else None,
             "max_discount_amount": max_discount}

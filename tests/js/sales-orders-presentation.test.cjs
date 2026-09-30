@@ -23,6 +23,30 @@ const erp = readFileSync(join(root, 'src/klen_clone/static/erp.js'), 'utf8');
 const inspector = readFileSync(join(root, 'src/klen_clone/static/workspace-inspector.js'), 'utf8');
 const inspectorStyles = readFileSync(join(root, 'src/klen_clone/static/workspace-inspector.css'), 'utf8');
 
+test('sales returns provide a linked customer-refund payout workspace', () => {
+  assert.match(erp, /await renderCustomerRefunds\(\)/);
+  assert.match(erp, /\/customer-refunds/);
+  assert.match(erp, /match-refund/);
+  assert.match(erp, /customer-refund-posting-plans/);
+  assert.match(erp, /posting\/customer_refund/);
+  assert.match(erp, /d\.posting_enabled&&can\('posting\.execute'\)/);
+  assert.match(erp, /renderCustomerPriceCredits\(\)/);
+  assert.match(erp, /renderCustomerRefundRecoveries\(\)/);
+  assert.match(erp, /customer-price-credit-posting-plans/);
+  assert.match(erp, /customer-refund-recovery-posting-plans/);
+  assert.match(erp, /match-recovery/);
+});
+
+test('posted invoices expose a separate item credit and original-location restock path', () => {
+  assert.match(customerInvoices, /Item credit \+ restock/);
+  assert.match(customerInvoices, /#sales-returns\?customer=/);
+  assert.match(erp, /Return all credited items to invoice location/);
+  assert.match(erp, /Custom restock \/ write-off split/);
+  assert.match(erp, /selected\.location_code/);
+  assert.match(erp, /restock\.value=quantity\.value/);
+  assert.match(erp, /approval and rehearsal do not change stock/i);
+});
+
 test('shared component layer loads after the shell foundation', () => {
   const foundation = shell.indexOf('/static/workspace-shell.css');
   const components = shell.indexOf('/static/workspace-components.css');
@@ -58,7 +82,7 @@ test('central task workspace progressively discloses dense routes without busine
   assert.match(styles, /@keyframes task-pane-enter/);
   assert.match(styles, /@keyframes task-drawer-enter/);
   assert.match(styles, /data-motion=reduced/);
-  assert.match(shell, /workspace-components\.css\?v=20260922-pricing-control-4/);
+  assert.match(shell, /workspace-components\.css\?v=[0-9]{8}-[a-z0-9-]+/);
   assert.match(shell, /workspace-components\.js\?v=20260922-task-workspace-3/);
 });
 
@@ -125,14 +149,14 @@ test('legacy workspaces are normalized into the responsive enterprise form syste
 test('central table regions align both header corners without a reserved scrollbar gutter', () => {
   assert.match(styles, /\.central-table-region\{[^}]*overflow-x:auto[^}]*overflow-y:hidden[^}]*scrollbar-gutter:auto/);
   assert.doesNotMatch(styles, /scrollbar-gutter:stable/);
-  assert.match(shell, /workspace-components\.css\?v=20260922-pricing-control-4/);
+  assert.match(shell, /workspace-components\.css\?v=[0-9]{8}-[a-z0-9-]+/);
 });
 
 test('shared workspace surfaces use restrained blur while preserving contrast mode', () => {
   assert.match(styles, /\.component-form,.legacy-workspace-form,.central-toolbar,.workflow-steps,.control-note,.close-package-actions/);
   assert.match(styles, /backdrop-filter:blur\(10px\) saturate\(1\.06\)/);
   assert.match(styles, /data-theme=contrast.*backdrop-filter:none!important/);
-  assert.match(shell, /workspace-components\.css\?v=20260922-pricing-control-4/);
+  assert.match(shell, /workspace-components\.css\?v=[0-9]{8}-[a-z0-9-]+/);
   assert.match(inspectorStyles, /\.workspace-drawer\{background:var\(--glass-elevated\)/);
   assert.match(inspectorStyles, /workspace-drawer::backdrop.*backdrop-filter:blur\(8px\)/);
 });
@@ -153,6 +177,13 @@ test('delivery pilot reuses the component layer without changing workflow endpoi
   assert.match(deliveries, /\/proof-of-delivery/);
   assert.match(deliveries, /expected_revision/);
   assert.match(styles, /\.workflow-steps/);
+});
+
+test('foreign delivery and invoice boards keep held status and dense data readable', () => {
+  assert.match(deliveries, /Foreign issuance held/);
+  assert.match(customerInvoices, /Commercial reference only · no settlement or posting/);
+  assert.match(styles, /\.invoice-board table\{min-width:\d+px;table-layout:fixed\}/);
+  assert.match(styles, /\.invoice-board th,\.invoice-board td\{[^}]*white-space:normal;overflow-wrap:anywhere/);
 });
 
 test('customer invoices reuse the workflow and financial presentation contracts', () => {

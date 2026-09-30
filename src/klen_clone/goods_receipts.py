@@ -207,6 +207,9 @@ def transition_goods_receipt(session: Session, receipt: OperationalGoodsReceipt,
     prior = receipt.status
     receipt.status, receipt.revision = target, receipt.revision + 1
     receipt.state_changed_at, receipt.state_changed_by = utc_now(), actor
+    if action == "accept":
+        from .lot_traceability import register_accepted_receipt_lots
+        register_accepted_receipt_lots(session, receipt)
     session.add(OperationalGoodsReceiptWorkflowEvent(event_key=str(uuid.uuid4()), receipt_id=receipt.id,
                 from_status=prior, to_status=target, actor=actor, note=note))
     session.add(OperationalAuditEvent(event_key=str(uuid.uuid4()), event_type=f"goods_receipt.{action}",

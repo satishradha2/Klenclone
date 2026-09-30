@@ -17,6 +17,8 @@ from .payments import (
     customer_invoice_settlement,
 )
 from .customer_invoices import OperationalCustomerInvoice
+from .sales_returns import OperationalSalesReturn, target_invoice_credit_total
+from .customer_refunds import OperationalCustomerRefund, OperationalCustomerRefundRecovery
 
 
 def _money(value) -> Decimal:
@@ -65,27 +67,36 @@ def build_ageing_report(clone_session: Session, operational_session: Session, *,
     claim_by_source = defaultdict(Decimal)
     submitted = defaultdict(Decimal)
     approved = defaultdict(Decimal)
+    posted = defaultdict(Decimal)
     for claim, payment_status in operational_session.execute(select(
             OperationalPaymentAllocationClaim, OperationalPayment.status).join(
                 OperationalPayment, OperationalPayment.id == OperationalPaymentAllocationClaim.payment_id).where(
                     OperationalPayment.payment_type == payment_type,
-                    OperationalPaymentAllocationClaim.status == "active")):
+                    OperationalPayment.payment_date <= as_of,
+                    OperationalPayment.status.in_(("submitted", "approved", "posted")),
+                    OperationalPaymentAllocationClaim.status.in_(("active", "consumed")))):
         parties.setdefault(claim.party_code, {"party_code": claim.party_code, "party_name": claim.party_code})
         claim_by_source[(claim.party_code, claim.source_type, claim.source_reference_key)] += _money(claim.amount)
-        (approved if payment_status == "approved" else submitted)[claim.party_code] += _money(claim.amount)
+        bucket = posted if payment_status == "posted" else approved if payment_status == "approved" else submitted
+        bucket[claim.party_code] += _money(claim.amount)
 
     submitted_advances = defaultdict(Decimal)
     approved_advances = defaultdict(Decimal)
+    posted_advances = defaultdict(Decimal)
     for payment in operational_session.scalars(select(OperationalPayment).where(
             OperationalPayment.payment_type == payment_type,
-            OperationalPayment.status.in_(("submitted", "approved")),
+            OperationalPayment.payment_date <= as_of,
+            OperationalPayment.status.in_(("submitted", "approved", "posted")),
             OperationalPayment.unallocated_amount > 0)):
         parties.setdefault(payment.party_code, {"party_code": payment.party_code,
                                                 "party_name": payment.party_name_snapshot})
-        (approved_advances if payment.status == "approved" else submitted_advances)[payment.party_code] += _money(payment.unallocated_amount)
+        advance_bucket = (posted_advances if payment.status == "posted" else
+                          approved_advances if payment.status == "approved" else submitted_advances)
+        advance_bucket[payment.party_code] += _money(payment.unallocated_amount)
 
     invoice_totals = defaultdict(Decimal)
     target_erp_invoiced = defaultdict(Decimal)
+    target_erp_credited = defaultdict(Decimal)
     buckets = defaultdict(lambda: defaultdict(Decimal))
     invoice_rows = clone_session.execute(select(
         ErpParty.party_code, ErpTransactionDocument.document_no, ErpTransactionDocument.occurred_at,
@@ -96,6 +107,8 @@ def build_ageing_report(clone_session: Session, operational_session: Session, *,
                 ErpTransactionDocument.source_kind == source_kind,
                 ErpParty.party_kind.in_((party_kind, "both"))))
     for invoice in invoice_rows:
+        if invoice.occurred_at and invoice.occurred_at.date() > as_of:
+            continue
         due = _money(invoice.due_amount if invoice.due_amount is not None else
                      (invoice.total_amount or 0) - (invoice.paid_amount or 0))
         claimed = claim_by_source[(invoice.party_code, "invoice", invoice.document_no)]
@@ -108,15 +121,18 @@ def build_ageing_report(clone_session: Session, operational_session: Session, *,
 
     if ledger_kind == "receivable":
         for invoice in operational_session.scalars(select(OperationalCustomerInvoice).where(
-                OperationalCustomerInvoice.status == "approved")):
+                OperationalCustomerInvoice.status.in_(("approved", "posted")),
+                OperationalCustomerInvoice.invoice_date <= as_of)):
             parties.setdefault(invoice.customer_code, {
                 "party_code": invoice.customer_code,
                 "party_name": invoice.customer_name_snapshot,
             })
             gross = _money(invoice.total_amount)
+            credited = target_invoice_credit_total(operational_session, invoice.invoice_key, as_of=as_of)
             target_erp_invoiced[invoice.customer_code] += gross
+            target_erp_credited[invoice.customer_code] += credited
             claimed = claim_by_source[(invoice.customer_code, "invoice", invoice.invoice_no)]
-            remaining = max(Decimal("0.00"), gross - claimed)
+            remaining = max(Decimal("0.00"), gross - credited - claimed)
             if remaining > 0:
                 invoice_totals[invoice.customer_code] += remaining
                 buckets[invoice.customer_code][ageing_bucket(invoice.invoice_date, as_of)] += remaining
@@ -125,38 +141,44 @@ def build_ageing_report(clone_session: Session, operational_session: Session, *,
     for party_code, party in parties.items():
         opening = _money(controls[party_code])
         target_invoiced = _money(target_erp_invoiced[party_code])
+        target_credited = _money(target_erp_credited[party_code])
         reserved_submitted = _money(submitted[party_code])
         reserved_approved = _money(approved[party_code])
-        control_remaining = max(Decimal("0.00"), opening + target_invoiced - reserved_submitted - reserved_approved)
+        settled_posted = _money(posted[party_code])
+        control_remaining = max(Decimal("0.00"), opening + target_invoiced - target_credited - reserved_submitted - reserved_approved - settled_posted)
         invoice_outstanding = _money(invoice_totals[party_code])
         source_advance = _money(source_advances[party_code])
         pending_advance = _money(submitted_advances[party_code])
         approved_advance = _money(approved_advances[party_code])
+        posted_advance = _money(posted_advances[party_code])
         control_variance = _money(control_remaining - invoice_outstanding)
         row = {**party, "opening_control": opening, "target_erp_invoiced": target_invoiced,
+               "target_erp_credited": target_credited,
                "submitted_allocation": reserved_submitted, "approved_unposted_allocation": reserved_approved,
+               "posted_allocation": settled_posted,
                "control_outstanding": control_remaining, "invoice_evidence_outstanding": invoice_outstanding,
                "control_variance": control_variance, "source_advance": source_advance,
                "submitted_advance": pending_advance, "approved_unposted_advance": approved_advance,
-               "net_exposure": _money(control_remaining - source_advance - pending_advance - approved_advance),
+               "posted_advance": posted_advance,
+               "net_exposure": _money(control_remaining - source_advance - pending_advance - approved_advance - posted_advance),
                "days_0_30": _money(buckets[party_code]["days_0_30"]),
                "days_31_60": _money(buckets[party_code]["days_31_60"]),
                "days_61_90": _money(buckets[party_code]["days_61_90"]),
                "days_91_plus": _money(buckets[party_code]["days_91_plus"]),
                "undated": _money(buckets[party_code]["undated"]),
                "reconciliation_status": "reconciled" if control_variance == 0 else "review_required"}
-        if any(row[key] != 0 for key in ("opening_control", "target_erp_invoiced", "invoice_evidence_outstanding", "source_advance",
-                                          "submitted_allocation", "approved_unposted_allocation",
-                                          "submitted_advance", "approved_unposted_advance")):
+        if any(row[key] != 0 for key in ("opening_control", "target_erp_invoiced", "target_erp_credited", "invoice_evidence_outstanding", "source_advance",
+                                          "submitted_allocation", "approved_unposted_allocation", "posted_allocation",
+                                          "submitted_advance", "approved_unposted_advance", "posted_advance")):
             rows.append(row)
     needle = query.strip().casefold()
     if needle:
         rows = [row for row in rows if needle in row["party_code"].casefold() or needle in row["party_name"].casefold()]
     rows.sort(key=lambda row: (-abs(row["net_exposure"]), row["party_code"]))
     totals = {key: _money(sum((row[key] for row in rows), Decimal("0"))) for key in (
-        "opening_control", "target_erp_invoiced", "submitted_allocation", "approved_unposted_allocation", "control_outstanding",
+        "opening_control", "target_erp_invoiced", "target_erp_credited", "submitted_allocation", "approved_unposted_allocation", "posted_allocation", "control_outstanding",
         "invoice_evidence_outstanding", "control_variance", "source_advance", "submitted_advance",
-        "approved_unposted_advance", "net_exposure", "days_0_30", "days_31_60", "days_61_90",
+        "approved_unposted_advance", "posted_advance", "net_exposure", "days_0_30", "days_31_60", "days_61_90",
         "days_91_plus", "undated")}
     return {"ledger_kind": ledger_kind, "party_kind": party_kind, "as_of": as_of,
             "age_basis": "invoice_date", "due_date_available": False,
@@ -171,6 +193,7 @@ def build_ageing_report(clone_session: Session, operational_session: Session, *,
 def build_customer_statement(operational_session: Session, *, party_code: str,
                              party_name: str, as_of: date) -> dict:
     """Build an auditable statement from opening controls and target-ERP activity."""
+    from .customer_price_credits import OperationalCustomerPriceCredit
     opening_receivable = _money(operational_session.scalar(select(func.coalesce(
         func.sum(OperationalOpeningPartyBalance.amount), 0)).where(
             OperationalOpeningPartyBalance.party_type == "customer",
@@ -186,12 +209,12 @@ def build_customer_statement(operational_session: Session, *, party_code: str,
     invoice_total = Decimal("0.00")
     invoices = operational_session.scalars(select(OperationalCustomerInvoice).where(
         OperationalCustomerInvoice.customer_code == party_code,
-        OperationalCustomerInvoice.status == "approved",
+        OperationalCustomerInvoice.status.in_(("approved", "posted")),
         OperationalCustomerInvoice.invoice_date <= as_of,
     ).order_by(OperationalCustomerInvoice.invoice_date,
                OperationalCustomerInvoice.invoice_no)).all()
     for invoice in invoices:
-        settlement = customer_invoice_settlement(operational_session, invoice)
+        settlement = customer_invoice_settlement(operational_session, invoice, as_of=as_of)
         amount = _money(invoice.total_amount)
         invoice_total += amount
         entries.append({
@@ -204,11 +227,46 @@ def build_customer_statement(operational_session: Session, *, party_code: str,
             **settlement,
         })
 
+    credit_total = Decimal("0.00")
+    returns = operational_session.scalars(select(OperationalSalesReturn).where(
+        OperationalSalesReturn.original_invoice_origin == "target_erp",
+        OperationalSalesReturn.customer_code == party_code,
+        OperationalSalesReturn.status.in_(("approved", "posted")),
+        OperationalSalesReturn.return_date <= as_of).order_by(
+            OperationalSalesReturn.return_date, OperationalSalesReturn.return_no)).all()
+    for returned in returns:
+        amount = _money(returned.total_amount)
+        credit_total += amount
+        entries.append({
+            "entry_date": returned.return_date,
+            "entry_type": "customer_credit_note",
+            "reference": returned.credit_note.credit_note_no,
+            "source_reference": returned.original_invoice_reference,
+            "description": f"Approved return {returned.return_no}",
+            "debit": Decimal("0.00"), "credit": amount,
+            "settlement_status": returned.status,
+        })
+    price_credits = operational_session.scalars(select(OperationalCustomerPriceCredit).where(
+        OperationalCustomerPriceCredit.customer_code == party_code,
+        OperationalCustomerPriceCredit.status.in_(("approved", "posted")),
+        OperationalCustomerPriceCredit.credit_date <= as_of).order_by(
+        OperationalCustomerPriceCredit.credit_date,
+        OperationalCustomerPriceCredit.credit_no)).all()
+    for credit in price_credits:
+        amount = _money(credit.total_amount)
+        credit_total += amount
+        entries.append({"entry_date": credit.credit_date,
+            "entry_type": "customer_price_credit", "reference": credit.credit_no,
+            "source_reference": credit.invoice.invoice_no,
+            "description": f"No-stock price correction; invoice line {credit.invoice_line.line_no}",
+            "debit": Decimal("0.00"), "credit": amount,
+            "settlement_status": credit.status})
+
     receipt_total = Decimal("0.00")
     receipts = operational_session.scalars(select(OperationalPayment).where(
         OperationalPayment.payment_type == "customer_receipt",
         OperationalPayment.party_code == party_code,
-        OperationalPayment.status == "approved",
+        OperationalPayment.status.in_(("approved", "posted")),
         OperationalPayment.payment_date <= as_of,
     ).order_by(OperationalPayment.payment_date, OperationalPayment.payment_no)).all()
     for receipt in receipts:
@@ -222,10 +280,50 @@ def build_customer_statement(operational_session: Session, *, party_code: str,
             "source_reference": sources or "Customer advance",
             "description": f"{receipt.payment_method.replace('_', ' ')} receipt",
             "debit": Decimal("0.00"), "credit": amount,
-            "settlement_status": "approved",
+            "settlement_status": receipt.status,
         })
 
-    type_order = {"customer_invoice": 0, "customer_receipt": 1}
+    refund_total = Decimal("0.00")
+    refunds = operational_session.scalars(select(OperationalCustomerRefund).where(
+        OperationalCustomerRefund.customer_code == party_code,
+        OperationalCustomerRefund.status == "posted",
+        OperationalCustomerRefund.refund_date <= as_of).order_by(
+        OperationalCustomerRefund.refund_date, OperationalCustomerRefund.refund_no)).all()
+    for refund in refunds:
+        source = (operational_session.get(OperationalSalesReturn, refund.sales_return_id)
+                  if refund.sales_return_id is not None else
+                  operational_session.get(OperationalCustomerPriceCredit, refund.price_credit_id))
+        amount = _money(refund.amount)
+        refund_total += amount
+        entries.append({"entry_date": refund.refund_date,
+            "entry_type": "customer_refund", "reference": refund.refund_no,
+            "source_reference": (source.credit_note.credit_note_no if refund.sales_return_id is not None
+                                 else source.credit_no),
+            "description": "Bank-confirmed customer refund",
+            "debit": amount, "credit": Decimal("0.00"),
+            "settlement_status": "posted"})
+    recovery_total = Decimal("0.00")
+    recoveries = operational_session.scalars(select(OperationalCustomerRefundRecovery).where(
+        OperationalCustomerRefundRecovery.customer_code == party_code,
+        OperationalCustomerRefundRecovery.status == "posted",
+        OperationalCustomerRefundRecovery.recovery_date <= as_of).order_by(
+        OperationalCustomerRefundRecovery.recovery_date,
+        OperationalCustomerRefundRecovery.recovery_no)).all()
+    for recovery in recoveries:
+        amount = _money(recovery.amount)
+        recovery_total += amount
+        source = operational_session.get(OperationalCustomerRefund, recovery.refund_id)
+        entries.append({"entry_date": recovery.recovery_date,
+            "entry_type": "customer_refund_recovery",
+            "reference": recovery.recovery_no,
+            "source_reference": source.refund_no,
+            "description": "Bank-confirmed refund repayment; credit liability reopened",
+            "debit": Decimal("0.00"), "credit": amount,
+            "settlement_status": "posted"})
+
+    type_order = {"customer_invoice": 0, "customer_credit_note": 1,
+                  "customer_price_credit": 1, "customer_receipt": 2, "customer_refund": 3,
+                  "customer_refund_recovery": 4}
     entries.sort(key=lambda row: (row["entry_date"], type_order[row["entry_type"]], row["reference"]))
     running = _money(opening_receivable - opening_advance)
     for entry in entries:
@@ -238,16 +336,20 @@ def build_customer_statement(operational_session: Session, *, party_code: str,
             OperationalPayment.party_code == party_code,
             OperationalPayment.status == "submitted",
             OperationalPayment.payment_date <= as_of)) or 0)
-    closing = _money(opening_receivable - opening_advance + invoice_total - receipt_total)
+    closing = _money(opening_receivable - opening_advance + invoice_total - credit_total
+                     - receipt_total + refund_total - recovery_total)
     return {
         "party_code": party_code, "party_name": party_name, "as_of": as_of,
         "currency_code": "AED", "opening_receivable": opening_receivable,
         "opening_advance": opening_advance,
         "opening_balance": _money(opening_receivable - opening_advance),
-        "invoice_total": _money(invoice_total), "receipt_total": _money(receipt_total),
+        "invoice_total": _money(invoice_total), "credit_total": _money(credit_total),
+        "receipt_total": _money(receipt_total),
+        "refund_total": _money(refund_total),
+        "recovery_total": _money(recovery_total),
         "pending_receipts": pending_receipts, "closing_balance": closing,
         "entries": entries, "posting_enabled": False,
-        "scope_note": "Authoritative opening control plus approved target-ERP invoices and receipts",
+        "scope_note": "Authoritative opening control plus approved target-ERP invoices, credits and approved or posted receipts",
     }
 
 

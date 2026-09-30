@@ -114,6 +114,8 @@
     .toLocaleLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 54) || 'workspace';
 
   const taskTitle = (element, fallback) => {
+    const explicit = element.dataset?.taskTitle?.trim();
+    if (explicit) return explicit;
     const heading = element.querySelector([
       ':scope > .panel-head h3', ':scope > h3', ':scope > h2',
       ':scope > summary h3', ':scope > summary', '.panel-head h3', '.section-title'

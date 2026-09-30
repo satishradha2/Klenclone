@@ -509,6 +509,13 @@ def create_product_recall(session: Session, *, location_code: str, reason: str,
         if quantity <= 0 or quantity > position.quantity_on_hand:
             raise ValueError(f"Recall quantity for {sku} exceeds controlled on-hand stock")
         if identity:
+            from .lot_traceability import OperationalReceiptLot
+            lot = session.scalar(select(OperationalReceiptLot).where(
+                OperationalReceiptLot.sku == sku,
+                OperationalReceiptLot.location_code == recall.location_code,
+                (func.upper(OperationalReceiptLot.lot_key) == identity)
+                | (OperationalReceiptLot.batch_no == identity),
+            ))
             serial = session.scalar(select(OperationalSerialUnit).where(
                 OperationalSerialUnit.serial_number == identity,
                 OperationalSerialUnit.sku == sku,
@@ -516,8 +523,10 @@ def create_product_recall(session: Session, *, location_code: str, reason: str,
             barcode = session.scalar(select(OperationalBarcodeIdentity).where(
                 OperationalBarcodeIdentity.barcode_value == identity,
                 OperationalBarcodeIdentity.sku == sku))
-            if not serial and not barcode:
+            if not serial and not barcode and not lot:
                 raise ValueError(f"Recall identity {identity} is not registered for {sku}")
+            if lot and quantity > lot.quantity_base:
+                raise ValueError(f"Recall quantity exceeds accepted lot quantity for {sku}")
         recall.lines.append(OperationalProductRecallLine(
             sku=sku, identity_value=identity, quantity_base=quantity,
             canonical_uom=position.canonical_uom,

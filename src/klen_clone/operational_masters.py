@@ -33,6 +33,10 @@ class OperationalPartyMaster(OperationalBase):
     mobile: Mapped[str | None] = mapped_column(String(120))
     address: Mapped[str | None] = mapped_column(Text)
     tax_number: Mapped[str | None] = mapped_column(String(120))
+    country_code: Mapped[str | None] = mapped_column(String(2))
+    preferred_currency_code: Mapped[str | None] = mapped_column(String(3))
+    tax_registration_type: Mapped[str | None] = mapped_column(String(20))
+    tax_country_code: Mapped[str | None] = mapped_column(String(2))
     status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
     revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     source_promoted: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -205,6 +209,8 @@ def promote_operational_masters(clone: Session, operational: Session, snapshot: 
     operational.add(OperationalAuditEvent(event_key=str(uuid.uuid4()), event_type="promotion.executed",
         actor=actor, resource_key=batch_key,
         detail=f"staging master promotion; {mapped} records; posting disabled; source immutable"))
+    from .product_taxonomy import backfill_product_taxonomy
+    backfill_product_taxonomy(operational, actor=actor)
     operational.commit()
     return {"status": "executed", "batch_key": batch_key, "expected_records": expected,
             "mapped_records": mapped, "exception_records": 0, "idempotent_replay": False,

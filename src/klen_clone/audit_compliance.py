@@ -11,8 +11,8 @@ from openpyxl import Workbook
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, select
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
-from .close_reporting import OperationalFinancialReportPackage
-from .operational import OperationalAuditEvent, OperationalBase, OperationalJournalBatch, utc_now
+from .close_reporting import OperationalFinancialReportPackage, assert_report_package_current
+from .operational import OperationalAuditEvent, OperationalBase, utc_now
 from .posting_integration import OperationalIntegratedPostingBatch
 from .vat_control import OperationalVatPeriod, OperationalVatReturnRehearsal
 
@@ -65,6 +65,7 @@ def _audit_snapshot(session: Session) -> tuple[list[dict], str]:
 def build_statutory_evidence(session: Session, report: OperationalFinancialReportPackage) -> dict:
     if report.status != "approved":
         raise ValueError("Statutory evidence requires approved financial statements")
+    period_ledger = assert_report_package_current(session, report)
     close = report.period_close
     period = close.fiscal_period
     vat_periods = list(session.scalars(select(OperationalVatPeriod).where(
@@ -73,8 +74,6 @@ def build_statutory_evidence(session: Session, report: OperationalFinancialRepor
         OperationalVatPeriod.ends_on >= period.starts_on).order_by(OperationalVatPeriod.starts_on)))
     audit_events, chain_root = _audit_snapshot(session)
     report_json = json.loads(report.report_json)
-    integrated_postings = session.scalar(select(func.count(OperationalIntegratedPostingBatch.id))) or 0
-    journal_postings = session.scalar(select(func.count(OperationalJournalBatch.id))) or 0
     vat_items = []
     for vat in vat_periods:
         rehearsal = session.scalar(select(OperationalVatReturnRehearsal).where(
@@ -95,8 +94,10 @@ def build_statutory_evidence(session: Session, report: OperationalFinancialRepor
          "evidence": f"difference AED {report_json['balance_sheet']['difference']}"},
         {"control": "approved_vat_return", "status": "pass" if vat_items else "warning",
          "evidence": ", ".join(v["period_code"] for v in vat_items) or "No overlapping approved VAT period"},
-        {"control": "permanent_posting_lock", "status": "pass" if integrated_postings + journal_postings == 0 else "fail",
-         "evidence": f"integrated {integrated_postings}; journal {journal_postings}"},
+        {"control": "posted_ledger_consistency", "status": "pass",
+         "evidence": f"period batches {period_ledger['batch_count']}; fingerprint {period_ledger['fingerprint']}"},
+        {"control": "opening_balances_certified", "status": "pass" if report_json.get("ledger_controls", {}).get("opening_balances_certified") else "warning",
+         "evidence": "Opening equity and account balances require cutover reconciliation"},
         {"control": "source_system_protection", "status": "pass", "evidence": "BizModo read-only; target ERP evidence only"},
         {"control": "statutory_filing_lock", "status": "pass", "evidence": "No filing performed; rehearsal only"},
     ]

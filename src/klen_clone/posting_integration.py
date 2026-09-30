@@ -9,10 +9,16 @@ from decimal import Decimal, ROUND_HALF_UP
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func, select
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
+from .gl_mapping import posting_gl_preflight, require_posting_gl
 from .goods_receipts import OperationalGoodsReceipt, rehearse_goods_receipt_posting
+from .customer_invoices import (OperationalCustomerInvoice, OperationalCustomerInvoicePostingRehearsal,
+                                invoice_dispatch_valuation, rehearse_customer_invoice)
+from .customer_refunds import (OperationalCustomerRefund, OperationalCustomerRefundRecovery,
+    recovery_posting_plan, refund_posting_plan)
+from .customer_price_credits import (OperationalCustomerPriceCredit, price_credit_posting_plan)
 from .inventory_operations import OperationalInventoryDocument, OperationalInventoryReservation, rehearse_inventory_posting
 from .operational import (
-    MONEY, OperationalAuditEvent, OperationalBase, OperationalDraft,
+    MONEY, OperationalAuditEvent, OperationalBase, OperationalDraft, OperationalFiscalPeriod,
     OperationalStockPosition, OperationalStockReservation, utc_now,
 )
 from .payments import OperationalPayment, OperationalPaymentAllocationClaim, rehearse_payment_posting
@@ -28,10 +34,11 @@ from .purchase_returns import (
     OperationalPurchaseReturnReservation,
     rehearse_purchase_return_posting,
 )
-from .sales_returns import OperationalSalesReturn, OperationalSalesReturnPostingRehearsal, rehearse_sales_return_posting
+from .sales_returns import (OperationalSalesReturn, OperationalSalesReturnPostingRehearsal,
+                            rehearse_sales_return_posting, validate_target_return_rehearsal)
 from .sales_invoices import OperationalSalesInvoicePostingRehearsal, rehearse_sales_invoice_posting
 
-RESOURCE_TYPES = {"inventory_document", "goods_receipt", "sales_invoice", "sales_return", "purchase_return", "payment", "supplier_invoice", "supplier_adjustment"}
+RESOURCE_TYPES = {"inventory_document", "goods_receipt", "sales_invoice", "customer_invoice", "sales_return", "customer_price_credit", "customer_refund", "customer_refund_recovery", "purchase_return", "payment", "supplier_invoice", "supplier_adjustment"}
 
 
 class OperationalIntegratedPostingBatch(OperationalBase):
@@ -39,7 +46,7 @@ class OperationalIntegratedPostingBatch(OperationalBase):
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_integrated_posting_idempotency"),
         UniqueConstraint("resource_type", "resource_key", "posting_sequence", name="uq_integrated_posting_resource_sequence"),
-        CheckConstraint("resource_type IN ('inventory_document','goods_receipt','sales_invoice','sales_return','purchase_return','payment','supplier_invoice','supplier_adjustment')", name="ck_integrated_posting_resource_type"),
+        CheckConstraint("resource_type IN ('inventory_document','goods_receipt','sales_invoice','customer_invoice','sales_return','customer_price_credit','customer_refund','customer_refund_recovery','purchase_return','payment','supplier_invoice','supplier_adjustment')", name="ck_integrated_posting_resource_type"),
         CheckConstraint("batch_kind IN ('posting','reversal')", name="ck_integrated_posting_kind"),
         CheckConstraint("status IN ('posted','reversed')", name="ck_integrated_posting_status"),
     )
@@ -120,7 +127,11 @@ def _resource(session: Session, resource_type: str, resource_key: str, *, lock: 
     mapping = {
         "inventory_document": (OperationalInventoryDocument, OperationalInventoryDocument.document_key),
         "goods_receipt": (OperationalGoodsReceipt, OperationalGoodsReceipt.receipt_key),
+        "customer_invoice": (OperationalCustomerInvoice, OperationalCustomerInvoice.invoice_key),
         "sales_return": (OperationalSalesReturn, OperationalSalesReturn.return_key),
+        "customer_price_credit": (OperationalCustomerPriceCredit, OperationalCustomerPriceCredit.credit_key),
+        "customer_refund": (OperationalCustomerRefund, OperationalCustomerRefund.refund_key),
+        "customer_refund_recovery": (OperationalCustomerRefundRecovery, OperationalCustomerRefundRecovery.recovery_key),
         "purchase_return": (OperationalPurchaseReturn, OperationalPurchaseReturn.return_key),
         "payment": (OperationalPayment, OperationalPayment.payment_key),
         "supplier_invoice": (OperationalSupplierInvoice, OperationalSupplierInvoice.invoice_key),
@@ -144,15 +155,31 @@ def _plan(session: Session, resource_type: str, document, actor: str) -> dict:
         plan = rehearse_sales_return_posting(session, document, actor=actor)
         plan["journal"] = [{"account": row["account_code"], "debit": row["debit"], "credit": row["credit"]}
                            for row in plan["journal"]]
+        source_type = ("customer_invoice" if document.original_invoice_origin == "target_erp"
+                       else "sales_invoice")
         plan["subledger"] = [{"entry_type": "receivable_credit", "party_code": document.customer_code,
-            "source_type": "sales_invoice", "source_reference_key": document.original_invoice_reference,
-            "amount": -document.total_amount}]
+            "source_type": source_type, "source_reference_key": document.original_invoice_reference,
+            "amount": -plan["receivable_credit"]}]
+        if plan["refund_payable"]:
+            plan["subledger"].append({"entry_type": "customer_refund_payable",
+                "party_code": document.customer_code, "source_type": source_type,
+                "source_reference_key": document.credit_note.credit_note_no,
+                "amount": plan["refund_payable"]})
     elif resource_type == "sales_invoice":
         plan = rehearse_sales_invoice_posting(session, document, actor=actor)
         plan["journal"] = [{"account": row["account_code"], "debit": row["debit"], "credit": row["credit"]}
                            for row in plan["journal"]]
         plan["subledger"] = [{"entry_type": "receivable_invoice", "party_code": document.party_code,
             "source_type": "sales_invoice", "source_reference_key": document.draft_no,
+            "amount": document.total_amount}]
+    elif resource_type == "customer_invoice":
+        plan = rehearse_customer_invoice(session, document, actor=actor)
+        plan["journal"] = [{"account": row["account_code"], "debit": row["debit"], "credit": row["credit"]}
+                           for row in plan["journal"]]
+        # Delivery dispatch has already reduced physical stock; the invoice posts accounting only.
+        plan["movements"] = []
+        plan["subledger"] = [{"entry_type": "receivable_invoice", "party_code": document.customer_code,
+            "source_type": "customer_invoice", "source_reference_key": document.invoice_no,
             "amount": document.total_amount}]
     elif resource_type == "purchase_return":
         plan = rehearse_purchase_return_posting(session, document, actor=actor)
@@ -163,6 +190,12 @@ def _plan(session: Session, resource_type: str, document, actor: str) -> dict:
             "amount": -document.total_amount}]
     elif resource_type == "payment":
         plan = rehearse_payment_posting(session, document, actor=actor)
+    elif resource_type == "customer_refund":
+        plan = refund_posting_plan(session, document)
+    elif resource_type == "customer_refund_recovery":
+        plan = recovery_posting_plan(session, document)
+    elif resource_type == "customer_price_credit":
+        plan = price_credit_posting_plan(session, document)
     elif resource_type == "supplier_invoice":
         plan = rehearse_supplier_invoice_posting(session, document, actor=actor)
         plan["journal"] = [{"account": row["account_code"], "debit": row["debit"], "credit": row["credit"]}
@@ -189,7 +222,9 @@ def posting_preview(session: Session, *, resource_type: str, resource_key: str, 
     document = _resource(session, resource_type, resource_key)
     if not document:
         raise ValueError("Posting resource was not found")
-    return _plan(session, resource_type, document, actor)
+    plan = _plan(session, resource_type, document, actor)
+    plan["gl_mapping"] = posting_gl_preflight(session, plan.get("journal", []))
+    return plan
 
 
 def get_posting_resource(session: Session, resource_type: str, resource_key: str):
@@ -280,7 +315,8 @@ def _batch_payload(batch: OperationalIntegratedPostingBatch, *, idempotent_repla
 
 
 def execute_integrated_posting(session: Session, *, resource_type: str, resource_key: str,
-                               idempotency_key: str, actor: str) -> dict:
+                               idempotency_key: str, actor: str,
+                               enforce_approved_gl: bool = False) -> dict:
     existing = session.scalar(select(OperationalIntegratedPostingBatch).where(OperationalIntegratedPostingBatch.idempotency_key == idempotency_key))
     if existing:
         if existing.resource_type != resource_type or existing.resource_key != resource_key:
@@ -292,7 +328,7 @@ def execute_integrated_posting(session: Session, *, resource_type: str, resource
     expected_status = "accepted" if resource_type == "goods_receipt" else "approved"
     if document.status != expected_status:
         raise ValueError(f"Only a {expected_status} {resource_type.replace('_', ' ')} can be posted")
-    if resource_type in {"sales_invoice", "supplier_invoice", "supplier_adjustment", "purchase_return", "sales_return"}:
+    if resource_type in {"sales_invoice", "customer_invoice", "supplier_invoice", "supplier_adjustment", "purchase_return", "sales_return", "customer_price_credit", "customer_refund", "customer_refund_recovery"}:
         if document.created_by == actor:
             raise ValueError(f"The {resource_type.replace('_', '-')} maker cannot execute its posting")
     if resource_type == "supplier_invoice":
@@ -305,17 +341,46 @@ def execute_integrated_posting(session: Session, *, resource_type: str, resource
     plan = _plan(session, resource_type, document, actor)
     if idempotency_key != plan["idempotency_key"]:
         raise ValueError("Posting idempotency key does not match the approved resource revision and plan")
+    gl_resolution = require_posting_gl(session, plan.get("journal", [])) if enforce_approved_gl else None
     try:
         locked = _resource(session, resource_type, resource_key, lock=True)
         if not locked or locked.status != expected_status or locked.revision != revision:
             raise ValueError("Approved resource changed before atomic posting")
+        if resource_type == "customer_invoice":
+            current_cogs, _ = invoice_dispatch_valuation(session, locked)
+            rehearsed_cogs = sum((_money(row["debit"]) for row in plan["journal"]
+                                  if row["account"] == "5000"), Decimal("0.00"))
+            if current_cogs != rehearsed_cogs:
+                raise ValueError("Dispatch valuation changed before atomic customer-invoice posting")
+        if resource_type == "sales_return" and locked.original_invoice_origin == "target_erp":
+            rehearsal = session.scalar(select(OperationalSalesReturnPostingRehearsal).where(
+                OperationalSalesReturnPostingRehearsal.sales_return_id == locked.id,
+                OperationalSalesReturnPostingRehearsal.return_revision == locked.revision).with_for_update())
+            if rehearsal is None or rehearsal.posting_fingerprint != plan["posting_fingerprint"]:
+                raise ValueError("Target return rehearsal changed before atomic posting")
+            validate_target_return_rehearsal(session, locked, rehearsal)
+        if resource_type == "customer_refund":
+            confirmed = refund_posting_plan(session, locked)
+            if confirmed["posting_fingerprint"] != plan["posting_fingerprint"]:
+                raise ValueError("Refund bank or credit-note evidence changed before atomic posting")
+        if resource_type == "customer_refund_recovery":
+            confirmed = recovery_posting_plan(session, locked)
+            if confirmed["posting_fingerprint"] != plan["posting_fingerprint"]:
+                raise ValueError("Recovery bank evidence changed before atomic posting")
+        if resource_type == "customer_price_credit":
+            confirmed = price_credit_posting_plan(session, locked)
+            if confirmed["posting_fingerprint"] != plan["posting_fingerprint"]:
+                raise ValueError("Pricing-credit invoice or settlement evidence changed before atomic posting")
+        posting_fingerprint = (hashlib.sha256((plan["posting_fingerprint"] + gl_resolution["fingerprint"]).encode()).hexdigest()
+                               if gl_resolution else plan["posting_fingerprint"])
         batch = OperationalIntegratedPostingBatch(batch_key=str(uuid.uuid4()), idempotency_key=idempotency_key,
             resource_type=resource_type, resource_key=resource_key, resource_revision=revision,
-            posting_sequence=1, batch_kind="posting", posting_fingerprint=plan["posting_fingerprint"],
+            posting_sequence=1, batch_kind="posting", posting_fingerprint=posting_fingerprint,
             fiscal_period_key=str(plan["period_key"]), status="posted", posted_by=actor)
         session.add(batch)
         session.flush()
-        for number, row in enumerate(plan.get("journal", []), 1):
+        journal = gl_resolution["journal"] if gl_resolution else plan.get("journal", [])
+        for number, row in enumerate(journal, 1):
             session.add(OperationalIntegratedJournalLine(batch_id=batch.id, line_no=number,
                 account_code=row["account"], debit=_money(row["debit"]), credit=_money(row["credit"])))
         _apply_movements(session, batch, plan.get("movements", []), resource_type)
@@ -404,6 +469,46 @@ def _execute_integrated_reversal(session: Session, batch: OperationalIntegratedP
     document = _resource(session, locked.resource_type, locked.resource_key, lock=True)
     if not document or document.status != "posted":
         raise ValueError("The posted resource is unavailable for reversal")
+    if locked.resource_type == "customer_refund":
+        raise ValueError("A bank-confirmed customer refund requires a separate compensating receipt, not reversal")
+    if locked.resource_type == "customer_refund_recovery":
+        raise ValueError("A bank-confirmed refund recovery cannot be erased; use a new governed payout")
+    if locked.resource_type == "customer_price_credit":
+        refund_dependency = session.scalar(select(OperationalCustomerRefund.id).where(
+            OperationalCustomerRefund.price_credit_id == document.id,
+            OperationalCustomerRefund.status.in_(("submitted", "approved", "posted"))))
+        if refund_dependency:
+            raise ValueError("A reserved or paid customer refund prevents pricing-credit reversal")
+        invoice = session.get(OperationalCustomerInvoice, document.invoice_id)
+        later_receipt = session.scalar(select(OperationalPaymentAllocationClaim.id).where(
+            OperationalPaymentAllocationClaim.party_code == document.customer_code,
+            OperationalPaymentAllocationClaim.source_type == "invoice",
+            OperationalPaymentAllocationClaim.source_reference_key == invoice.invoice_no,
+            OperationalPaymentAllocationClaim.created_at >= locked.posted_at,
+            OperationalPaymentAllocationClaim.status.in_(("active", "consumed"))))
+        later_return = session.scalar(select(OperationalSalesReturn.id).where(
+            OperationalSalesReturn.original_invoice_target_key == invoice.invoice_key,
+            OperationalSalesReturn.created_at >= locked.posted_at,
+            OperationalSalesReturn.status.in_(("submitted", "approved", "posted"))))
+        later_price_credit = session.scalar(select(OperationalCustomerPriceCredit.id).where(
+            OperationalCustomerPriceCredit.invoice_id == invoice.id,
+            OperationalCustomerPriceCredit.id != document.id,
+            OperationalCustomerPriceCredit.created_at >= locked.posted_at,
+            OperationalCustomerPriceCredit.status.in_(("submitted", "approved", "posted"))))
+        if later_receipt or later_return or later_price_credit:
+            raise ValueError("Later invoice settlement or credit activity prevents pricing-credit reversal")
+    if locked.resource_type == "payment" and document.payment_type == "customer_receipt":
+        allocated_invoices = select(OperationalPaymentAllocationClaim.source_reference_key).where(
+            OperationalPaymentAllocationClaim.payment_id == document.id,
+            OperationalPaymentAllocationClaim.source_type == "invoice",
+            OperationalPaymentAllocationClaim.status == "consumed")
+        dependent_return = session.scalar(select(OperationalSalesReturn.id).where(
+            OperationalSalesReturn.customer_code == document.party_code,
+            OperationalSalesReturn.original_invoice_origin == "target_erp",
+            OperationalSalesReturn.original_invoice_reference.in_(allocated_invoices),
+            OperationalSalesReturn.status == "posted"))
+        if dependent_return:
+            raise ValueError("A posted target return depends on this receipt; reverse the return first")
     if locked.resource_type == "supplier_invoice":
         payment_dependency = session.scalar(select(OperationalPaymentAllocationClaim.id).where(
             OperationalPaymentAllocationClaim.party_code == document.supplier_code,
@@ -447,6 +552,11 @@ def _execute_integrated_reversal(session: Session, batch: OperationalIntegratedP
         if payment_dependency:
             raise ValueError("A later supplier payment allocation prevents purchase-return reversal")
     if locked.resource_type == "sales_return":
+        refund_dependency = session.scalar(select(OperationalCustomerRefund.id).where(
+            OperationalCustomerRefund.sales_return_id == document.id,
+            OperationalCustomerRefund.status.in_(("submitted", "approved", "posted"))))
+        if refund_dependency:
+            raise ValueError("A reserved or paid customer refund prevents sales-return reversal")
         rehearsal = session.scalar(select(OperationalSalesReturnPostingRehearsal).where(
             OperationalSalesReturnPostingRehearsal.sales_return_id == document.id,
             OperationalSalesReturnPostingRehearsal.return_revision == locked.resource_revision))
@@ -460,6 +570,17 @@ def _execute_integrated_reversal(session: Session, batch: OperationalIntegratedP
             OperationalPaymentAllocationClaim.status.in_(("active", "consumed"))))
         if receipt_dependency:
             raise ValueError("A later customer receipt allocation prevents sales-return reversal")
+        if document.original_invoice_origin == "target_erp":
+            period = session.scalar(select(OperationalFiscalPeriod).where(
+                OperationalFiscalPeriod.period_key == locked.fiscal_period_key).with_for_update())
+            if not period or period.status != "open":
+                raise ValueError("A locked fiscal period prevents target-return reversal")
+            later_return = session.scalar(select(OperationalSalesReturn.id).where(
+                OperationalSalesReturn.original_invoice_target_key == document.original_invoice_target_key,
+                OperationalSalesReturn.id > document.id,
+                OperationalSalesReturn.status.in_(("submitted", "approved", "posted"))))
+            if later_return:
+                raise ValueError("A later target return prevents reversal of the earlier credit")
     if locked.resource_type == "sales_invoice":
         rehearsal = session.scalar(select(OperationalSalesInvoicePostingRehearsal).where(
             OperationalSalesInvoicePostingRehearsal.sales_invoice_id == document.id,
@@ -474,6 +595,34 @@ def _execute_integrated_reversal(session: Session, batch: OperationalIntegratedP
             OperationalPaymentAllocationClaim.status.in_(("active", "consumed"))))
         if receipt_dependency:
             raise ValueError("A later customer receipt allocation prevents sales-invoice reversal")
+    if locked.resource_type == "customer_invoice":
+        period = session.scalar(select(OperationalFiscalPeriod).where(
+            OperationalFiscalPeriod.period_key == locked.fiscal_period_key).with_for_update())
+        if not period or period.status != "open":
+            raise ValueError("A closed fiscal period prevents customer-invoice reversal")
+        rehearsal = session.scalar(select(OperationalCustomerInvoicePostingRehearsal).where(
+            OperationalCustomerInvoicePostingRehearsal.invoice_id == document.id,
+            OperationalCustomerInvoicePostingRehearsal.invoice_revision == locked.resource_revision))
+        if rehearsal is None:
+            raise ValueError("The approved customer-invoice rehearsal is unavailable for reversal")
+        receipt_dependency = session.scalar(select(OperationalPaymentAllocationClaim.id).where(
+            OperationalPaymentAllocationClaim.party_code == document.customer_code,
+            OperationalPaymentAllocationClaim.source_type == "invoice",
+            OperationalPaymentAllocationClaim.source_reference_key.in_((document.invoice_key, document.invoice_no)),
+            OperationalPaymentAllocationClaim.status.in_(("active", "consumed"))))
+        if receipt_dependency:
+            raise ValueError("A customer receipt allocation prevents customer-invoice reversal")
+        dependent_return = session.scalar(select(OperationalSalesReturn.id).where(
+            OperationalSalesReturn.original_invoice_origin == "target_erp",
+            OperationalSalesReturn.original_invoice_target_key == document.invoice_key,
+            OperationalSalesReturn.status.not_in(("cancelled", "reversed"))))
+        if dependent_return:
+            raise ValueError("A dependent sales return prevents customer-invoice reversal")
+        dependent_price_credit = session.scalar(select(OperationalCustomerPriceCredit.id).where(
+            OperationalCustomerPriceCredit.invoice_id == document.id,
+            OperationalCustomerPriceCredit.status.not_in(("cancelled", "reversed"))))
+        if dependent_price_credit:
+            raise ValueError("A dependent pricing credit prevents customer-invoice reversal")
     fingerprint = hashlib.sha256(f"reverse:{locked.posting_fingerprint}".encode("ascii")).hexdigest()
     reversal = OperationalIntegratedPostingBatch(batch_key=str(uuid.uuid4()),
         idempotency_key=f"reverse:{locked.idempotency_key}", resource_type=locked.resource_type,

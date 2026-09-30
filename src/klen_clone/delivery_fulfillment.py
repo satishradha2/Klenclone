@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
 from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func, select
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
-from .operational import OperationalAuditEvent, OperationalBase, OperationalStockPosition, utc_now
+from .operational import MONEY, OperationalAuditEvent, OperationalBase, OperationalStockPosition, utc_now
 from .sales_orders import OperationalSalesOrder
 
 
@@ -99,6 +99,7 @@ class OperationalDeliveryStockMovement(OperationalBase):
         CheckConstraint("quantity_base > 0", name="ck_delivery_stock_movement_quantity"),
         CheckConstraint("movement_type = 'dispatch_issue'", name="ck_delivery_stock_movement_type"),
         CheckConstraint("accounting_posting_enabled = false", name="ck_delivery_stock_no_accounting_posting"),
+        CheckConstraint("(unit_cost_snapshot IS NULL AND issue_value_snapshot IS NULL) OR (unit_cost_snapshot >= 0 AND issue_value_snapshot >= 0)", name="ck_delivery_stock_valuation_pair"),
     )
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     movement_key: Mapped[str] = mapped_column(String(36), unique=True, nullable=False)
@@ -107,6 +108,8 @@ class OperationalDeliveryStockMovement(OperationalBase):
     location_code: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
     sku: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     quantity_base: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    unit_cost_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(18, 6))
+    issue_value_snapshot: Mapped[Decimal | None] = mapped_column(Numeric(19, 2))
     movement_type: Mapped[str] = mapped_column(String(30), nullable=False, default="dispatch_issue")
     accounting_posting_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
@@ -136,6 +139,9 @@ def _event(session: Session, fulfillment: OperationalDeliveryFulfillment, previo
 
 def allocate_sales_order(session: Session, order: OperationalSalesOrder, *, actor: str,
                          note: str) -> OperationalDeliveryFulfillment:
+    if order.customer_country_code not in (None, "AE"):
+        from .cross_border_delivery_readiness import approved_readiness
+        approved_readiness(session, order)
     existing = session.scalar(select(OperationalDeliveryFulfillment).where(
         OperationalDeliveryFulfillment.sales_order_id == order.id))
     if existing:
@@ -192,6 +198,16 @@ def transition_delivery(session: Session, fulfillment: OperationalDeliveryFulfil
         raise ValueError(f"Action {action} is not allowed from {fulfillment.status}")
     if not note.strip():
         raise ValueError("A delivery workflow reason is required")
+    if fulfillment.sales_order.customer_country_code not in (None, "AE"):
+        from .cross_border_delivery_readiness import approved_readiness
+        if action in {"pick", "dispatch"}:
+            approved_readiness(session, fulfillment.sales_order)
+        if action == "dispatch":
+            from .cross_border_dispatch_release import consume_dispatch_release
+            consume_dispatch_release(session, fulfillment, actor=actor)
+    from .lot_traceability import close_delivery_lots, validate_delivery_lots
+    if action in {"pick", "dispatch"}:
+        validate_delivery_lots(session, fulfillment)
     reservations=list(session.scalars(select(OperationalDeliveryReservation).where(
         OperationalDeliveryReservation.fulfillment_id == fulfillment.id,
         OperationalDeliveryReservation.status == "active").with_for_update()))
@@ -224,6 +240,11 @@ def transition_delivery(session: Session, fulfillment: OperationalDeliveryFulfil
                 OperationalStockPosition.sku == reservation.sku).with_for_update())
             if not position or position.quantity_reserved < reservation.quantity_base or position.quantity_on_hand < reservation.quantity_base:
                 raise RuntimeError(f"Delivery stock ledger mismatch for {reservation.sku}")
+            # Cost is captured before physical issue; later receipts cannot reprice this dispatch.
+            issue_cost = Decimal(position.average_unit_cost)
+            if not issue_cost.is_finite() or issue_cost < 0:
+                raise RuntimeError(f"Delivery issue cost is invalid for {reservation.sku}")
+            issue_value = (Decimal(reservation.quantity_base) * issue_cost).quantize(MONEY, rounding=ROUND_HALF_UP)
             position.quantity_on_hand -= reservation.quantity_base
             position.quantity_reserved -= reservation.quantity_base
             position.revision += 1; position.updated_at=utc_now()
@@ -233,6 +254,7 @@ def transition_delivery(session: Session, fulfillment: OperationalDeliveryFulfil
                 fulfillment_id=fulfillment.id, fulfillment_line_id=line.id,
                 location_code=reservation.location_code, sku=reservation.sku,
                 quantity_base=reservation.quantity_base, movement_type="dispatch_issue",
+                unit_cost_snapshot=issue_cost, issue_value_snapshot=issue_value,
                 accounting_posting_enabled=False, occurred_at=fulfillment.dispatched_at, actor=actor))
     elif action == "deliver":
         if not (received_by or "").strip() or not (pod_reference or "").strip():
@@ -240,6 +262,8 @@ def transition_delivery(session: Session, fulfillment: OperationalDeliveryFulfil
         fulfillment.received_by=received_by.strip(); fulfillment.pod_reference=pod_reference.strip()
         fulfillment.pod_note=note.strip(); fulfillment.delivered_at=occurred_at or utc_now(); fulfillment.delivered_by=actor
         for line in fulfillment.lines: line.delivered_quantity_base=line.dispatched_quantity_base
+    if action in {"cancel", "dispatch"}:
+        close_delivery_lots(session, fulfillment, action)
     fulfillment.status=target; fulfillment.revision += 1
     fulfillment.state_changed_at=utc_now(); fulfillment.state_changed_by=actor
     _event(session, fulfillment, previous, target, actor, note)
@@ -258,6 +282,9 @@ def delivery_control_counts(session: Session) -> dict:
                 OperationalDeliveryReservation.status == "active")) or 0,
             "dispatched": session.scalar(select(func.count(OperationalDeliveryFulfillment.id)).where(
                 OperationalDeliveryFulfillment.status == "dispatched")) or 0,
-            "invoice_eligible": session.scalar(select(func.count(OperationalDeliveryFulfillment.id)).where(
-                OperationalDeliveryFulfillment.status == "delivered")) or 0,
+            "invoice_eligible": session.scalar(select(func.count(OperationalDeliveryFulfillment.id)).join(
+                OperationalSalesOrder, OperationalSalesOrder.id == OperationalDeliveryFulfillment.sales_order_id).where(
+                OperationalDeliveryFulfillment.status == "delivered",
+                (OperationalSalesOrder.customer_country_code.is_(None) |
+                 (OperationalSalesOrder.customer_country_code == "AE")))) or 0,
             "accounting_posting_enabled": False}

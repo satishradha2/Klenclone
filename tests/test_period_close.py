@@ -9,6 +9,7 @@ from klen_clone.period_close import (
     create_close_adjustment, create_period_close, decide_close_adjustment,
     period_close_payload, rehearse_period_close, transition_period_close,
 )
+from klen_clone.posting_integration import OperationalIntegratedJournalLine, OperationalIntegratedPostingBatch
 
 
 def session_value():
@@ -72,3 +73,28 @@ def test_close_submission_blocks_pending_adjustment_and_requires_warning_note():
     payload = period_close_payload(session, close)
     assert any(item["control"] == "vat_return_approved" and item["status"] == "warning"
                for item in payload["checklist"])
+
+
+def test_close_blocks_unbalanced_integrated_journal_in_its_fiscal_period():
+    session = session_value()
+    close = create_period_close(session, fiscal_period_key="2026-09", actor="maker")
+    for index, period_key in enumerate(("2026-09", "2026-10"), start=1):
+        batch = OperationalIntegratedPostingBatch(
+            batch_key=f"test-batch-{index}", idempotency_key=f"close-test-{index}",
+            resource_type="customer_refund_recovery", resource_key=f"test-recovery-{index}",
+            resource_revision=2, posting_sequence=1, batch_kind="posting",
+            posting_fingerprint=f"test-fingerprint-{index}", fiscal_period_key=period_key,
+            status="posted", posted_by="test")
+        session.add(batch)
+        session.flush()
+        session.add(OperationalIntegratedJournalLine(batch_id=batch.id, line_no=1,
+            account_code="1110", debit=Decimal("2.00"), credit=Decimal("0.00")))
+    session.commit()
+    payload = period_close_payload(session, close)
+    assert payload["snapshot"]["integrated_journal_batches"] == 1
+    assert payload["snapshot"]["permanent_journal_batches"] == 1
+    balance = next(item for item in payload["checklist"] if item["control"] == "permanent_journal_balance")
+    assert balance["status"] == "block" and "AED 2.00" in balance["detail"]
+    with pytest.raises(ValueError, match="Blocking close controls"):
+        transition_period_close(session, close, action="submit", expected_revision=1,
+            actor="maker", note="Isolated integrated journal test")

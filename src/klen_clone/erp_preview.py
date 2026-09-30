@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -41,10 +42,11 @@ from .operational import (
     OperationalFinancialMigrationException, OperationalOpeningPartyBalance,
     OperationalPostingProbe, OperationalReversalRequest, OperationalStockPosition,
     OperationalStockReservation, OperationalSubledgerEntry,
-    calculate_line, create_draft, initialize_operational_database, list_drafts,
+    MONEY, calculate_line, create_draft, initialize_operational_database, list_drafts,
     make_operational_engine, operational_session_factory, execute_posting, execute_reversal,
     rehearse_posting, replace_draft, transition_draft,
 )
+from .operational_migrations import verify_operational_database
 from .inventory_operations import (
     OperationalInventoryDocument,
     create_inventory_document,
@@ -65,6 +67,15 @@ from .warehouse_controls import (
     transition_product_recall, transition_serial, transition_warehouse_task,
     warehouse_control_payload,
 )
+from .product_creation import (
+    ProductEditor, ProductChangeRequest, OperationalProductDetails,
+    barcode_taken, change_payload, decide_product, duplicate_key as product_duplicate_key,
+    generate_barcode as generate_product_barcode, product_record, propose_product,
+    propose_product_status,
+)
+from .product_taxonomy import (
+    active_product_taxonomy, create_product_taxonomy_value,
+)
 from .approval_workspace import approval_workspace_payload
 from .goods_receipts import (
     OperationalGoodsReceipt,
@@ -81,10 +92,12 @@ from .data_reviews import (
     transaction_review_findings, transition_review,
 )
 from .sales_returns import (
-    OperationalSalesReturn, OperationalSalesReturnPostingRehearsal,
+    OperationalSalesReturn, OperationalSalesReturnLine, OperationalSalesReturnPostingRehearsal,
     _sales_return_rehearsal_payload, create_sales_return, list_sales_returns,
     rehearse_sales_return_posting, replace_sales_return,
-    sales_return_control_counts, transition_sales_return,
+    sales_return_control_counts, target_invoice_dispatch_movement,
+    target_invoice_evidence_hash, target_return_credit,
+    transition_sales_return,
 )
 from .sales_invoices import (
     OperationalSalesInvoicePostingRehearsal,
@@ -108,6 +121,9 @@ from .customer_invoices import (
     customer_invoice_rehearsal_payload, list_customer_invoices,
     rehearse_customer_invoice, transition_customer_invoice,
 )
+from .lot_traceability import (
+    OperationalReceiptLot, assign_delivery_lot, delivery_lot_payload, trace_lot,
+)
 from .purchase_returns import (
     OperationalPurchaseReturn, OperationalPurchaseReturnPostingRehearsal,
     create_purchase_return, list_purchase_returns,
@@ -122,12 +138,22 @@ from .payments import (
     list_payments, payment_control_counts, rehearse_payment_posting,
     payment_rehearsal_payload, replace_payment, transition_payment,
 )
+from .customer_refunds import (OperationalCustomerRefund, OperationalCustomerRefundRecovery,
+    create_recovery, create_refund, recovery_available, recovery_posting_plan,
+    refund_available, refund_posting_plan, transition_recovery, transition_refund)
+from .customer_price_credits import (OperationalCustomerPriceCredit,
+    create_price_credit, transition_price_credit, price_credit_posting_plan)
 from .cash_management import (
     OperationalCashAccount, OperationalStatementBatch, OperationalStatementLine,
     cash_account_payload, cash_management_payload, create_cash_account,
     create_statement_batch, decide_cash_account, explain_statement_line,
-    match_statement_line, rehearse_reconciliation, statement_payload,
+    match_recovery_statement_line, match_refund_statement_line, match_statement_line,
+    rehearse_reconciliation, statement_payload,
     transition_statement_batch,
+)
+from .fx_controls import (
+    OperationalFxRate, approved_fx_rate, decide_fx_rate, foreign_invoice_fx_exposure,
+    fx_rate_payload, prepare_fx_rate,
 )
 from .expense_management import (
     OperationalExpenseClaim, OperationalPettyCashAdvance,
@@ -153,7 +179,7 @@ from .period_close import (
     rehearse_period_close, transition_period_close,
 )
 from .close_reporting import (
-    OperationalFinancialReportPackage, generate_report_package, pdf_bytes,
+    OperationalFinancialReportPackage, assert_report_package_current, generate_report_package, pdf_bytes,
     report_package_payload, reporting_workspace_payload, transition_report_package,
     workbook_bytes,
 )
@@ -183,6 +209,28 @@ from .commercial_pricing import (
     OperationalPriceListItem, OperationalPromotion, approve_price_list, approve_promotion,
     assign_customer_price_group, create_customer_price_group, create_price_list, create_promotion,
 )
+from .quote_trade_controls import (
+    OperationalQuoteTradeDecision, prepare_trade_decision, decide_trade_decision,
+    trade_decision_payload,
+)
+from .cross_border_order_controls import (
+    OperationalCrossBorderOrderRelease, prepare_order_release, decide_order_release,
+    order_release_payload,
+)
+from .cross_border_delivery_readiness import (
+    OperationalCrossBorderDeliveryReadiness, prepare_readiness, decide_readiness,
+    readiness_payload,
+)
+from .cross_border_dispatch_release import (
+    OperationalCrossBorderDispatchRelease, prepare_dispatch_release,
+    decide_dispatch_release, dispatch_release_payload,
+)
+from .cross_border_invoice_tax import (
+    OperationalExportTaxDecision, OperationalExportEvidenceDocument,
+    OperationalExportTaxInvoiceUse, prepare_export_tax_decision,
+    decide_export_tax_decision, approved_export_tax_decision,
+    tax_decision_payload,
+)
 from .credit_management import (
     OperationalCollectionAction, OperationalCreditLimitRequest,
     OperationalCreditOverrideRequest, OperationalCustomerCreditProfile,
@@ -211,6 +259,12 @@ from .posting_integration import (
 from .provisioned_users import load_provisioned_users
 from .security_runtime import PersistentSessionStore, production_security_settings, validate_production_security
 from .operational_masters import OperationalLocationMaster, OperationalPartyMaster, OperationalProductMaster
+from .party_creation import (
+    OperationalPartyCreationRequest, decide_party, party_request_payload, propose_party,
+)
+from .country_catalog import (QUOTATION_CURRENCY_MINOR_UNITS, country_catalog,
+    country_code as normalize_country_code, currency_code as normalize_currency_code,
+    market_scope, quotation_money_quantum)
 from .enterprise_setup import (
     add_branch, add_van, add_warehouse, enterprise_setup_payload,
     initialize_enterprise_setup, transition_operating_unit, update_company_profile,
@@ -222,6 +276,10 @@ from .finance_foundation import (
 from .finance_reconciliation import (
     decide_reconciliation_review, finance_reconciliation_payload,
     initialize_finance_reconciliation, request_reconciliation_review,
+)
+from .opening_ledger import (
+    OperationalOpeningLedgerPackage, create_opening_package, opening_package_payload,
+    transition_opening_package,
 )
 from .finance_ledger import (
     OperationalGeneralJournal, create_general_journal, general_ledger_payload,
@@ -295,6 +353,31 @@ def baseline_review_evidence(session: Session, snapshot: SourceSnapshot, entity_
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=200)
     password: str = Field(min_length=1, max_length=500)
+
+
+class ProductChangeInput(BaseModel):
+    product: ProductEditor
+    expected_revision: int | None = Field(default=None, ge=1)
+
+
+class ProductTaxonomyInput(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+
+class ProductBarcodeInput(BaseModel):
+    sku: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=250)
+    pack_level: str = Field(default="base", pattern="^(base|transaction|inner|outer|pallet)$")
+    uom: str = Field(default="", max_length=80)
+    factor_to_base: Decimal = Field(default=Decimal("1"), gt=0)
+
+
+class ProductDecisionInput(BaseModel):
+    note: str = Field(min_length=5, max_length=1000)
+
+
+class ProductStatusInput(ProductDecisionInput):
+    expected_revision: int = Field(ge=1)
 
 
 class CompanyProfileSetupRequest(BaseModel):
@@ -562,6 +645,34 @@ class FinanceReconciliationDecisionRequest(BaseModel):
     note: str = Field(min_length=5, max_length=2000)
 
 
+class OpeningLedgerLineRequest(BaseModel):
+    account_code: str = Field(min_length=1, max_length=40)
+    debit: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+    credit: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+
+
+class OpeningPartyControlRequest(BaseModel):
+    balance_type: str = Field(pattern="^(receivable|payable|supplier_advance|customer_advance)$")
+    party_code: str = Field(min_length=1, max_length=80)
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+
+
+class OpeningLedgerRequest(BaseModel):
+    cutoff_date: date
+    source_reference: str = Field(min_length=1, max_length=500)
+    source_sha256: str = Field(min_length=64, max_length=64)
+    source_atomic: bool = False
+    stock_evidence_reference: str = Field(min_length=1, max_length=500)
+    stock_value: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    lines: list[OpeningLedgerLineRequest] = Field(min_length=2, max_length=500)
+    party_balances: list[OpeningPartyControlRequest] = Field(default_factory=list, max_length=100000)
+
+
+class OpeningLedgerTransitionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(default="", max_length=2000)
+
+
 class GeneralJournalLineRequest(BaseModel):
     account_code: str = Field(min_length=1, max_length=40)
     description: str | None = Field(default=None, max_length=500)
@@ -617,7 +728,9 @@ class SalesQuotationRequest(BaseModel):
     location_code: str = Field(min_length=1, max_length=80)
     quotation_date: date
     valid_until: date
-    discount_amount: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+    currency_code: str = Field(default="AED", min_length=3, max_length=3)
+    trade_decision_key: str | None = Field(default=None, max_length=36)
+    discount_amount: Decimal = Field(default=Decimal("0"), ge=0, max_digits=19, decimal_places=3)
     payment_terms: str | None = Field(default=None, max_length=500)
     delivery_terms: str | None = Field(default=None, max_length=500)
     notes: str | None = Field(default=None, max_length=2000)
@@ -642,10 +755,40 @@ class PriceListItemRequest(BaseModel):
 class PriceListRequest(BaseModel):
     name: str = Field(min_length=2, max_length=200)
     customer_group: str = Field(min_length=1, max_length=80)
+    currency_code: str = Field(default="AED", min_length=3, max_length=3)
     effective_from: date
     effective_to: date | None = None
     max_discount_percent: Decimal = Field(ge=0, le=100, max_digits=7, decimal_places=2)
     items: list[PriceListItemRequest] = Field(min_length=1, max_length=1000)
+
+
+class TradeQuoteTaxRateRequest(BaseModel):
+    sku: str = Field(min_length=1, max_length=100)
+    tax_rate: Decimal = Field(ge=0, le=100, max_digits=7, decimal_places=4)
+
+
+class TradeQuoteDecisionRequest(BaseModel):
+    customer_code: str = Field(min_length=1, max_length=80)
+    currency_code: str = Field(min_length=3, max_length=3)
+    quotation_date: date
+    line_tax_rates: list[TradeQuoteTaxRateRequest] = Field(min_length=1, max_length=100)
+    provisional_tax_basis: str = Field(min_length=10, max_length=2000)
+    trade_terms: str = Field(min_length=2, max_length=300)
+    evidence_reference: str = Field(min_length=2, max_length=500)
+
+
+class TradeQuoteDecisionActionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class CrossBorderOrderReleaseRequest(BaseModel):
+    quotation_key: str = Field(min_length=1, max_length=36)
+    expected_revision: int = Field(ge=1)
+    order_tax_review_basis: str = Field(min_length=5, max_length=2000)
+    fulfillment_evidence_required: str = Field(min_length=5, max_length=2000)
+    evidence_reference: str = Field(min_length=5, max_length=500)
+    valid_until: date
 
 
 class PromotionRequest(BaseModel):
@@ -768,6 +911,29 @@ class DeliveryAllocationRequest(BaseModel):
     note: str = Field(min_length=5, max_length=2000)
 
 
+class DeliveryReadinessRequest(BaseModel):
+    order_key: str = Field(min_length=1, max_length=36)
+    transport_plan: str = Field(min_length=5, max_length=2000)
+    customs_evidence_plan: str = Field(min_length=5, max_length=2000)
+    evidence_reference: str = Field(min_length=5, max_length=500)
+    valid_until: date
+
+
+class CrossBorderDispatchReleaseRequest(BaseModel):
+    fulfillment_key: str = Field(min_length=1, max_length=36)
+    carrier_name: str = Field(min_length=5, max_length=200)
+    transport_reference: str = Field(min_length=5, max_length=500)
+    packing_list_reference: str = Field(min_length=5, max_length=500)
+    customs_declaration_reference: str = Field(min_length=5, max_length=500)
+    destination_consignment_reference: str = Field(min_length=5, max_length=500)
+    valid_until: date
+
+
+class DeliveryLotAssignmentRequest(BaseModel):
+    lot_key: str = Field(min_length=36, max_length=36)
+    quantity_base: Decimal = Field(ge=0, max_digits=18, decimal_places=6)
+
+
 class DeliveryActionRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     note: str = Field(min_length=5, max_length=2000)
@@ -789,6 +955,26 @@ class CustomerInvoiceCreateRequest(BaseModel):
     invoice_date: date
     due_date: date
     notes: str | None = Field(default=None, max_length=2000)
+
+
+class ExportEvidenceUpload(BaseModel):
+    kind: str = Field(min_length=3, max_length=32)
+    filename: str = Field(min_length=1, max_length=200)
+    content_type: str = Field(min_length=3, max_length=40)
+    content_base64: str = Field(min_length=1, max_length=2800000)
+
+
+class ExportTaxReviewRequest(BaseModel):
+    fulfillment_key: str = Field(min_length=1, max_length=36)
+    tax_treatment: str = Field(pattern="^(zero_rated|standard_rated)$")
+    tax_basis: str = Field(min_length=20, max_length=2000)
+    valid_until: date
+    documents: list[ExportEvidenceUpload] = Field(min_length=1, max_length=5)
+
+
+class ExportTaxDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=20, max_length=2000)
 
 
 class PostingExecutionRequest(BaseModel):
@@ -972,6 +1158,35 @@ class PaymentRequest(BaseModel):
     allocations: list[PaymentAllocationRequest] = Field(default_factory=list, max_length=100)
 
 
+class CustomerRefundRequest(BaseModel):
+    return_key: str | None = Field(default=None, min_length=1, max_length=36)
+    price_credit_key: str | None = Field(default=None, min_length=1, max_length=36)
+    cash_account_code: str = Field(min_length=1, max_length=80)
+    refund_date: date
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+    notes: str | None = Field(default=None, max_length=2000)
+
+
+class CustomerPriceCreditRequest(BaseModel):
+    invoice_key: str = Field(min_length=1, max_length=36)
+    line_no: int = Field(ge=1)
+    credit_date: date
+    quantity: Decimal = Field(gt=0, max_digits=18, decimal_places=6)
+    corrected_unit_net: Decimal = Field(ge=0, max_digits=18, decimal_places=4)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class CustomerRefundRecoveryRequest(BaseModel):
+    refund_key: str = Field(min_length=1, max_length=36)
+    recovery_date: date
+    amount: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class RecoveryStatementMatchRequest(BaseModel):
+    recovery_key: str = Field(min_length=1, max_length=36)
+
+
 class CashAccountRequest(BaseModel):
     account_code: str = Field(min_length=1, max_length=80)
     account_name: str = Field(min_length=1, max_length=200)
@@ -984,6 +1199,20 @@ class CashAccountRequest(BaseModel):
 
 
 class CashDecisionRequest(BaseModel):
+    expected_revision: int = Field(ge=1)
+    note: str = Field(min_length=5, max_length=2000)
+
+
+class FxRateRequest(BaseModel):
+    currency_code: str = Field(min_length=3, max_length=3)
+    rate_date: date
+    aed_per_unit: Decimal = Field(gt=0, max_digits=20, decimal_places=8)
+    source_name: str = Field(min_length=1, max_length=160)
+    source_reference: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+class FxRateDecisionRequest(BaseModel):
     expected_revision: int = Field(ge=1)
     note: str = Field(min_length=5, max_length=2000)
 
@@ -1011,6 +1240,10 @@ class StatementBatchRequest(BaseModel):
 
 class StatementMatchRequest(BaseModel):
     payment_key: str = Field(min_length=1, max_length=36)
+
+
+class RefundStatementMatchRequest(BaseModel):
+    refund_key: str = Field(min_length=1, max_length=36)
 
 
 class StatementExceptionRequest(BaseModel):
@@ -1201,6 +1434,29 @@ class PartyMasterUpdateRequest(BaseModel):
     mobile: str | None = Field(default=None, max_length=120)
     address: str | None = Field(default=None, max_length=2000)
     tax_number: str | None = Field(default=None, max_length=120)
+    country_code: str | None = Field(default=None, min_length=2, max_length=2)
+    preferred_currency_code: str | None = Field(default=None, min_length=3, max_length=3)
+    tax_registration_type: str | None = Field(default=None, pattern="^(vat|gst|other)$")
+    tax_country_code: str | None = Field(default=None, min_length=2, max_length=2)
+
+
+class PartyCreateRequest(BaseModel):
+    party_code: str = Field(min_length=2, max_length=80)
+    party_kind: str = Field(pattern="^(customer|supplier)$")
+    legal_or_business_name: str = Field(min_length=1, max_length=500)
+    contact_name: str | None = Field(default=None, max_length=300)
+    email: str | None = Field(default=None, max_length=320)
+    mobile: str | None = Field(default=None, max_length=120)
+    address: str | None = Field(default=None, max_length=2000)
+    tax_number: str | None = Field(default=None, max_length=120)
+    country_code: str = Field(min_length=2, max_length=2)
+    preferred_currency_code: str = Field(min_length=3, max_length=3)
+    tax_registration_type: str | None = Field(default=None, pattern="^(vat|gst|other)$")
+    tax_country_code: str | None = Field(default=None, min_length=2, max_length=2)
+
+
+class PartyDecisionRequest(BaseModel):
+    note: str = Field(min_length=5, max_length=500)
 
 
 class MasterStatusRequest(BaseModel):
@@ -1228,9 +1484,11 @@ NAVIGATION_PERMISSION_RULES: dict[str, frozenset[str]] = {
     "crm": frozenset({"crm.read"}),
     "pos": frozenset({"pos.read"}),
     "van-sales": frozenset({"van.read"}),
-    "sales-orders": frozenset({"draft.create", "draft.approve", "price_list.manage", "discount.approve"}),
-    "deliveries": frozenset({"delivery.allocate", "delivery.pick", "delivery.dispatch", "delivery.pod", "delivery.cancel", "inventory.create", "inventory.edit", "inventory.submit", "inventory.approve", "inventory.cancel"}),
-    "customer-invoices": frozenset({"customer_invoice.create", "customer_invoice.submit", "customer_invoice.approve", "customer_invoice.rehearse", "draft.create", "draft.approve"}),
+    "sales-orders": frozenset({"draft.create", "draft.approve", "price_list.manage", "discount.approve",
+                                "trade.quote.prepare", "trade.quote.approve",
+                                "trade.order.prepare", "trade.order.approve"}),
+    "deliveries": frozenset({"delivery.allocate", "delivery.pick", "delivery.dispatch", "delivery.pod", "delivery.cancel", "inventory.create", "inventory.edit", "inventory.submit", "inventory.approve", "inventory.cancel", "trade.delivery.prepare", "trade.delivery.approve", "trade.dispatch.prepare", "trade.dispatch.approve"}),
+    "customer-invoices": frozenset({"customer_invoice.create", "customer_invoice.submit", "customer_invoice.approve", "customer_invoice.rehearse", "export_tax.prepare", "export_tax.approve", "draft.create", "draft.approve"}),
     "procurement": frozenset({"purchase.requisition.create", "purchase.requisition.approve", "rfq.create", "supplier_quote.manage", "purchase_order.prepare", "purchase_order.approve", "supplier_bill.prepare", "supplier_bill.approve", "supplier_bill.tolerance.approve", "supplier_bill.rehearse", "supplier_adjustment.prepare", "supplier_adjustment.approve", "match_tolerance.prepare", "match_tolerance.approve", "enterprise.setup"}),
     "drafts": frozenset({"draft.create", "draft.edit", "draft.submit", "draft.approve", "draft.cancel", "draft.rehearse"}),
     "inventory-operations": frozenset({"inventory.create", "inventory.edit", "inventory.submit", "inventory.approve", "inventory.cancel", "inventory.rehearse"}),
@@ -1239,7 +1497,7 @@ NAVIGATION_PERMISSION_RULES: dict[str, frozenset[str]] = {
     "sales-returns": frozenset({"sales_return.create", "sales_return.edit", "sales_return.submit", "sales_return.approve", "sales_return.cancel", "sales_return.rehearse"}),
     "purchase-returns": frozenset({"purchase_return.create", "purchase_return.edit", "purchase_return.submit", "purchase_return.approve", "purchase_return.cancel", "purchase_return.rehearse"}),
     "payments": frozenset({"payment.prepare", "payment.create", "payment.edit", "payment.submit", "payment.approve", "payment.cancel", "payment.rehearse"}),
-    "cash-management": frozenset({"cash.account.prepare", "cash.account.approve", "bank.statement.import", "bank.reconcile.prepare", "bank.reconcile.approve", "bank.reconcile.rehearse"}),
+    "cash-management": frozenset({"cash.account.prepare", "cash.account.approve", "bank.statement.import", "bank.reconcile.prepare", "bank.reconcile.approve", "bank.reconcile.rehearse", "fx.rate.read"}),
     "expenses": frozenset({"expense.prepare", "expense.submit", "expense.approve", "expense.rehearse", "petty_cash.prepare", "petty_cash.approve", "petty_cash.manage"}),
     "fixed-assets": frozenset({"fixed_asset.prepare", "fixed_asset.submit", "fixed_asset.approve", "fixed_asset.disposal.prepare", "fixed_asset.disposal.approve", "fixed_asset.rehearse"}),
     "vat-control": frozenset({"vat.period.prepare", "vat.period.submit", "vat.period.approve", "vat.adjustment.prepare", "vat.adjustment.approve", "vat.rehearse"}),
@@ -1306,7 +1564,10 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     app.state.operational_engine = make_operational_engine(operational_url) if operational_url else None
     app.state.operational_sessions = operational_session_factory(app.state.operational_engine) if operational_url else None
     if app.state.operational_engine:
-        initialize_operational_database(app.state.operational_engine)
+        if app.state.production_mode:
+            verify_operational_database(app.state.operational_engine)
+        else:
+            initialize_operational_database(app.state.operational_engine)
         with app.state.operational_sessions() as operational_session:
             initialize_enterprise_setup(operational_session)
             initialize_finance_foundation(operational_session)
@@ -1435,7 +1696,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 and request.url.scheme != "https"):
             return secure_response(RedirectResponse(str(request.url.replace(scheme="https")), status_code=307), request_id)
         content_length = request.headers.get("content-length")
-        if content_length and content_length.isdigit() and int(content_length) > 2 * 1024 * 1024:
+        request_limit = 16 * 1024 * 1024 if request.url.path == "/api/v1/customer-invoices/export-tax-reviews" else 2 * 1024 * 1024
+        if content_length and content_length.isdigit() and int(content_length) > request_limit:
             return secure_response(JSONResponse(status_code=413, content={"detail": "Request body is too large"}), request_id)
         auth_posts = {"/api/v1/auth/login", "/api/v1/auth/logout"}
         operational_mutation = (request.url.path.startswith("/api/v1/drafts")
@@ -1444,8 +1706,15 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                                 or request.url.path.startswith("/api/v1/warehouse-controls")
                                 or request.url.path.startswith("/api/v1/goods-receipts")
                                 or request.url.path.startswith("/api/v1/sales-returns")
+                                or request.url.path.startswith("/api/v1/customer-price-credits")
+                                or request.url.path.startswith("/api/v1/customer-price-credit-posting-plans")
+                                or request.url.path.startswith("/api/v1/customer-refunds")
+                                or request.url.path.startswith("/api/v1/customer-refund-posting-plans")
+                                or request.url.path.startswith("/api/v1/customer-refund-recoveries")
+                                or request.url.path.startswith("/api/v1/customer-refund-recovery-posting-plans")
                                 or request.url.path.startswith("/api/v1/sales-orders")
                                 or request.url.path.startswith("/api/v1/commercial-pricing")
+                                or request.url.path.startswith("/api/v1/product-editor")
                                 or request.url.path.startswith("/api/v1/deliveries")
                                 or request.url.path.startswith("/api/v1/customer-invoices")
                                 or request.url.path.startswith("/api/v1/pos")
@@ -1469,6 +1738,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                                 or request.url.path.startswith("/api/v1/setup/enterprise")
                                 or request.url.path.startswith("/api/v1/finance/approvals")
                                 or request.url.path.startswith("/api/v1/finance/reconciliation")
+                                or request.url.path.startswith("/api/v1/finance/opening-ledger")
+                                or request.url.path.startswith("/api/v1/finance/fx-rates")
                                 or request.url.path.startswith("/api/v1/general-ledger")
                                 or request.url.path.startswith("/api/v1/access-control")
                                 or request.url.path.startswith("/api/v1/hrm/")
@@ -1659,6 +1930,58 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         require_finance_report_scope(request, snapshot, session,
                                      NAVIGATION_PERMISSION_RULES["accounting"] | {"financial_report.read"})
         return finance_reconciliation_payload(operational_session)
+
+    @app.get("/api/v1/finance/opening-ledger")
+    def list_opening_ledger(request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        require_user(request, "opening_balance.read")
+        rows = operational_session.scalars(select(OperationalOpeningLedgerPackage).where(
+            OperationalOpeningLedgerPackage.company_code == "ASAS").order_by(
+            OperationalOpeningLedgerPackage.id.desc())).all()
+        chart = operational_session.scalars(select(OperationalChartAccount).where(
+            OperationalChartAccount.company_code == "ASAS",
+            OperationalChartAccount.status == "active",
+            OperationalChartAccount.is_postable.is_(True)).order_by(
+            OperationalChartAccount.account_code)).all()
+        return {"items": [opening_package_payload(row) for row in rows],
+                "active_accounts": [{"code": row.account_code, "name": row.name} for row in chart],
+                "posting_enabled": False, "opening_balances_certified": False}
+
+    @app.post("/api/v1/finance/opening-ledger")
+    def add_opening_ledger(payload: OpeningLedgerRequest, request: Request,
+                           operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "opening_balance.prepare")
+        try:
+            row = create_opening_package(operational_session, actor=user.username,
+                cutoff_date=payload.cutoff_date, source_reference=payload.source_reference,
+                source_sha256=payload.source_sha256, source_atomic=payload.source_atomic,
+                lines=[line.model_dump() for line in payload.lines],
+                party_balances=[item.model_dump() for item in payload.party_balances],
+                stock_value=payload.stock_value,
+                stock_evidence_reference=payload.stock_evidence_reference)
+            return opening_package_payload(row)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/finance/opening-ledger/{package_key}/{action}")
+    def change_opening_ledger(package_key: str, action: str, payload: OpeningLedgerTransitionRequest,
+                              request: Request, operational_session=Depends(operational_session_dependency)):
+        if action not in {"submit", "approve", "reject"}:
+            raise HTTPException(status_code=422, detail="Unsupported opening-package action")
+        user = require_csrf(request, "opening_balance.prepare" if action == "submit" else "opening_balance.approve")
+        try:
+            row = transition_opening_package(operational_session, key=package_key,
+                action=action, actor=user.username, expected_revision=payload.expected_revision,
+                note=payload.note)
+            return opening_package_payload(row)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/v1/finance/reconciliation/{review_key}/request")
     def submit_finance_reconciliation(
@@ -2529,16 +2852,22 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     @app.get("/api/v1/selectors/parties")
     def party_selector(kind: str = Query(pattern="^(customer|supplier)$"), q: str = Query("", max_length=120),
                        limit: int = Query(30, ge=1, le=500),
+                       include_foreign: bool = False,
                        snapshot: SourceSnapshot = Depends(snapshot_dependency), session: Session = Depends(session_dependency),
                        operational_session=Depends(optional_operational_session_dependency)):
         if operational_session is not None and operational_session.scalar(select(func.count(OperationalPartyMaster.id))):
             filters = [OperationalPartyMaster.status == "active", OperationalPartyMaster.party_kind.in_((kind, "both"))]
+            if not include_foreign or kind != "customer":
+                filters.append(or_(OperationalPartyMaster.country_code == "AE", OperationalPartyMaster.country_code.is_(None)))
             if q:
                 pattern = f"%{q.strip()}%"
                 filters.append(or_(OperationalPartyMaster.party_code.ilike(pattern), OperationalPartyMaster.legal_or_business_name.ilike(pattern)))
             rows = [dict(row._mapping) for row in operational_session.execute(select(
-                OperationalPartyMaster.party_code, OperationalPartyMaster.legal_or_business_name.label("name")
+                OperationalPartyMaster.party_code, OperationalPartyMaster.legal_or_business_name.label("name"),
+                OperationalPartyMaster.country_code, OperationalPartyMaster.preferred_currency_code,
             ).where(*filters).order_by(OperationalPartyMaster.legal_or_business_name).limit(limit)).all()]
+            for row in rows:
+                row["market_scope"] = market_scope(row["country_code"])
             return {"items": rows}
         filters = [ErpParty.snapshot_id == snapshot.id, ErpParty.party_kind.in_((kind, "both"))]
         if q:
@@ -2598,9 +2927,11 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         return {"items": rows}
 
     @app.get("/api/v1/selectors/sales-invoices")
-    def sales_invoice_selector(customer_code: str = Query(min_length=1, max_length=80),
+    def sales_invoice_selector(request: Request,
+                               customer_code: str = Query(min_length=1, max_length=80),
                                snapshot: SourceSnapshot = Depends(snapshot_dependency),
-                               session: Session = Depends(session_dependency)):
+                               session: Session = Depends(session_dependency),
+                               operational_session: Session = Depends(operational_session_dependency)):
         rows = session.execute(select(ErpTransactionDocument.document_no,
                                       ErpTransactionDocument.occurred_at,
                                       ErpTransactionDocument.total_amount).join(
@@ -2609,7 +2940,37 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             ErpTransactionDocument.source_kind == "sale",
             ErpParty.party_code == customer_code).order_by(
             ErpTransactionDocument.occurred_at.desc()).limit(30)).all()
-        return {"items": [dict(row._mapping) for row in rows]}
+        items = [{**dict(row._mapping), "source_origin": "bizmodo_clone"} for row in rows]
+        user = current_user(request)
+        target = operational_session.scalars(select(OperationalCustomerInvoice).where(
+            OperationalCustomerInvoice.customer_code == customer_code,
+            OperationalCustomerInvoice.status.in_(("approved", "posted"))).order_by(
+                OperationalCustomerInvoice.invoice_date.desc()).limit(30)).all()
+        for invoice in target:
+            if not user or not location_allowed(user, invoice.location_code):
+                continue
+            available_lines = []
+            for line in invoice.lines:
+                reserved = operational_session.scalar(select(func.coalesce(func.sum(
+                    OperationalSalesReturnLine.quantity), 0)).join(OperationalSalesReturn).where(
+                        OperationalSalesReturn.original_invoice_target_key == invoice.invoice_key,
+                        OperationalSalesReturn.status.in_(("submitted", "approved", "posted")),
+                        OperationalSalesReturnLine.sku == line.sku)) or Decimal("0")
+                available = max(Decimal("0"), line.quantity - reserved)
+                if available > 0:
+                    issue = operational_session.scalar(select(OperationalDeliveryStockMovement).where(
+                        OperationalDeliveryStockMovement.fulfillment_line_id == line.delivery_line_id))
+                    available_lines.append({"sku": line.sku, "uom": line.uom,
+                        "quantity": available, "unit_price": line.unit_price,
+                        "tax_rate": line.tax_rate,
+                        "unit_cost_snapshot": (issue.unit_cost_snapshot if issue else None)})
+            if available_lines:
+                items.append({"document_no": invoice.invoice_no, "occurred_at": invoice.invoice_date,
+                              "total_amount": invoice.total_amount, "location_code": invoice.location_code,
+                              "source_origin": "target_erp",
+                              "lines": available_lines})
+        items.sort(key=lambda row: str(row["occurred_at"] or ""), reverse=True)
+        return {"items": items[:60]}
 
     @app.get("/api/v1/selectors/purchase-invoices")
     def purchase_invoice_selector(supplier_code: str = Query(min_length=1, max_length=80),
@@ -2660,7 +3021,9 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     def operational_masters_present(operational_session: Session, model) -> bool:
         return bool(operational_session.scalar(select(func.count(model.id))))
 
-    def prepare_draft(payload: DraftRequest, session: Session, operational_session: Session, user):
+    def prepare_draft(payload: DraftRequest, session: Session, operational_session: Session, user,
+                      *, allow_foreign_customer_quote: bool = False,
+                      money_quantum: Decimal = MONEY):
         snapshot = session.scalar(select(SourceSnapshot).where(SourceSnapshot.name == selected_snapshot))
         if operational_masters_present(operational_session, OperationalLocationMaster):
             location_record = operational_session.scalar(select(OperationalLocationMaster).where(or_(
@@ -2685,6 +3048,9 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 OperationalPartyMaster.party_kind.in_((expected_kind, "both"))))
             if party_record and party_record.status != "active":
                 raise HTTPException(status_code=422, detail=f"{expected_kind.title()} is inactive in the operational master")
+            if (party_record and party_record.country_code not in (None, "AE")
+                    and not (allow_foreign_customer_quote and expected_kind == "customer")):
+                raise HTTPException(status_code=422, detail="Cross-border transactions are held until tax, FX and trade controls are configured")
             party = ((party_record.party_code, party_record.legal_or_business_name) if party_record else None)
         else:
             party = session.execute(select(ErpParty.party_code, ErpParty.legal_or_business_name).where(
@@ -2743,7 +3109,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 canonical_uom = governed_conversion.canonical_uom
             default_price = product[3] if payload.document_type == "sale" else product[2]
             price = item.unit_price if item.unit_price is not None else Decimal(str(default_price or "0"))
-            net, tax, gross = calculate_line(item.quantity, price, item.tax_rate)
+            net, tax, gross = calculate_line(item.quantity, price, item.tax_rate, money_quantum)
             unit_cost = Decimal(str(product[2])) if product[2] is not None else None
             cost_amount = ((item.quantity * factor * unit_cost).quantize(
                 Decimal("0.01"), rounding=ROUND_HALF_UP)
@@ -2862,9 +3228,10 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             if draft.document_type == "sale":
                 return execute_integrated_posting(operational_session, resource_type="sales_invoice",
                     resource_key=draft.draft_key, actor=user.username,
-                    idempotency_key=payload.idempotency_key)
+                    idempotency_key=payload.idempotency_key, enforce_approved_gl=True)
             return execute_posting(operational_session, draft, actor=user.username,
-                                   idempotency_key=payload.idempotency_key)
+                                   idempotency_key=payload.idempotency_key,
+                                   enforce_approved_gl=True)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -3105,6 +3472,27 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         user = require_any_user(request, NAVIGATION_PERMISSION_RULES["warehouse-controls"])
         return warehouse_control_payload(operational_session, allowed_locations=user.allowed_locations)
 
+    @app.get("/api/v1/warehouse-controls/lots")
+    def warehouse_lots(request: Request, sku: str | None = None,
+                       operational_session=Depends(operational_session_dependency)):
+        user = require_any_user(request, NAVIGATION_PERMISSION_RULES["warehouse-controls"])
+        query = select(OperationalReceiptLot)
+        if sku:
+            query = query.where(OperationalReceiptLot.sku == sku)
+        if "*" not in user.allowed_locations:
+            query = query.where(OperationalReceiptLot.location_code.in_(user.allowed_locations))
+        lots = operational_session.scalars(query.order_by(OperationalReceiptLot.created_at.desc()).limit(200)).all()
+        return {"items": [trace_lot(operational_session, lot) for lot in lots], "total": len(lots)}
+
+    @app.get("/api/v1/warehouse-controls/lots/{lot_key}")
+    def warehouse_lot_trace(lot_key: str, request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_any_user(request, NAVIGATION_PERMISSION_RULES["warehouse-controls"])
+        lot = operational_session.scalar(select(OperationalReceiptLot).where(OperationalReceiptLot.lot_key == lot_key))
+        if not lot or not location_allowed(user, lot.location_code):
+            raise HTTPException(status_code=404, detail="Receipt lot not found")
+        return trace_lot(operational_session, lot)
+
     @app.post("/api/v1/warehouse-controls/cycle-counts", status_code=201)
     def new_cycle_count(payload: CycleCountRequest, request: Request,
                         operational_session=Depends(operational_session_dependency)):
@@ -3149,26 +3537,14 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     @app.post("/api/v1/warehouse-controls/barcodes", status_code=201)
     def new_barcode_identity(payload: BarcodeRegistrationRequest, request: Request,
                              operational_session=Depends(operational_session_dependency)):
-        user = require_csrf(request, "barcode.manage")
-        if not location_allowed(user, payload.location_code):
-            raise HTTPException(status_code=404, detail="Warehouse location not found")
-        try:
-            return barcode_payload(register_barcode(
-                operational_session, actor=user.username, **payload.model_dump()))
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        require_csrf(request, "barcode.manage")
+        raise HTTPException(status_code=409, detail="Use the governed Products editor for barcode registration and independent approval")
 
     @app.post("/api/v1/warehouse-controls/product-uoms", status_code=201)
     def new_product_uom(payload: ProductUomRegistrationRequest, request: Request,
                         operational_session=Depends(operational_session_dependency)):
-        user = require_csrf(request, "product.manage")
-        try:
-            row = register_product_uom(operational_session, actor=user.username, **payload.model_dump())
-            return {"conversion_key": row.conversion_key, "sku": row.sku, "uom": row.uom,
-                    "canonical_uom": row.canonical_uom, "factor_to_base": row.factor_to_base,
-                    "pack_level": row.pack_level, "barcode_value": row.barcode_value}
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        require_csrf(request, "product.manage")
+        raise HTTPException(status_code=409, detail="Use the governed Products editor for UOM changes and independent approval")
 
     @app.post("/api/v1/warehouse-controls/recalls", status_code=201)
     def new_product_recall(payload: RecallCreateRequest, request: Request,
@@ -3317,6 +3693,8 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 OperationalPartyMaster.party_code == payload.supplier_code,
                 OperationalPartyMaster.party_kind.in_(("supplier", "both")),
                 OperationalPartyMaster.status == "active"))
+            if supplier_record and supplier_record.country_code not in (None, "AE"):
+                raise HTTPException(status_code=422, detail="Cross-border goods receipts are held until tax, FX and trade controls are configured")
             supplier = ((supplier_record.legal_or_business_name, supplier_record.party_kind)
                         if supplier_record else None)
         else:
@@ -3481,6 +3859,11 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "customer_code": document.customer_code, "customer_name": document.customer_name_snapshot,
                 "location_code": document.location_code, "quotation_date": document.quotation_date,
                 "valid_until": document.valid_until, "currency_code": document.currency_code,
+                "customer_country_code": document.customer_country_code,
+                "fx_rate_key": document.fx_rate_key,
+                "aed_per_unit_snapshot": document.aed_per_unit_snapshot,
+                "aed_total_snapshot": document.aed_total_snapshot,
+                "trade_decision_key": document.trade_decision_key,
                 "subtotal": document.subtotal, "discount_amount": document.discount_amount,
                 "tax_amount": document.tax_amount, "total_amount": document.total_amount,
                 "payment_terms": document.payment_terms, "delivery_terms": document.delivery_terms,
@@ -3501,6 +3884,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                            "factor_to_base_snapshot": line.factor_to_base_snapshot,
                            "quantity_base": line.quantity_base, "unit_price": line.unit_price,
                            "tax_rate": line.tax_rate, "net_amount": line.net_amount,
+                           "discount_amount": line.discount_amount,
                            "tax_amount": line.tax_amount, "gross_amount": line.gross_amount}
                           for line in document.lines]}
 
@@ -3512,6 +3896,11 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "location_code": document.location_code,
                 "requested_delivery_date": document.requested_delivery_date,
                 "currency_code": document.currency_code, "subtotal": document.subtotal,
+                "customer_country_code": document.customer_country_code,
+                "aed_total_snapshot": document.aed_total_snapshot,
+                "fx_rate_key": document.fx_rate_key,
+                "order_release_key": document.order_release_key,
+                "fulfillment_held": document.customer_country_code not in (None, "AE"),
                 "discount_amount": document.discount_amount, "tax_amount": document.tax_amount,
                 "total_amount": document.total_amount, "status": document.status,
                 "posting_enabled": False, "stock_reservation_enabled": False,
@@ -3522,16 +3911,29 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                            "factor_to_base_snapshot": line.factor_to_base_snapshot,
                            "quantity_base": line.quantity_base, "unit_price": line.unit_price,
                            "tax_rate": line.tax_rate, "net_amount": line.net_amount,
+                           "discount_amount": line.discount_amount,
                            "tax_amount": line.tax_amount, "gross_amount": line.gross_amount}
                           for line in document.lines]}
 
     def prepare_sales_quotation(payload: SalesQuotationRequest, clone_session: Session,
                                 operational_session: Session, user):
+        try:
+            currency = normalize_currency_code(payload.currency_code)
+            quantum = quotation_money_quantum(currency)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         draft_payload = DraftRequest(document_type="sale", party_code=payload.customer_code,
-            location_code=payload.location_code, discount_amount=payload.discount_amount,
+            location_code=payload.location_code, discount_amount=Decimal("0"),
             notes=payload.notes, lines=payload.lines)
-        location, customer, lines = prepare_draft(draft_payload, clone_session, operational_session, user)
-        return location, customer, lines
+        location, customer, lines = prepare_draft(draft_payload, clone_session, operational_session, user,
+            allow_foreign_customer_quote=True, money_quantum=quantum)
+        master = operational_session.scalar(select(OperationalPartyMaster).where(
+            OperationalPartyMaster.party_code == customer[0],
+            OperationalPartyMaster.party_kind.in_(("customer", "both"))))
+        country = normalize_country_code(master.country_code) if master and master.country_code else "AE"
+        if country != "AE" and master and master.preferred_currency_code and currency != master.preferred_currency_code:
+            raise HTTPException(status_code=422, detail="Quotation currency must match the customer's approved preferred currency")
+        return location, customer, lines, country
 
     @app.get("/api/v1/pos")
     def pos_workspace(request: Request, operational_session: Session = Depends(operational_session_dependency)):
@@ -3691,12 +4093,14 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     @app.get("/api/v1/commercial-pricing")
     def commercial_pricing_workspace(request: Request, operational_session=Depends(operational_session_dependency)):
         require_any_user(request, {"draft.create", "draft.edit", "draft.approve",
-                                   "price_list.manage", "discount.approve"})
+                                   "price_list.manage", "discount.approve",
+                                   "trade.quote.prepare", "trade.quote.approve",
+                                   "trade.order.prepare", "trade.order.approve"})
         lists = operational_session.scalars(select(OperationalPriceList).order_by(OperationalPriceList.effective_from.desc())).all()
         return {"posting_enabled": False,
                 "groups": [{"group_code": row.group_code, "name": row.name, "status": row.status} for row in operational_session.scalars(select(OperationalCustomerPriceGroup).order_by(OperationalCustomerPriceGroup.group_code))],
                 "assignments": [{"customer_code": row.customer_code, "group_code": row.group_code} for row in operational_session.scalars(select(OperationalCustomerPriceGroupAssignment).order_by(OperationalCustomerPriceGroupAssignment.customer_code))],
-                "price_lists": [{"price_list_key": row.price_list_key, "name": row.name, "customer_group": row.customer_group, "effective_from": row.effective_from, "effective_to": row.effective_to, "max_discount_percent": row.max_discount_percent, "status": row.status, "created_by": row.created_by, "approved_by": row.approved_by, "items": [{"sku": item.sku, "unit_price": item.unit_price} for item in operational_session.scalars(select(OperationalPriceListItem).where(OperationalPriceListItem.price_list_id == row.id))]} for row in lists],
+                "price_lists": [{"price_list_key": row.price_list_key, "name": row.name, "customer_group": row.customer_group, "currency_code": row.currency_code, "effective_from": row.effective_from, "effective_to": row.effective_to, "max_discount_percent": row.max_discount_percent, "status": row.status, "created_by": row.created_by, "approved_by": row.approved_by, "items": [{"sku": item.sku, "unit_price": item.unit_price} for item in operational_session.scalars(select(OperationalPriceListItem).where(OperationalPriceListItem.price_list_id == row.id))]} for row in lists],
                 "promotions": [{"promotion_key": row.promotion_key, "promotion_code": row.promotion_code, "name": row.name, "customer_group": row.customer_group, "sku": row.sku, "discount_percent": row.discount_percent, "effective_from": row.effective_from, "effective_to": row.effective_to, "status": row.status, "created_by": row.created_by, "approved_by": row.approved_by} for row in operational_session.scalars(select(OperationalPromotion).order_by(OperationalPromotion.effective_from.desc()))]}
 
     @app.post("/api/v1/commercial-pricing/groups", status_code=201)
@@ -3782,6 +4186,56 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         except PermissionError as exc: raise HTTPException(status_code=403, detail=str(exc)) from exc
         except ValueError as exc: raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.get("/api/v1/sales-orders/trade-decisions")
+    def trade_quote_decisions(request: Request, operational_session=Depends(operational_session_dependency)):
+        require_any_user(request, {"draft.create", "trade.quote.prepare", "trade.quote.approve"})
+        rows = operational_session.scalars(select(OperationalQuoteTradeDecision).order_by(
+            OperationalQuoteTradeDecision.created_at.desc()).limit(200)).all()
+        return {"items": [trade_decision_payload(row) for row in rows], "posting_enabled": False,
+                "scope": "provisional_quotation_only"}
+
+    @app.post("/api/v1/sales-orders/trade-decisions", status_code=201)
+    def new_trade_quote_decision(payload: TradeQuoteDecisionRequest, request: Request,
+                                 clone_session: Session = Depends(session_dependency),
+                                 operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "trade.quote.prepare")
+        try:
+            validate_pricing_customer(payload.customer_code, clone_session, operational_session)
+            validate_pricing_skus({item.sku for item in payload.line_tax_rates}, clone_session, operational_session)
+            customer = operational_session.scalar(select(OperationalPartyMaster).where(
+                OperationalPartyMaster.party_code == payload.customer_code))
+            if not customer or not customer.country_code or customer.country_code == "AE":
+                raise ValueError("An active non-UAE customer with a controlled destination country is required")
+            currency = normalize_currency_code(payload.currency_code)
+            if customer.preferred_currency_code and customer.preferred_currency_code != currency:
+                raise ValueError("Currency must match the customer's approved preferred currency")
+            values = payload.model_dump()
+            values["destination_country_code"] = customer.country_code
+            values["line_tax_rates"] = [item.model_dump() for item in payload.line_tax_rates]
+            row = prepare_trade_decision(operational_session, actor=user.username, **values)
+            return trade_decision_payload(row)
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/sales-orders/trade-decisions/{decision_key}/{action}")
+    def review_trade_quote_decision(decision_key: str, action: str, payload: TradeQuoteDecisionActionRequest,
+                                    request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "trade.quote.approve")
+        row = operational_session.scalar(select(OperationalQuoteTradeDecision).where(
+            OperationalQuoteTradeDecision.decision_key == decision_key).with_for_update())
+        if not row:
+            raise HTTPException(status_code=404, detail="Trade decision not found")
+        try:
+            return trade_decision_payload(decide_trade_decision(operational_session, row,
+                action=action, actor=user.username, **payload.model_dump()))
+        except PermissionError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.get("/api/v1/sales-orders")
     def sales_orders_workspace(request: Request,
                                operational_session=Depends(operational_session_dependency)):
@@ -3791,7 +4245,60 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         orders = list_sales_orders(operational_session, allowed_locations=locations)
         return {"quotations": [sales_quotation_payload(row, operational_session) for row in quotations],
                 "orders": [sales_order_payload(row) for row in orders],
+                "quotation_currencies": [{"code": code, "minor_units": digits}
+                                         for code, digits in QUOTATION_CURRENCY_MINOR_UNITS.items()],
                 "controls": sales_order_control_counts(operational_session)}
+
+    @app.get("/api/v1/sales-orders/order-releases")
+    def cross_border_order_releases(request: Request,
+                                    operational_session=Depends(operational_session_dependency)):
+        user = require_any_user(request, {"draft.create", "trade.order.prepare", "trade.order.approve"})
+        query = select(OperationalCrossBorderOrderRelease).join(
+            OperationalSalesQuotation,
+            OperationalCrossBorderOrderRelease.quotation_id == OperationalSalesQuotation.id)
+        if "*" not in user.allowed_locations:
+            query = query.where(OperationalSalesQuotation.location_code.in_(user.allowed_locations))
+        rows = operational_session.scalars(query.order_by(
+            OperationalCrossBorderOrderRelease.created_at.desc()).limit(200)).all()
+        return {"items": [order_release_payload(row) for row in rows], "posting_enabled": False,
+                "scope": "order_recording_only"}
+
+    @app.post("/api/v1/sales-orders/order-releases", status_code=201)
+    def new_cross_border_order_release(payload: CrossBorderOrderReleaseRequest, request: Request,
+                                       operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "trade.order.prepare")
+        document = operational_session.scalar(select(OperationalSalesQuotation).where(
+            OperationalSalesQuotation.quotation_key == payload.quotation_key).with_for_update())
+        if not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Sales quotation not found")
+        try:
+            values = payload.model_dump(exclude={"quotation_key"})
+            return order_release_payload(prepare_order_release(
+                operational_session, document, actor=user.username, **values))
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/sales-orders/order-releases/{release_key}/{action}")
+    def review_cross_border_order_release(release_key: str, action: str,
+                                          payload: TradeQuoteDecisionActionRequest, request: Request,
+                                          operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "trade.order.approve")
+        row = operational_session.scalar(select(OperationalCrossBorderOrderRelease).where(
+            OperationalCrossBorderOrderRelease.release_key == release_key).with_for_update())
+        document = operational_session.get(OperationalSalesQuotation, row.quotation_id) if row else None
+        if not row or not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Order release not found")
+        try:
+            return order_release_payload(decide_order_release(
+                operational_session, row, action=action, actor=user.username,
+                **payload.model_dump()))
+        except PermissionError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/v1/sales-orders/quotations/{quotation_key}")
     def sales_quotation_detail(quotation_key: str, request: Request,
@@ -3808,14 +4315,16 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                             clone_session: Session = Depends(session_dependency),
                             operational_session=Depends(operational_session_dependency)):
         user = require_csrf(request, "draft.create")
-        location, customer, lines = prepare_sales_quotation(payload, clone_session, operational_session, user)
+        location, customer, lines, country = prepare_sales_quotation(payload, clone_session, operational_session, user)
         try:
             document = create_sales_quotation(operational_session,
                 customer_code=customer[0], customer_name_snapshot=customer[1], location_code=location[0],
                 quotation_date=payload.quotation_date, valid_until=payload.valid_until,
                 discount_amount=payload.discount_amount, payment_terms=payload.payment_terms,
                 delivery_terms=payload.delivery_terms, notes=payload.notes,
-                actor=user.username, lines=lines, promotion_code=payload.promotion_code)
+                actor=user.username, lines=lines, promotion_code=payload.promotion_code,
+                customer_country_code=country, currency_code=payload.currency_code,
+                trade_decision_key=payload.trade_decision_key)
         except ValueError as exc:
             operational_session.rollback()
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -3831,7 +4340,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             OperationalSalesQuotation.quotation_key == quotation_key).with_for_update())
         if not document or not location_allowed(user, document.location_code):
             raise HTTPException(status_code=404, detail="Sales quotation not found")
-        location, customer, lines = prepare_sales_quotation(payload, clone_session, operational_session, user)
+        location, customer, lines, country = prepare_sales_quotation(payload, clone_session, operational_session, user)
         try:
             document = replace_sales_quotation(operational_session, document,
                 expected_revision=expected_revision, customer_code=customer[0],
@@ -3839,7 +4348,9 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 quotation_date=payload.quotation_date, valid_until=payload.valid_until,
                 discount_amount=payload.discount_amount, payment_terms=payload.payment_terms,
                 delivery_terms=payload.delivery_terms, notes=payload.notes,
-                actor=user.username, lines=lines, promotion_code=payload.promotion_code)
+                actor=user.username, lines=lines, promotion_code=payload.promotion_code,
+                customer_country_code=country, currency_code=payload.currency_code,
+                trade_decision_key=payload.trade_decision_key)
         except ValueError as exc:
             operational_session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -3922,7 +4433,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return sales_order_payload(order)
 
-    def delivery_payload(document: OperationalDeliveryFulfillment) -> dict:
+    def delivery_payload(document: OperationalDeliveryFulfillment, session: Session) -> dict:
         return {"fulfillment_key": document.fulfillment_key,
                 "fulfillment_no": document.fulfillment_no,
                 "sales_order_key": document.sales_order.order_key,
@@ -3930,7 +4441,9 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "customer_name": document.sales_order.customer_name_snapshot,
                 "location_code": document.location_code, "status": document.status,
                 "revision": document.revision, "posting_enabled": False,
-                "invoice_eligible": document.status == "delivered",
+                "invoice_eligible": document.status == "delivered" and document.sales_order.customer_country_code in (None, "AE"),
+                "customer_country_code": document.sales_order.customer_country_code,
+                "currency_code": document.sales_order.currency_code,
                 "allocation_note": document.allocation_note,
                 "delivery_note_no": document.delivery_note_no,
                 "vehicle_number": document.vehicle_number, "driver_name": document.driver_name,
@@ -3941,6 +4454,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "created_at": document.created_at, "state_changed_at": document.state_changed_at,
                 "state_changed_by": document.state_changed_by,
                 "total_amount": document.sales_order.total_amount,
+                "lot_trace": delivery_lot_payload(session, document),
                 "lines": [{"line_no": line.line_no, "sku": line.sku,
                            "product_name": line.product_name_snapshot,
                            "ordered_quantity": line.ordered_quantity, "uom": line.uom,
@@ -3965,9 +4479,100 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             order_query=order_query.where(OperationalSalesOrder.location_code.in_(locations))
         orders=list(operational_session.scalars(order_query.order_by(OperationalSalesOrder.created_at.desc()).limit(100)))
         deliveries=list_delivery_fulfillments(operational_session, allowed_locations=locations)
+        readiness_query=select(OperationalCrossBorderDeliveryReadiness).join(
+            OperationalSalesOrder,
+            OperationalCrossBorderDeliveryReadiness.sales_order_id == OperationalSalesOrder.id)
+        if "*" not in locations:
+            readiness_query=readiness_query.where(OperationalSalesOrder.location_code.in_(locations))
+        readiness=list(operational_session.scalars(readiness_query.order_by(
+            OperationalCrossBorderDeliveryReadiness.created_at.desc()).limit(200)))
+        dispatch_query=select(OperationalCrossBorderDispatchRelease).join(
+            OperationalDeliveryFulfillment,
+            OperationalCrossBorderDispatchRelease.fulfillment_id == OperationalDeliveryFulfillment.id)
+        if "*" not in locations:
+            dispatch_query=dispatch_query.where(OperationalDeliveryFulfillment.location_code.in_(locations))
+        dispatch_releases=list(operational_session.scalars(dispatch_query.order_by(
+            OperationalCrossBorderDispatchRelease.created_at.desc()).limit(200)))
         return {"ready_orders": [sales_order_payload(row) for row in orders],
-                "deliveries": [delivery_payload(row) for row in deliveries],
+                "deliveries": [delivery_payload(row, operational_session) for row in deliveries],
+                "readiness": [{**readiness_payload(row),
+                               "order_no": operational_session.get(OperationalSalesOrder, row.sales_order_id).order_no}
+                              for row in readiness],
+                "dispatch_releases": [{**dispatch_release_payload(row),
+                                       "fulfillment_no": operational_session.get(
+                                           OperationalDeliveryFulfillment, row.fulfillment_id).fulfillment_no}
+                                      for row in dispatch_releases],
                 "controls": delivery_control_counts(operational_session)}
+
+    @app.post("/api/v1/deliveries/readiness", status_code=201)
+    def new_delivery_readiness(payload: DeliveryReadinessRequest, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user=require_csrf(request, "trade.delivery.prepare")
+        order=operational_session.scalar(select(OperationalSalesOrder).where(
+            OperationalSalesOrder.order_key == payload.order_key).with_for_update())
+        if not order or not location_allowed(user, order.location_code):
+            raise HTTPException(status_code=404, detail="Sales order not found")
+        try:
+            return readiness_payload(prepare_readiness(operational_session, order,
+                actor=user.username, **payload.model_dump(exclude={"order_key"})))
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/deliveries/readiness/{readiness_key}/{action}")
+    def review_delivery_readiness(readiness_key: str, action: str,
+                                  payload: TradeQuoteDecisionActionRequest, request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        user=require_csrf(request, "trade.delivery.approve")
+        row=operational_session.scalar(select(OperationalCrossBorderDeliveryReadiness).where(
+            OperationalCrossBorderDeliveryReadiness.readiness_key == readiness_key).with_for_update())
+        order=operational_session.get(OperationalSalesOrder, row.sales_order_id) if row else None
+        if not row or not order or not location_allowed(user, order.location_code):
+            raise HTTPException(status_code=404, detail="Delivery readiness not found")
+        try:
+            return readiness_payload(decide_readiness(operational_session, row, action=action,
+                actor=user.username, **payload.model_dump()))
+        except PermissionError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/deliveries/dispatch-releases", status_code=201)
+    def new_cross_border_dispatch_release(payload: CrossBorderDispatchReleaseRequest, request: Request,
+                                          operational_session=Depends(operational_session_dependency)):
+        user=require_csrf(request, "trade.dispatch.prepare")
+        document=operational_session.scalar(select(OperationalDeliveryFulfillment).where(
+            OperationalDeliveryFulfillment.fulfillment_key == payload.fulfillment_key).with_for_update())
+        if not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Delivery fulfillment not found")
+        try:
+            return dispatch_release_payload(prepare_dispatch_release(operational_session, document,
+                actor=user.username, **payload.model_dump(exclude={"fulfillment_key"})))
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/deliveries/dispatch-releases/{release_key}/{action}")
+    def review_cross_border_dispatch_release(release_key: str, action: str,
+                                             payload: TradeQuoteDecisionActionRequest, request: Request,
+                                             operational_session=Depends(operational_session_dependency)):
+        user=require_csrf(request, "trade.dispatch.approve")
+        row=operational_session.scalar(select(OperationalCrossBorderDispatchRelease).where(
+            OperationalCrossBorderDispatchRelease.release_key == release_key).with_for_update())
+        document=operational_session.get(OperationalDeliveryFulfillment, row.fulfillment_id) if row else None
+        if not row or not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Dispatch release not found")
+        try:
+            return dispatch_release_payload(decide_dispatch_release(operational_session, row,
+                action=action, actor=user.username, **payload.model_dump()))
+        except PermissionError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/deliveries/orders/{order_key}/allocate", status_code=201)
     def allocate_delivery(order_key: str, payload: DeliveryAllocationRequest, request: Request,
@@ -3982,7 +4587,24 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         except ValueError as exc:
             operational_session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return delivery_payload(document)
+        return delivery_payload(document, operational_session)
+
+    @app.post("/api/v1/deliveries/{fulfillment_key}/lines/{line_no}/lots")
+    def assign_delivery_lot_route(fulfillment_key: str, line_no: int,
+                                  payload: DeliveryLotAssignmentRequest, request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        user = require_any_csrf(request, {"delivery.pick", "inventory.edit"})
+        document = operational_session.scalar(select(OperationalDeliveryFulfillment).where(
+            OperationalDeliveryFulfillment.fulfillment_key == fulfillment_key).with_for_update())
+        if not document or not location_allowed(user, document.location_code):
+            raise HTTPException(status_code=404, detail="Delivery fulfillment not found")
+        try:
+            assign_delivery_lot(operational_session, document, line_no=line_no,
+                lot_key=payload.lot_key, quantity_base=payload.quantity_base, actor=user.username)
+        except (ValueError, IntegrityError) as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return delivery_payload(document, operational_session)
 
     def delivery_action(fulfillment_key: str, action: str, payload, request: Request,
                         operational_session: Session):
@@ -4008,7 +4630,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         except (RuntimeError, ValueError) as exc:
             operational_session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return delivery_payload(document)
+        return delivery_payload(document, operational_session)
 
     @app.post("/api/v1/deliveries/{fulfillment_key}/pick")
     def pick_delivery(fulfillment_key: str, payload: DeliveryActionRequest, request: Request,
@@ -4035,7 +4657,20 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         rehearsal = operational_session.scalar(select(OperationalCustomerInvoicePostingRehearsal).where(
             OperationalCustomerInvoicePostingRehearsal.invoice_id == document.id).order_by(
                 OperationalCustomerInvoicePostingRehearsal.generated_at.desc()))
-        settlement = customer_invoice_settlement(operational_session, document)
+        foreign_draft = document.sales_order.customer_country_code not in (None, "AE")
+        fx_exposure = (foreign_invoice_fx_exposure(operational_session, document)
+                       if foreign_draft else None)
+        settlement = ({"settlement_status": "not_released", "paid_amount": Decimal("0"),
+                       "pending_allocation_amount": Decimal("0"), "outstanding_amount": Decimal("0"),
+                       "available_outstanding": Decimal("0")}
+                      if foreign_draft else customer_invoice_settlement(operational_session, document))
+        tax_use = operational_session.scalar(select(OperationalExportTaxInvoiceUse).where(
+            OperationalExportTaxInvoiceUse.invoice_id == document.id))
+        posting_batch = operational_session.scalar(select(OperationalIntegratedPostingBatch).where(
+            OperationalIntegratedPostingBatch.resource_type == "customer_invoice",
+            OperationalIntegratedPostingBatch.resource_key == document.invoice_key,
+            OperationalIntegratedPostingBatch.batch_kind == "posting").order_by(
+            OperationalIntegratedPostingBatch.id.desc()))
         return {
             "invoice_key": document.invoice_key, "invoice_no": document.invoice_no,
             "sales_order_no": document.sales_order_no_snapshot,
@@ -4047,7 +4682,14 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             "due_date": document.due_date, "currency_code": document.currency_code,
             "subtotal": document.subtotal, "discount_amount": document.discount_amount,
             "tax_amount": document.tax_amount, "total_amount": document.total_amount,
-            "status": document.status, "posting_enabled": False, "notes": document.notes,
+            "status": document.status, "posting_enabled": app.state.posting_enabled,
+            "posting_batch_key": posting_batch.batch_key if posting_batch else None,
+            "posting_batch_status": posting_batch.status if posting_batch else None,
+            "notes": document.notes,
+            "export_tax_decision_key": (operational_session.get(OperationalExportTaxDecision, tax_use.decision_id).decision_key
+                                         if tax_use else None),
+            "foreign_draft_only": foreign_draft,
+            "fx_exposure": fx_exposure,
             "created_by": document.created_by, "created_at": document.created_at,
             "approved_by": document.approved_by, "approval_note": document.approval_note,
             "revision": document.revision, "state_changed_at": document.state_changed_at,
@@ -4061,6 +4703,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                        "factor_to_base_snapshot": line.factor_to_base_snapshot,
                        "quantity_base": line.quantity_base, "unit_price": line.unit_price,
                        "tax_rate": line.tax_rate, "net_amount": line.net_amount,
+                       "discount_amount": line.discount_amount,
                        "tax_amount": line.tax_amount, "gross_amount": line.gross_amount}
                       for line in document.lines],
         }
@@ -4078,9 +4721,94 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         ready = list(operational_session.scalars(ready_query.order_by(
             OperationalDeliveryFulfillment.delivered_at.desc()).limit(100)))
         invoices = list_customer_invoices(operational_session, allowed_locations=locations)
-        return {"ready_deliveries": [delivery_payload(row) for row in ready],
+        review_query = select(OperationalExportTaxDecision).join(
+            OperationalDeliveryFulfillment,
+            OperationalExportTaxDecision.fulfillment_id == OperationalDeliveryFulfillment.id)
+        if "*" not in locations:
+            review_query = review_query.where(OperationalDeliveryFulfillment.location_code.in_(locations))
+        reviews = list(operational_session.scalars(review_query.order_by(
+            OperationalExportTaxDecision.created_at.desc()).limit(100)))
+        review_by_delivery = {row.fulfillment_id: row for row in reviews if row.status in {"pending", "approved", "consumed"}}
+        ready_payload = []
+        for row in ready:
+            item = delivery_payload(row, operational_session)
+            foreign = row.sales_order.customer_country_code not in (None, "AE")
+            item["foreign_invoice_hold"] = foreign
+            item["export_tax_review"] = (tax_decision_payload(review_by_delivery[row.id])
+                                          if row.id in review_by_delivery else None)
+            item["invoice_draft_eligible"] = not foreign
+            if foreign:
+                try:
+                    approved_export_tax_decision(operational_session, row, invoice_date=date.today())
+                    item["invoice_draft_eligible"] = True
+                except ValueError:
+                    pass
+            ready_payload.append(item)
+        return {"ready_deliveries": ready_payload,
+                "export_tax_reviews": [{**tax_decision_payload(row),
+                    "fulfillment_no": operational_session.get(OperationalDeliveryFulfillment, row.fulfillment_id).fulfillment_no,
+                    "customer_name": operational_session.get(OperationalDeliveryFulfillment, row.fulfillment_id).sales_order.customer_name_snapshot}
+                    for row in reviews],
                 "invoices": [customer_invoice_payload(row, operational_session) for row in invoices],
+                "posting_enabled": app.state.posting_enabled,
                 "controls": customer_invoice_control_counts(operational_session)}
+
+    @app.post("/api/v1/customer-invoices/export-tax-reviews", status_code=201)
+    def new_export_tax_review(payload: ExportTaxReviewRequest, request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "export_tax.prepare")
+        fulfillment = operational_session.scalar(select(OperationalDeliveryFulfillment).where(
+            OperationalDeliveryFulfillment.fulfillment_key == payload.fulfillment_key).with_for_update())
+        if not fulfillment or not location_allowed(user, fulfillment.location_code):
+            raise HTTPException(status_code=404, detail="Delivered order not found")
+        try:
+            row = prepare_export_tax_decision(operational_session, fulfillment,
+                tax_treatment=payload.tax_treatment, tax_basis=payload.tax_basis,
+                valid_until=payload.valid_until,
+                documents=[item.model_dump() for item in payload.documents], actor=user.username)
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return tax_decision_payload(row)
+
+    @app.post("/api/v1/customer-invoices/export-tax-reviews/{decision_key}/{action}")
+    def review_export_tax(decision_key: str, action: str, payload: ExportTaxDecisionRequest,
+                          request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "export_tax.approve")
+        row = operational_session.scalar(select(OperationalExportTaxDecision).where(
+            OperationalExportTaxDecision.decision_key == decision_key).with_for_update())
+        if not row or not location_allowed(user, operational_session.get(
+                OperationalDeliveryFulfillment, row.fulfillment_id).location_code):
+            raise HTTPException(status_code=404, detail="Export tax review not found")
+        try:
+            row = decide_export_tax_decision(operational_session, row,
+                expected_revision=payload.expected_revision, action=action,
+                note=payload.note, actor=user.username)
+        except PermissionError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return tax_decision_payload(row)
+
+    @app.get("/api/v1/customer-invoices/export-evidence/{document_key}")
+    def export_evidence_file(document_key: str, request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        user = require_any_user(request, {"export_tax.prepare", "export_tax.approve", "audit.read"})
+        document = operational_session.scalar(select(OperationalExportEvidenceDocument).where(
+            OperationalExportEvidenceDocument.document_key == document_key))
+        if not document:
+            raise HTTPException(status_code=404, detail="Export evidence not found")
+        decision = document.decision
+        fulfillment = operational_session.get(OperationalDeliveryFulfillment, decision.fulfillment_id)
+        if user and not location_allowed(user, fulfillment.location_code):
+            raise HTTPException(status_code=404, detail="Export evidence not found")
+        if hashlib.sha256(document.content).hexdigest() != document.content_sha256:
+            raise HTTPException(status_code=409, detail="Stored evidence integrity check failed")
+        return Response(content=document.content, media_type="application/octet-stream",
+                        headers={"Content-Disposition": f'attachment; filename="{document.document_key}"',
+                                 "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
 
     @app.post("/api/v1/customer-invoices/deliveries/{fulfillment_key}", status_code=201)
     def new_customer_invoice(fulfillment_key: str, payload: CustomerInvoiceCreateRequest,
@@ -4171,16 +4899,31 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             OperationalIntegratedPostingBatch.resource_type == "sales_return",
             OperationalIntegratedPostingBatch.resource_key == document.return_key,
             OperationalIntegratedPostingBatch.batch_kind == "posting"))
+        target_invoice = (operational_session.scalar(select(OperationalCustomerInvoice).where(
+            OperationalCustomerInvoice.invoice_key == document.original_invoice_target_key))
+            if document.original_invoice_origin == "target_erp" else None)
+        target_posting = (operational_session.scalar(select(OperationalIntegratedPostingBatch.id).where(
+            OperationalIntegratedPostingBatch.resource_type == "customer_invoice",
+            OperationalIntegratedPostingBatch.resource_key == document.original_invoice_target_key,
+            OperationalIntegratedPostingBatch.batch_kind == "posting",
+            OperationalIntegratedPostingBatch.status == "posted"))
+            if target_invoice and target_invoice.status == "posted" else None)
         return {"return_key": document.return_key, "return_no": document.return_no,
                 "customer_code": document.customer_code, "customer_name": document.customer_name_snapshot,
                 "location_code": document.location_code,
                 "original_invoice_reference": document.original_invoice_reference,
                 "original_invoice_source_record_id": document.original_invoice_source_record_id,
+                "original_invoice_origin": document.original_invoice_origin,
+                "original_invoice_target_key": document.original_invoice_target_key,
+                "original_invoice_posting_ready": bool(target_posting),
                 "original_invoice_total_snapshot": document.original_invoice_total_snapshot,
                 "original_invoice_evidence_hash": document.original_invoice_evidence_hash,
                 "return_date": document.return_date, "reason_code": document.reason_code,
                 "currency_code": document.currency_code, "subtotal": document.subtotal,
                 "tax_amount": document.tax_amount, "total_amount": document.total_amount,
+                "refund_payable": (_sales_return_rehearsal_payload(rehearsal, document)["refund_payable"]
+                                     if rehearsal and document.original_invoice_origin == "target_erp"
+                                     else Decimal("0.00")),
                 "status": document.status, "posting_enabled": app.state.posting_enabled,
                 "notes": document.notes, "created_by": document.created_by, "created_at": document.created_at,
                 "revision": document.revision, "state_changed_at": document.state_changed_at,
@@ -4211,17 +4954,17 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
     def prepare_sales_return(payload: SalesReturnRequest, clone_session: Session,
                              operational_session: Session, user) -> tuple[str, dict, list[dict]]:
         snapshot = clone_session.scalar(select(SourceSnapshot).where(SourceSnapshot.name == selected_snapshot))
-        if not snapshot:
-            raise HTTPException(status_code=404, detail="Configured BizModo clone snapshot is unavailable")
         if not location_allowed(user, payload.location_code):
             raise HTTPException(status_code=403, detail="Return location is outside the user's operational scope")
         if operational_masters_present(operational_session, OperationalLocationMaster):
             location_exists = operational_session.scalar(select(OperationalLocationMaster.id).where(
                 OperationalLocationMaster.location_code == payload.location_code,
                 OperationalLocationMaster.status == "active"))
-        else:
+        elif snapshot is not None:
             location_exists = clone_session.scalar(select(ErpLocation.id).where(
                 ErpLocation.snapshot_id == snapshot.id, ErpLocation.code == payload.location_code))
+        else:
+            location_exists = None
         if not location_exists:
             raise HTTPException(status_code=422, detail="Return location is not active in the operational master")
         operational_customer = None
@@ -4232,6 +4975,61 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 OperationalPartyMaster.status == "active"))
             if not operational_customer:
                 raise HTTPException(status_code=422, detail="Customer is not active in the operational customer master")
+        target_invoice = operational_session.scalar(select(OperationalCustomerInvoice).where(
+            OperationalCustomerInvoice.invoice_no == payload.original_invoice_reference,
+            OperationalCustomerInvoice.customer_code == payload.customer_code))
+        if target_invoice is not None:
+            if payload.reason_code == "pricing_correction":
+                raise HTTPException(status_code=422, detail="Pricing-only credits need a separate governed adjustment workflow")
+            if (target_invoice.status not in ("approved", "posted") or target_invoice.location_code != payload.location_code
+                    or target_invoice.currency_code != "AED" or payload.return_date < target_invoice.invoice_date):
+                raise HTTPException(status_code=422, detail="An approved AED target invoice at this location and an eligible return date are required")
+            prepared = []
+            seen_skus = set()
+            for item in payload.lines:
+                if item.sku in seen_skus:
+                    raise HTTPException(status_code=422, detail=f"Duplicate target return SKU {item.sku} is not allowed")
+                seen_skus.add(item.sku)
+                matching = [line for line in target_invoice.lines if line.sku == item.sku]
+                if len(matching) != 1:
+                    raise HTTPException(status_code=422, detail=f"A unique target invoice line is required for SKU {item.sku}")
+                source_line = matching[0]
+                if item.uom.casefold() != source_line.uom.casefold():
+                    raise HTTPException(status_code=422, detail=f"Return UOM must match the invoiced UOM for {item.sku}")
+                if item.unit_price is not None and item.unit_price != source_line.unit_price:
+                    raise HTTPException(status_code=422, detail=f"Return unit price must match the invoice for {item.sku}")
+                if item.tax_rate != source_line.tax_rate:
+                    raise HTTPException(status_code=422, detail=f"Return VAT rate must match the invoice for {item.sku}")
+                previous = operational_session.scalar(select(func.coalesce(func.sum(
+                    OperationalSalesReturnLine.quantity), 0)).join(OperationalSalesReturn).where(
+                        OperationalSalesReturn.original_invoice_target_key == target_invoice.invoice_key,
+                        OperationalSalesReturn.status.in_(("submitted", "approved", "posted")),
+                        OperationalSalesReturnLine.sku == item.sku)) or Decimal("0")
+                try:
+                    credit_net, credit_tax = target_return_credit(source_line, previous, item.quantity)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                try:
+                    issue = target_invoice_dispatch_movement(operational_session, target_invoice, source_line)
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+                prepared.append({"sku": item.sku, "product_name_snapshot": source_line.product_name_snapshot,
+                    "quantity": item.quantity, "restock_quantity": item.restock_quantity,
+                    "writeoff_quantity": item.writeoff_quantity, "uom": source_line.uom,
+                    "canonical_uom": source_line.canonical_uom,
+                    "factor_to_base_snapshot": source_line.factor_to_base_snapshot,
+                    "unit_price": source_line.unit_price, "tax_rate": source_line.tax_rate,
+                    "unit_cost_snapshot": issue.unit_cost_snapshot,
+                    "original_invoice_quantity_snapshot": source_line.quantity,
+                    "original_invoice_unit_price_snapshot": source_line.unit_price,
+                    "credit_net_amount": credit_net, "credit_tax_amount": credit_tax,
+                    "disposition_reason": item.disposition_reason})
+            return (target_invoice.customer_name_snapshot,
+                    {"source_record_id": 0, "total_amount": target_invoice.total_amount,
+                     "evidence_hash": target_invoice_evidence_hash(target_invoice),
+                     "origin": "target_erp", "target_key": target_invoice.invoice_key}, prepared)
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="Configured BizModo clone snapshot is unavailable")
         customer = clone_session.execute(select(ErpParty.id, ErpParty.legal_or_business_name).where(
             ErpParty.snapshot_id == snapshot.id, ErpParty.party_code == payload.customer_code,
             ErpParty.party_kind.in_(("customer", "both")))).first()
@@ -4355,7 +5153,9 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 reason_code=payload.reason_code, notes=payload.notes, actor=user.username, lines=lines,
                 original_invoice_source_record_id=evidence["source_record_id"],
                 original_invoice_total_snapshot=evidence["total_amount"],
-                original_invoice_evidence_hash=evidence["evidence_hash"])
+                original_invoice_evidence_hash=evidence["evidence_hash"],
+                original_invoice_origin=evidence.get("origin", "bizmodo_clone"),
+                original_invoice_target_key=evidence.get("target_key"))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return sales_return_payload(document, operational_session)
@@ -4379,7 +5179,9 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 actor=user.username, lines=lines,
                 original_invoice_source_record_id=evidence["source_record_id"],
                 original_invoice_total_snapshot=evidence["total_amount"],
-                original_invoice_evidence_hash=evidence["evidence_hash"])
+                original_invoice_evidence_hash=evidence["evidence_hash"],
+                original_invoice_origin=evidence.get("origin", "bizmodo_clone"),
+                original_invoice_target_key=evidence.get("target_key"))
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return sales_return_payload(document, operational_session)
@@ -4427,6 +5229,319 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             raise HTTPException(status_code=404, detail="Sales return not found")
         try:
             return rehearse_sales_return_posting(operational_session, document, actor=user.username)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def customer_price_credit_payload(row: OperationalCustomerPriceCredit) -> dict:
+        return {"credit_key": row.credit_key, "credit_no": row.credit_no,
+            "invoice_key": row.invoice.invoice_key, "invoice_no": row.invoice.invoice_no,
+            "line_no": row.invoice_line.line_no, "sku": row.invoice_line.sku,
+            "customer_code": row.customer_code, "location_code": row.location_code,
+            "credit_date": row.credit_date, "quantity": row.quantity,
+            "corrected_unit_net": row.corrected_unit_net,
+            "net_credit": row.net_credit, "vat_credit": row.vat_credit,
+            "total_amount": row.total_amount, "reason": row.reason,
+            "status": row.status, "revision": row.revision,
+            "created_by": row.created_by, "approved_by": row.approved_by}
+
+    @app.get("/api/v1/customer-price-credits")
+    def customer_price_credits(request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_user(request, "clone.read")
+        query = select(OperationalCustomerPriceCredit).order_by(
+            OperationalCustomerPriceCredit.created_at.desc()).limit(100)
+        invoice_query = select(OperationalCustomerInvoice).where(
+            OperationalCustomerInvoice.status == "posted",
+            OperationalCustomerInvoice.currency_code == "AED").order_by(
+            OperationalCustomerInvoice.invoice_date.desc()).limit(100)
+        if user and "*" not in user.allowed_locations:
+            query = query.where(OperationalCustomerPriceCredit.location_code.in_(user.allowed_locations))
+            invoice_query = invoice_query.where(OperationalCustomerInvoice.location_code.in_(user.allowed_locations))
+        rows = list(operational_session.scalars(query))
+        invoices = list(operational_session.scalars(invoice_query))
+        return {"items": [customer_price_credit_payload(row) for row in rows],
+            "invoices": [{"invoice_key": row.invoice_key, "invoice_no": row.invoice_no,
+                "customer_code": row.customer_code, "customer_name": row.customer_name_snapshot,
+                "location_code": row.location_code, "invoice_date": row.invoice_date,
+                "lines": [{"line_no": line.line_no, "sku": line.sku,
+                    "name": line.product_name_snapshot, "quantity": line.quantity,
+                    "effective_unit_net": ((Decimal(line.net_amount) - Decimal(line.discount_amount))
+                                           / Decimal(line.quantity)).quantize(Decimal("0.0001")),
+                    "tax_rate": line.tax_rate} for line in row.lines]}
+                for row in invoices], "posting_enabled": app.state.posting_enabled}
+
+    @app.post("/api/v1/customer-price-credits", status_code=201)
+    def new_customer_price_credit(payload: CustomerPriceCreditRequest, request: Request,
+                                  operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "customer_price_credit.create")
+        invoice = operational_session.scalar(select(OperationalCustomerInvoice).where(
+            OperationalCustomerInvoice.invoice_key == payload.invoice_key).with_for_update())
+        if not invoice or not location_allowed(user, invoice.location_code):
+            raise HTTPException(status_code=404, detail="Posted customer invoice not found")
+        try:
+            row = create_price_credit(operational_session, invoice=invoice,
+                line_no=payload.line_no, credit_date=payload.credit_date,
+                quantity=payload.quantity, corrected_unit_net=payload.corrected_unit_net,
+                reason=payload.reason, actor=user.username)
+            return customer_price_credit_payload(row)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/customer-price-credits/{credit_key}/{action}")
+    def customer_price_credit_action(credit_key: str, action: str,
+                                     payload: DraftTransitionRequest, request: Request,
+                                     operational_session=Depends(operational_session_dependency)):
+        permission = {"submit": "customer_price_credit.submit",
+                      "cancel": "customer_price_credit.cancel",
+                      "approve": "customer_price_credit.approve"}.get(action)
+        if not permission:
+            raise HTTPException(status_code=404, detail="Pricing-credit action not found")
+        user = require_csrf(request, permission)
+        row = operational_session.scalar(select(OperationalCustomerPriceCredit).where(
+            OperationalCustomerPriceCredit.credit_key == credit_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Pricing credit not found")
+        try:
+            return customer_price_credit_payload(transition_price_credit(operational_session, row,
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username, note=payload.note))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/customer-price-credit-posting-plans/{credit_key}")
+    def customer_price_credit_plan(credit_key: str, request: Request,
+                                   operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "customer_price_credit.rehearse")
+        row = operational_session.scalar(select(OperationalCustomerPriceCredit).where(
+            OperationalCustomerPriceCredit.credit_key == credit_key))
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Pricing credit not found")
+        try:
+            return price_credit_posting_plan(operational_session, row)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def customer_refund_payload(row: OperationalCustomerRefund, operational_session: Session) -> dict:
+        source = (operational_session.get(OperationalSalesReturn, row.sales_return_id)
+                  if row.sales_return_id is not None else
+                  operational_session.get(OperationalCustomerPriceCredit, row.price_credit_id))
+        matched = operational_session.scalar(select(OperationalStatementLine).where(
+            OperationalStatementLine.matched_refund_id == row.id))
+        return {"refund_key": row.refund_key, "refund_no": row.refund_no,
+            "return_key": source.return_key if row.sales_return_id is not None else None,
+            "price_credit_key": source.credit_key if row.price_credit_id is not None else None,
+            "credit_note_no": (source.credit_note.credit_note_no if row.sales_return_id is not None
+                               else source.credit_no),
+            "customer_code": row.customer_code, "location_code": row.location_code,
+            "cash_account_code": row.cash_account_code, "refund_date": row.refund_date,
+            "amount": row.amount, "status": row.status, "revision": row.revision,
+            "created_by": row.created_by, "approved_by": row.approved_by,
+            "notes": row.notes, "bank_match": ({"statement_reference": matched.batch.statement_reference,
+                "external_id": matched.external_id, "bank_date": matched.transaction_date,
+                "status": matched.batch.status} if matched else None)}
+
+    @app.get("/api/v1/customer-refunds")
+    def customer_refunds(request: Request, operational_session=Depends(operational_session_dependency)):
+        user = require_user(request, "clone.read")
+        query = select(OperationalCustomerRefund).order_by(OperationalCustomerRefund.created_at.desc()).limit(100)
+        if user and "*" not in user.allowed_locations:
+            query = query.where(OperationalCustomerRefund.location_code.in_(user.allowed_locations))
+        rows = list(operational_session.scalars(query))
+        eligible_query = select(OperationalSalesReturn).where(
+            OperationalSalesReturn.original_invoice_origin == "target_erp",
+            OperationalSalesReturn.status == "posted").order_by(
+            OperationalSalesReturn.created_at.desc()).limit(100)
+        if user and "*" not in user.allowed_locations:
+            eligible_query = eligible_query.where(
+                OperationalSalesReturn.location_code.in_(user.allowed_locations))
+        eligible = []
+        for returned in operational_session.scalars(eligible_query):
+            available = refund_available(operational_session, returned)
+            if available > 0:
+                eligible.append({"return_key": returned.return_key,
+                    "credit_note_no": returned.credit_note.credit_note_no,
+                    "customer_code": returned.customer_code,
+                    "customer_name": returned.customer_name_snapshot,
+                    "location_code": returned.location_code, "available": available})
+        price_query = select(OperationalCustomerPriceCredit).where(
+            OperationalCustomerPriceCredit.status == "posted").order_by(
+            OperationalCustomerPriceCredit.created_at.desc()).limit(100)
+        if user and "*" not in user.allowed_locations:
+            price_query = price_query.where(
+                OperationalCustomerPriceCredit.location_code.in_(user.allowed_locations))
+        for credit in operational_session.scalars(price_query):
+            available = refund_available(operational_session, credit)
+            if available > 0:
+                eligible.append({"price_credit_key": credit.credit_key,
+                    "credit_note_no": credit.credit_no,
+                    "customer_code": credit.customer_code,
+                    "customer_name": credit.invoice.customer_name_snapshot,
+                    "location_code": credit.location_code, "available": available})
+        accounts = list(operational_session.scalars(select(OperationalCashAccount).where(
+            OperationalCashAccount.status == "active",
+            OperationalCashAccount.account_type == "bank",
+            OperationalCashAccount.currency_code == "AED")))
+        if user and "*" not in user.allowed_locations:
+            accounts = [account for account in accounts if account.location_code in user.allowed_locations]
+        return {"items": [customer_refund_payload(row, operational_session) for row in rows],
+            "total": len(rows), "eligible": eligible,
+            "bank_accounts": [{"account_code": account.account_code,
+                "account_name": account.account_name, "location_code": account.location_code}
+                for account in accounts], "posting_enabled": app.state.posting_enabled}
+
+    @app.post("/api/v1/customer-refunds", status_code=201)
+    def new_customer_refund(payload: CustomerRefundRequest, request: Request,
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "customer_refund.create")
+        if bool(payload.return_key) == bool(payload.price_credit_key):
+            raise HTTPException(status_code=422, detail="Select exactly one posted credit document")
+        returned = (operational_session.scalar(select(OperationalSalesReturn).where(
+            OperationalSalesReturn.return_key == payload.return_key).with_for_update())
+            if payload.return_key else None)
+        price_credit = (operational_session.scalar(select(OperationalCustomerPriceCredit).where(
+            OperationalCustomerPriceCredit.credit_key == payload.price_credit_key).with_for_update())
+            if payload.price_credit_key else None)
+        source = returned if returned is not None else price_credit
+        if not source or not location_allowed(user, source.location_code):
+            raise HTTPException(status_code=404, detail="Posted credit note not found")
+        account = operational_session.scalar(select(OperationalCashAccount).where(
+            OperationalCashAccount.account_code == payload.cash_account_code,
+            OperationalCashAccount.account_type == "bank", OperationalCashAccount.status == "active",
+            OperationalCashAccount.currency_code == "AED"))
+        if not account or account.location_code not in (source.location_code, "MAIN"):
+            raise HTTPException(status_code=422, detail="Select an approved AED bank account for this location")
+        try:
+            row = create_refund(operational_session, returned=returned, price_credit=price_credit,
+                cash_account_code=account.account_code, refund_date=payload.refund_date,
+                amount=payload.amount, actor=user.username, notes=payload.notes)
+            return customer_refund_payload(row, operational_session)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/customer-refunds/{refund_key}/{action}")
+    def customer_refund_action(refund_key: str, action: str, payload: DraftTransitionRequest,
+                               request: Request, operational_session=Depends(operational_session_dependency)):
+        permission = {"submit": "customer_refund.submit", "cancel": "customer_refund.cancel",
+                      "approve": "customer_refund.approve"}.get(action)
+        if not permission:
+            raise HTTPException(status_code=404, detail="Refund action not found")
+        user = require_csrf(request, permission)
+        row = operational_session.scalar(select(OperationalCustomerRefund).where(
+            OperationalCustomerRefund.refund_key == refund_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Customer refund not found")
+        try:
+            row = transition_refund(operational_session, row,
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username, note=payload.note)
+            return customer_refund_payload(row, operational_session)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/customer-refund-posting-plans/{refund_key}")
+    def customer_refund_posting_plan(refund_key: str, request: Request,
+                                     operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "customer_refund.rehearse")
+        row = operational_session.scalar(select(OperationalCustomerRefund).where(
+            OperationalCustomerRefund.refund_key == refund_key))
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Customer refund not found")
+        try:
+            return refund_posting_plan(operational_session, row)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def customer_recovery_payload(row: OperationalCustomerRefundRecovery,
+                                  operational_session: Session) -> dict:
+        refund = operational_session.get(OperationalCustomerRefund, row.refund_id)
+        matched = operational_session.scalar(select(OperationalStatementLine).where(
+            OperationalStatementLine.matched_recovery_id == row.id))
+        return {"recovery_key": row.recovery_key, "recovery_no": row.recovery_no,
+            "refund_key": refund.refund_key, "refund_no": refund.refund_no,
+            "customer_code": row.customer_code, "location_code": row.location_code,
+            "cash_account_code": row.cash_account_code, "recovery_date": row.recovery_date,
+            "amount": row.amount, "reason": row.reason,
+            "status": row.status, "revision": row.revision,
+            "created_by": row.created_by, "approved_by": row.approved_by,
+            "bank_match": ({"statement_reference": matched.batch.statement_reference,
+                "external_id": matched.external_id, "bank_date": matched.transaction_date,
+                "status": matched.batch.status} if matched else None)}
+
+    @app.get("/api/v1/customer-refund-recoveries")
+    def customer_refund_recoveries(request: Request,
+                                   operational_session=Depends(operational_session_dependency)):
+        user = require_user(request, "clone.read")
+        query = select(OperationalCustomerRefundRecovery).order_by(
+            OperationalCustomerRefundRecovery.created_at.desc()).limit(100)
+        refund_query = select(OperationalCustomerRefund).where(
+            OperationalCustomerRefund.status == "posted").order_by(
+            OperationalCustomerRefund.created_at.desc()).limit(100)
+        if user and "*" not in user.allowed_locations:
+            query = query.where(OperationalCustomerRefundRecovery.location_code.in_(user.allowed_locations))
+            refund_query = refund_query.where(OperationalCustomerRefund.location_code.in_(user.allowed_locations))
+        eligible = []
+        for refund in operational_session.scalars(refund_query):
+            amount = recovery_available(operational_session, refund)
+            if amount > 0:
+                eligible.append({"refund_key": refund.refund_key, "refund_no": refund.refund_no,
+                    "customer_code": refund.customer_code, "available": amount,
+                    "cash_account_code": refund.cash_account_code})
+        return {"items": [customer_recovery_payload(row, operational_session)
+                          for row in operational_session.scalars(query)],
+            "eligible": eligible, "posting_enabled": app.state.posting_enabled}
+
+    @app.post("/api/v1/customer-refund-recoveries", status_code=201)
+    def new_customer_refund_recovery(payload: CustomerRefundRecoveryRequest, request: Request,
+                                     operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "customer_refund_recovery.create")
+        refund = operational_session.scalar(select(OperationalCustomerRefund).where(
+            OperationalCustomerRefund.refund_key == payload.refund_key).with_for_update())
+        if not refund or not location_allowed(user, refund.location_code):
+            raise HTTPException(status_code=404, detail="Posted refund not found")
+        try:
+            return customer_recovery_payload(create_recovery(operational_session, refund=refund,
+                recovery_date=payload.recovery_date, amount=payload.amount,
+                reason=payload.reason, actor=user.username), operational_session)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/customer-refund-recoveries/{recovery_key}/{action}")
+    def customer_refund_recovery_action(recovery_key: str, action: str,
+                                        payload: DraftTransitionRequest, request: Request,
+                                        operational_session=Depends(operational_session_dependency)):
+        permission = {"submit": "customer_refund_recovery.submit",
+                      "cancel": "customer_refund_recovery.cancel",
+                      "approve": "customer_refund_recovery.approve"}.get(action)
+        if not permission:
+            raise HTTPException(status_code=404, detail="Recovery action not found")
+        user = require_csrf(request, permission)
+        row = operational_session.scalar(select(OperationalCustomerRefundRecovery).where(
+            OperationalCustomerRefundRecovery.recovery_key == recovery_key).with_for_update())
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Recovery not found")
+        try:
+            return customer_recovery_payload(transition_recovery(operational_session, row,
+                expected_revision=payload.expected_revision, action=action,
+                actor=user.username, note=payload.note), operational_session)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/customer-refund-recovery-posting-plans/{recovery_key}")
+    def customer_refund_recovery_plan(recovery_key: str, request: Request,
+                                      operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "customer_refund_recovery.rehearse")
+        row = operational_session.scalar(select(OperationalCustomerRefundRecovery).where(
+            OperationalCustomerRefundRecovery.recovery_key == recovery_key))
+        if not row or not location_allowed(user, row.location_code):
+            raise HTTPException(status_code=404, detail="Recovery not found")
+        try:
+            return recovery_posting_plan(operational_session, row)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -4656,7 +5771,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 OperationalPaymentAllocationClaim.party_code == party_code,
                 OperationalPaymentAllocationClaim.source_type == item["source_type"],
                 OperationalPaymentAllocationClaim.source_reference_key == item["source_reference_key"],
-                OperationalPaymentAllocationClaim.status == "active")) or Decimal("0")
+                OperationalPaymentAllocationClaim.status.in_(("active", "consumed")))) or Decimal("0")
             item["reserved_amount"] = claimed
             item["available_outstanding"] = max(Decimal("0"), item["source_outstanding"] - claimed)
         return party, [item for item in items if item["available_outstanding"] > 0]
@@ -4823,6 +5938,58 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             payload["statements"] = [row for row in payload["statements"] if row["account_key"] in allowed_keys]
         return payload
 
+    @app.get("/api/v1/finance/fx-rates")
+    def list_fx_rates(request: Request,
+                      operational_session=Depends(operational_session_dependency)):
+        require_user(request, "fx.rate.read")
+        rows = operational_session.scalars(select(OperationalFxRate).order_by(
+            OperationalFxRate.rate_date.desc(), OperationalFxRate.id.desc()).limit(200)).all()
+        return {"items": [fx_rate_payload(row) for row in rows],
+                "purpose": "commercial_reference_only",
+                "transaction_use_enabled": False}
+
+    @app.get("/api/v1/finance/fx-rates/lookup")
+    def lookup_fx_rate(currency_code: str, rate_date: date, request: Request,
+                       operational_session=Depends(operational_session_dependency)):
+        require_user(request, "fx.rate.read")
+        try:
+            row = approved_fx_rate(operational_session, currency_code, rate_date)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if row is None:
+            raise HTTPException(status_code=404, detail="No approved FX reference for this currency and exact date")
+        return fx_rate_payload(row)
+
+    @app.post("/api/v1/finance/fx-rates", status_code=201)
+    def request_fx_rate(payload: FxRateRequest, request: Request,
+                        operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "fx.rate.prepare")
+        try:
+            return fx_rate_payload(prepare_fx_rate(operational_session,
+                actor=user.username, **payload.model_dump()))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/finance/fx-rates/{rate_key}/{action}")
+    def decide_fx_rate_route(rate_key: str, action: str, payload: FxRateDecisionRequest,
+                             request: Request,
+                             operational_session=Depends(operational_session_dependency)):
+        if action not in {"approve", "reject"}:
+            raise HTTPException(status_code=404, detail="FX action not found")
+        user = require_csrf(request, "fx.rate.approve")
+        row = operational_session.scalar(select(OperationalFxRate).where(
+            OperationalFxRate.rate_key == rate_key).with_for_update())
+        if row is None:
+            raise HTTPException(status_code=404, detail="FX reference not found")
+        try:
+            return fx_rate_payload(decide_fx_rate(operational_session, row,
+                action=action, expected_revision=payload.expected_revision,
+                note=payload.note, actor=user.username))
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.post("/api/v1/cash-management/accounts", status_code=201)
     def request_cash_account(payload: CashAccountRequest, request: Request,
                              operational_session=Depends(operational_session_dependency)):
@@ -4896,6 +6063,43 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             raise HTTPException(status_code=404, detail="Receipt/payment not found")
         try:
             match_statement_line(operational_session, batch, line, payment, actor=user.username)
+            return statement_payload(operational_session, batch)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/cash-management/statements/{batch_key}/lines/{line_no}/match-refund")
+    def match_bank_refund_line(batch_key: str, line_no: int, payload: RefundStatementMatchRequest,
+                               request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "bank.reconcile.prepare")
+        batch, line = statement_and_line(batch_key, line_no, operational_session)
+        if not batch or not line or not location_allowed(user, batch.account.location_code):
+            raise HTTPException(status_code=404, detail="Statement line not found")
+        refund = operational_session.scalar(select(OperationalCustomerRefund).where(
+            OperationalCustomerRefund.refund_key == payload.refund_key).with_for_update())
+        if not refund or not location_allowed(user, refund.location_code):
+            raise HTTPException(status_code=404, detail="Approved refund not found")
+        try:
+            match_refund_statement_line(operational_session, batch, line, refund, actor=user.username)
+            return statement_payload(operational_session, batch)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/cash-management/statements/{batch_key}/lines/{line_no}/match-recovery")
+    def match_bank_recovery_line(batch_key: str, line_no: int,
+                                 payload: RecoveryStatementMatchRequest, request: Request,
+                                 operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "bank.reconcile.prepare")
+        batch, line = statement_and_line(batch_key, line_no, operational_session)
+        if not batch or not line or not location_allowed(user, batch.account.location_code):
+            raise HTTPException(status_code=404, detail="Statement line not found")
+        recovery = operational_session.scalar(select(OperationalCustomerRefundRecovery).where(
+            OperationalCustomerRefundRecovery.recovery_key == payload.recovery_key).with_for_update())
+        if not recovery or not location_allowed(user, recovery.location_code):
+            raise HTTPException(status_code=404, detail="Approved recovery not found")
+        try:
+            match_recovery_statement_line(operational_session, batch, line,
+                recovery, actor=user.username)
             return statement_payload(operational_session, batch)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -5383,6 +6587,10 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             OperationalFinancialReportPackage.package_key == package_key))
         if not row or row.status != "approved":
             raise HTTPException(status_code=409, detail="Exports require an approved financial-report package")
+        try:
+            assert_report_package_current(operational_session, row)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if format_name == "xlsx":
             content, media = workbook_bytes(row), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         elif format_name == "pdf":
@@ -5579,7 +6787,7 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
             return execute_integrated_posting(operational_session, resource_type=resource_type,
                                               resource_key=resource_key,
                                               idempotency_key=payload.idempotency_key,
-                                              actor=user.username)
+                                              actor=user.username, enforce_approved_gl=True)
         except ValueError as exc:
             operational_session.rollback()
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -5764,42 +6972,108 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "master_status": record.status, "revision": record.revision,
                 "source_promoted": record.source_promoted}
 
+    @app.get("/api/v1/product-editor/catalog")
+    def product_editor_catalog(request: Request, operational_session=Depends(operational_session_dependency)):
+        require_user(request, "clone.read")
+        rows = operational_session.scalars(select(OperationalProductMaster).order_by(OperationalProductMaster.sku)).all()
+        taxonomy = active_product_taxonomy(operational_session)
+        changes = operational_session.scalars(select(ProductChangeRequest).where(
+            ProductChangeRequest.status == "pending").order_by(ProductChangeRequest.created_at.desc())).all()
+        return {"items": [{"sku": row.sku, "name": row.name, "category_name": row.category_name,
+                 "brand_name": row.brand_name, "base_uom": row.base_uom, "status": row.status,
+                 "revision": row.revision} for row in rows],
+                "pending": [change_payload(row) for row in changes],
+                "categories": taxonomy["categories"],
+                "brands": sorted({row.brand_name for row in rows if row.brand_name}),
+                "units": taxonomy["units"],
+                "warehouses": sorted({r[0] for r in operational_session.execute(select(OperationalLocationMaster.location_code)).all()})}
+
+    @app.post("/api/v1/product-editor/master/{kind}", status_code=201)
+    def product_editor_create_master(kind: str, payload: ProductTaxonomyInput, request: Request,
+                                     operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "product.manage")
+        if kind not in {"category", "uom"}:
+            raise HTTPException(status_code=404, detail="Unknown product master type")
+        try:
+            row = create_product_taxonomy_value(operational_session, kind, payload.name, actor=user.username)
+            return {"kind": kind, "name": row.name, "created_by": row.created_by,
+                    "created_at": row.created_at}
+        except (ValueError, IntegrityError) as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/v1/product-editor/record/{sku}")
+    def product_editor_record(sku: str, request: Request, operational_session=Depends(operational_session_dependency)):
+        require_user(request, "clone.read")
+        record = product_record(operational_session, sku)
+        if not record:
+            raise HTTPException(status_code=404, detail="Product not found")
+        return record
+
+    @app.post("/api/v1/product-editor/barcodes/generate")
+    def product_editor_barcode(payload: ProductBarcodeInput, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        require_csrf(request, "product.manage")
+        try:
+            value = generate_product_barcode(operational_session, sku=payload.sku, name=payload.name,
+                pack_level=payload.pack_level, uom=payload.uom, factor=str(payload.factor_to_base))
+            return {"barcode": value, "database_checked": True, "reserved": False}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/v1/product-editor/duplicate-check")
+    def product_editor_duplicate(payload: ProductEditor, request: Request,
+                                 operational_session=Depends(operational_session_dependency)):
+        require_user(request, "clone.read")
+        key = product_duplicate_key(payload)
+        matched = operational_session.scalar(select(OperationalProductDetails.sku).where(
+            OperationalProductDetails.duplicate_key == key))
+        pending = operational_session.scalar(select(ProductChangeRequest.sku).where(
+            ProductChangeRequest.duplicate_key == key, ProductChangeRequest.status == "pending"))
+        return {"duplicate": bool(matched or pending), "matched_sku": matched or pending, "duplicate_key": key}
+
+    @app.post("/api/v1/product-editor/changes", status_code=201)
+    def product_editor_propose(payload: ProductChangeInput, request: Request,
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "product.manage")
+        try:
+            row = propose_product(operational_session, payload.product, actor=user.username,
+                expected_revision=payload.expected_revision)
+            return change_payload(row)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/product-editor/changes/{change_key}/{action}")
+    def product_editor_decision(change_key: str, action: str, payload: ProductDecisionInput, request: Request,
+                                operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "product.approve")
+        try:
+            return change_payload(decide_product(operational_session, change_key,
+                actor=user.username, action=action, note=payload.note))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/v1/product-editor/status/{sku}/{action}", status_code=201)
+    def product_editor_status(sku: str, action: str, payload: ProductStatusInput, request: Request,
+                              operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, "product.manage")
+        try:
+            return change_payload(propose_product_status(operational_session, sku, actor=user.username,
+                action=action, expected_revision=payload.expected_revision, note=payload.note))
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @app.patch("/api/v1/master-data/products/{sku}")
     def update_product_master(sku: str, payload: ProductMasterUpdateRequest, request: Request,
                               operational_session=Depends(operational_session_dependency)):
-        user = require_csrf(request, "migration.review")
-        record = operational_session.scalar(select(OperationalProductMaster).where(
-            OperationalProductMaster.sku == sku).with_for_update())
-        if not record:
-            raise HTTPException(status_code=404, detail="Operational product not found")
-        if record.revision != payload.expected_revision:
-            raise HTTPException(status_code=409, detail=f"Product revision conflict; current revision is {record.revision}")
-        for field in ("name", "category_name", "brand_name", "purchase_price", "selling_price", "tax_rate"):
-            setattr(record, field, getattr(payload, field))
-        record.revision += 1; record.updated_by = user.username; record.updated_at = datetime.now().astimezone()
-        operational_session.add(OperationalAuditEvent(event_key=str(uuid.uuid4()), event_type="master.product.edited",
-            actor=user.username, resource_key=record.product_key, detail=f"SKU {record.sku}; revision {record.revision}"))
-        operational_session.commit()
-        return operational_product_payload(record)
+        require_csrf(request, "migration.review")
+        raise HTTPException(status_code=409, detail="Use the governed Products editor for amendments and independent approval")
 
     @app.post("/api/v1/master-data/products/{sku}/{action}")
     def product_master_status(sku: str, action: str, payload: MasterStatusRequest, request: Request,
                               operational_session=Depends(operational_session_dependency)):
-        if action not in {"deactivate", "reactivate"}:
-            raise HTTPException(status_code=404, detail="Unsupported master action")
-        user = require_csrf(request, "migration.review")
-        record = operational_session.scalar(select(OperationalProductMaster).where(
-            OperationalProductMaster.sku == sku).with_for_update())
-        if not record: raise HTTPException(status_code=404, detail="Operational product not found")
-        if record.revision != payload.expected_revision:
-            raise HTTPException(status_code=409, detail=f"Product revision conflict; current revision is {record.revision}")
-        target = "inactive" if action == "deactivate" else "active"
-        if record.status == target: raise HTTPException(status_code=409, detail=f"Product is already {target}")
-        record.status = target; record.revision += 1; record.updated_by = user.username; record.updated_at = datetime.now().astimezone()
-        operational_session.add(OperationalAuditEvent(event_key=str(uuid.uuid4()), event_type=f"master.product.{action}d",
-            actor=user.username, resource_key=record.product_key, detail=payload.note or f"SKU {record.sku}"))
-        operational_session.commit()
-        return operational_product_payload(record)
+        require_csrf(request, "migration.review")
+        raise HTTPException(status_code=409, detail="Use the governed Products editor for status changes and independent approval")
 
     def parties(kind: str, limit: int, offset: int, q: str | None, snapshot: SourceSnapshot,
                 session: Session, operational_session):
@@ -5815,9 +7089,14 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 OperationalPartyMaster.email, OperationalPartyMaster.mobile,
                 OperationalPartyMaster.address, OperationalPartyMaster.tax_number,
                 OperationalPartyMaster.party_kind, OperationalPartyMaster.status.label("master_status"),
-                OperationalPartyMaster.revision,
+                OperationalPartyMaster.revision, OperationalPartyMaster.country_code,
+                OperationalPartyMaster.preferred_currency_code,
+                OperationalPartyMaster.tax_registration_type, OperationalPartyMaster.tax_country_code,
             ).where(*filters).order_by(OperationalPartyMaster.legal_or_business_name).offset(offset).limit(limit)).all()
-            return page(limit, offset, total, rows)
+            result = page(limit, offset, total, rows)
+            for row in result["items"]:
+                row["market_scope"] = market_scope(row["country_code"])
+            return result
         kinds = (kind, "both")
         filters = [ErpParty.snapshot_id == snapshot.id, ErpParty.party_kind.in_(kinds)]
         rows = session.execute(select(
@@ -5847,7 +7126,71 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
                 "legal_or_business_name": record.legal_or_business_name, "contact_name": record.contact_name,
                 "email": record.email, "mobile": record.mobile, "address": record.address,
                 "tax_number": record.tax_number, "master_status": record.status,
+                "country_code": record.country_code,
+                "preferred_currency_code": record.preferred_currency_code,
+                "tax_registration_type": record.tax_registration_type,
+                "tax_country_code": record.tax_country_code,
+                "market_scope": market_scope(record.country_code),
+                "transaction_ready": record.country_code in (None, "AE"),
                 "revision": record.revision, "source_promoted": record.source_promoted}
+
+    @app.get("/api/v1/master-data/country-catalog")
+    def party_country_catalog(request: Request):
+        require_user(request, "clone.read")
+        return country_catalog()
+
+    @app.get("/api/v1/master-data/party-requests")
+    def list_party_requests(request: Request, kind: str = Query(pattern="^(customer|supplier)$"),
+                            operational_session=Depends(operational_session_dependency)):
+        user = require_any_user(request, {f"{kind}.manage", f"{kind}.approve"})
+        requests = operational_session.scalars(select(OperationalPartyCreationRequest).where(
+            OperationalPartyCreationRequest.party_kind == kind,
+        ).order_by(OperationalPartyCreationRequest.created_at.desc()).limit(100)).all()
+        return {"items": [party_request_payload(row) for row in requests],
+                "can_create": f"{kind}.manage" in user.permissions,
+                "can_approve": f"{kind}.approve" in user.permissions}
+
+    @app.post("/api/v1/master-data/party-requests")
+    def request_party_creation(payload: PartyCreateRequest, request: Request,
+                               snapshot: SourceSnapshot = Depends(snapshot_dependency),
+                               session: Session = Depends(session_dependency),
+                               operational_session=Depends(operational_session_dependency)):
+        user = require_csrf(request, f"{payload.party_kind}.manage")
+        code = payload.party_code.strip().upper()
+        name = " ".join(payload.legal_or_business_name.split()).casefold()
+        tax = (payload.tax_number or "").strip()
+        source_parties = session.scalars(select(ErpParty).where(ErpParty.snapshot_id == snapshot.id)).all()
+        overlay_parties = app.state.delta_overlay.party_records(payload.party_kind) if app.state.delta_overlay else []
+        for source in [*source_parties, *overlay_parties]:
+            value = source if isinstance(source, dict) else source.__dict__
+            source_kind = value.get("party_kind", payload.party_kind)
+            if (str(value.get("party_code", "")).upper() == code
+                    or (source_kind in (payload.party_kind, "both") and
+                        " ".join(str(value.get("legal_or_business_name", "")).split()).casefold() == name)
+                    or (tax and str(value.get("tax_number") or "").strip() == tax)):
+                raise HTTPException(status_code=409, detail="Party duplicates protected source evidence")
+        try:
+            row = propose_party(operational_session, **payload.model_dump(), actor=user.username)
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return party_request_payload(row)
+
+    @app.post("/api/v1/master-data/party-requests/{request_key}/{action}")
+    def decide_party_creation(request_key: str, action: str, payload: PartyDecisionRequest,
+                              request: Request, operational_session=Depends(operational_session_dependency)):
+        row = operational_session.scalar(select(OperationalPartyCreationRequest).where(
+            OperationalPartyCreationRequest.request_key == request_key))
+        if not row:
+            raise HTTPException(status_code=404, detail="Party request not found")
+        user = require_csrf(request, f"{row.party_kind}.approve")
+        try:
+            decided = decide_party(operational_session, request_key, action=action,
+                                   actor=user.username, note=payload.note)
+        except ValueError as exc:
+            operational_session.rollback()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return party_request_payload(decided)
 
     @app.patch("/api/v1/master-data/parties/{party_code}")
     def update_party_master(party_code: str, payload: PartyMasterUpdateRequest, request: Request,
@@ -5858,8 +7201,29 @@ def create_app(database_url: str | None = None, snapshot_name: str | None = None
         if not record: raise HTTPException(status_code=404, detail="Operational party not found")
         if record.revision != payload.expected_revision:
             raise HTTPException(status_code=409, detail=f"Party revision conflict; current revision is {record.revision}")
+        changes = payload.model_dump(exclude_unset=True)
+        try:
+            country = (normalize_country_code(changes["country_code"]) if changes.get("country_code")
+                       else record.country_code if "country_code" not in changes else None)
+            currency = (normalize_currency_code(changes["preferred_currency_code"]) if changes.get("preferred_currency_code")
+                        else record.preferred_currency_code if "preferred_currency_code" not in changes else None)
+            tax_country = (normalize_country_code(changes["tax_country_code"]) if changes.get("tax_country_code")
+                           else record.tax_country_code if "tax_country_code" not in changes else None)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        tax = changes.get("tax_number", record.tax_number)
+        tax_type = changes.get("tax_registration_type", record.tax_registration_type)
+        if not record.source_promoted and (not country or not currency):
+            raise HTTPException(status_code=422, detail="Target-created parties require country and preferred currency")
+        if tax and (not record.source_promoted or tax_type or tax_country):
+            if tax_type not in {"vat", "gst", "other"} or not tax_country:
+                raise HTTPException(status_code=422, detail="Tax ID updates require a registration type and issuing country")
+        if not tax and (tax_type or tax_country):
+            raise HTTPException(status_code=422, detail="Tax registration details require a tax ID")
         for field in ("legal_or_business_name", "contact_name", "email", "mobile", "address", "tax_number"):
             setattr(record, field, getattr(payload, field))
+        record.country_code = country; record.preferred_currency_code = currency
+        record.tax_registration_type = tax_type; record.tax_country_code = tax_country
         record.revision += 1; record.updated_by = user.username; record.updated_at = datetime.now().astimezone()
         operational_session.add(OperationalAuditEvent(event_key=str(uuid.uuid4()), event_type="master.party.edited",
             actor=user.username, resource_key=record.party_key, detail=f"Party {record.party_code}; revision {record.revision}"))

@@ -249,6 +249,7 @@ FINANCIAL_DOCUMENT_REVIEW_EVIDENCE = {
     74: (116,), 75: (117,), 76: (118,), 77: (119,), 78: (120,),
     79: (121,), 80: (122,), 82: (124,), 86: (128,), 87: (129,),
     88: (130,), 89: (131,), 90: (132,), 91: (133,), 93: (135,),
+    83: (125,), 84: (126,), 85: (127,),
 }
 
 # These legacy blueprint controls are superseded by the separately approved
@@ -293,7 +294,7 @@ UOM_CONVERSION_GROUP_EVIDENCE = {
     101: (62, 63),
     102: (58, 59, 60, 61),
 }
-ZERO_QUANTITY_LOCATIONLESS_STOCK_EVIDENCE = {176: "92659", 177: "98024"}
+ZERO_QUANTITY_LOCATIONLESS_STOCK_EVIDENCE = {176: "92659", 177: "98024", 178: "98081"}
 
 
 def resolution_code(exception_id: int) -> str:
@@ -336,6 +337,10 @@ def resolution_code(exception_id: int) -> str:
     if exception_id in {expected["settlement_exception_id"]
                         for expected in PAYMENT_PARENT_RELATIONSHIP_EXCEPTIONS.values()}:
         return "PAYMENT_PARENT_SETTLEMENT_RECONCILED"
+    if exception_id in {64, 65}:
+        return "PENDING_TRANSFER_PRESERVED_WITHOUT_STOCK_POSTING"
+    if exception_id == 50:
+        return "PRODUCT_SPECIFIC_UOM_MOVEMENT_PROVEN"
     if exception_id in PAYMENT_PARENT_RELATIONSHIP_EXCEPTIONS:
         return "PAYMENT_PARENT_MULTI_FIELD_MATCH_PROVEN"
     if exception_id == 22:
@@ -1504,6 +1509,83 @@ def build_resolution_evidence(source_root: Path) -> dict[int, dict]:
             str(detail_hashes_path.relative_to(source_root)): sha256(detail_hashes_path),
         },
     }
+    pending_detail_path = source_root / "2026-09-08" / "stock_transfer_details_0901_0917.json"
+    require(detail_hashes.get(pending_detail_path.name) == sha256(pending_detail_path),
+            "ST2026/0141: preserved detail checksum mismatch")
+    pending_headers = [row for row in rows(transfers_path) if row["Reference No"] == "ST2026/0141"]
+    pending_details = [item for item in json.loads(pending_detail_path.read_text(encoding="utf-8"))
+                       if "Reference No: #ST2026/0141" in item.get("text", "")]
+    require(len(pending_headers) == len(pending_details) == 1,
+            "ST2026/0141: expected one frozen header and preserved detail")
+    pending_header = pending_headers[0]
+    pending_text = pending_details[0]["text"]
+    require(pending_header["Status"] == "Pending" and "Status: Pending" in pending_text,
+            "ST2026/0141: source status is not consistently pending")
+    require(pending_header["Location (From)"] == "Asas General Trading LLC"
+            and pending_header["Location (To)"] == "SHJ"
+            and "76115\tAsas General Trading LLC\tSHJ\t-\t30.00 Pack" in pending_text,
+            "ST2026/0141: pending line or locations differ")
+    for exception_id, source_movement_id, direction, location, counterparty in (
+        (64, 17845, "transfer_out", "Asas General Trading LLC", "SHJ"),
+        (65, 17846, "transfer_in", "SHJ", "Asas General Trading LLC"),
+    ):
+        result[exception_id] = {
+            "source_key": f"movement:ST2026/0141:{direction}",
+            "relationship": "frozen header and independently preserved detail prove this transfer remained Pending",
+            "source_movement_id": source_movement_id,
+            "document_no": "ST2026/0141",
+            "sku": "76115",
+            "entered_quantity": "30.00",
+            "entered_uom": "Pack",
+            "location": location,
+            "counterparty_location": counterparty,
+            "direction": direction,
+            "posting_disposition": "pending_historical_transfer_retained_as_evidence_not_stock_posted",
+            "availability_enabled": False,
+            "files": {
+                str(transfers_path.relative_to(source_root)): sha256(transfers_path),
+                str(pending_detail_path.relative_to(source_root)): sha256(pending_detail_path),
+                str(status_path.relative_to(source_root)): sha256(status_path),
+            },
+        }
+    tissue_name = "Facial Tissue - 200x2Ply-(1x6pkt)"
+    tissue_sku = "6290429015714"
+    tissue_captures = (source_products_path, products_path)
+    tissue_factors = []
+    for capture_path in tissue_captures:
+        matches = [row for row in rows(capture_path) if row["Product"] == tissue_name]
+        require(len(matches) == 1 and matches[0]["SKU"] == tissue_sku,
+                "CN2026/0010: product identity is not unique across captures")
+        stock_match = re.fullmatch(
+            r"\s*(\d+(?:\.\d+)?)\s*Pack\s*(\d+(?:\.\d+)?)\s*Carton\s*",
+            matches[0]["Sub Unit"], flags=re.IGNORECASE)
+        require(stock_match is not None and Decimal(stock_match.group(2)) > 0,
+                "CN2026/0010: product-specific pack/carton snapshot is absent")
+        tissue_factors.append(Decimal(stock_match.group(1)) / Decimal(stock_match.group(2)))
+    require(tissue_factors == [Decimal("6"), Decimal("6")],
+            "CN2026/0010: two product captures do not prove the same carton factor")
+    return_details = [item for item in json.loads(sales_returns_path.read_text(encoding="utf-8"))
+                      if "Sell Return (Invoice No.: CN2026/0010)" in item.get("text", "")]
+    require(len(return_details) == 1 and
+            f"{tissue_name}\t64.9998\t0.50 Carton\t32.4999" in return_details[0]["text"],
+            "CN2026/0010: preserved return line does not prove the entered quantity")
+    result[50] = {
+        "source_key": "movement:CN2026/0010:sale_return:75",
+        "relationship": "unique product master in both captures and preserved return detail prove a product-specific carton-to-pack factor",
+        "source_movement_id": 9570,
+        "source_line_id": 75,
+        "document_no": "CN2026/0010",
+        "sku": tissue_sku,
+        "product_name": tissue_name,
+        "entered_quantity": "0.50",
+        "entered_uom": "Carton",
+        "canonical_uom": "Pack",
+        "factor_to_base_snapshot": "6",
+        "quantity_base": "3.00",
+        "posting_disposition": "conversion_evidence_recorded_historical_posting_remains_disabled",
+        "files": {str(path.relative_to(source_root)): sha256(path)
+                  for path in (*tissue_captures, sales_returns_path)},
+    }
     for exception_id, source_movement_id, direction, location, counterparty in (
         (56, 9585, "transfer_out", "Asas General Trading LLC", "DXB"),
         (57, 9586, "transfer_in", "DXB", "Asas General Trading LLC"),
@@ -1699,7 +1781,10 @@ def build_resolution_evidence(source_root: Path) -> dict[int, dict]:
         }
 
     for queue_exception_id, sku in ZERO_QUANTITY_LOCATIONLESS_STOCK_EVIDENCE.items():
-        matches = [row for row in frozen_stock if row["SKU"] == sku and not row["Location"]
+        evidence_stock_path = (source_root / "2026-09-08" / "stock_snapshot_all_locations.csv"
+                               if queue_exception_id == 178 else stock_path)
+        evidence_stock = rows(evidence_stock_path) if queue_exception_id == 178 else frozen_stock
+        matches = [row for row in evidence_stock if row["SKU"] == sku and not row["Location"]
                    and quantity(row["Available Stock"]) == Decimal("0")]
         require(len(matches) == 1, f"{sku}: expected one locationless zero-quantity source row")
         result[queue_exception_id] = {
@@ -1708,17 +1793,27 @@ def build_resolution_evidence(source_root: Path) -> dict[int, dict]:
             "sku": sku, "quantity_base": "0.00", "location": None,
             "availability_enabled": False,
             "posting_disposition": "zero_quantity_locationless_row_excluded_from_stock_posting",
-            "files": {str(stock_path.relative_to(source_root)): sha256(stock_path)},
+            "files": {str(evidence_stock_path.relative_to(source_root)): sha256(evidence_stock_path)},
         }
+        if queue_exception_id == 178:
+            require(result[188]["source_key"] == sku and
+                    result[188]["master_quantity"] == result[188]["location_quantity"],
+                    "98081: later master and location totals must reconcile before excluding zero row")
+            result[queue_exception_id]["supporting_evidence_ids"] = [188]
     return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Resolve only checksum-proven earlier-snapshot drift exceptions")
     parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--exception-id", type=int, help="Apply or inspect only one proven queue exception")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
     evidence = build_resolution_evidence(args.source_root)
+    if args.exception_id is not None:
+        if args.exception_id not in evidence:
+            parser.error(f"exception {args.exception_id} has no checksum-proven resolution")
+        evidence = {args.exception_id: evidence[args.exception_id]}
     output = {"mode": "apply" if args.apply else "dry-run", "batch_key": BATCH_KEY,
               "proven_exception_ids": sorted(evidence), "evidence": evidence,
               "source_mutation": False, "posting_enabled": False}

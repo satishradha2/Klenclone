@@ -29,8 +29,16 @@ def load_provisioned_users(path: str | None, fallback_username: str, fallback_ha
                             "sales_return.create", "sales_return.edit", "sales_return.submit", "sales_return.cancel",
                             "purchase_return.create", "purchase_return.edit", "purchase_return.submit", "purchase_return.cancel",
                             "payment.create", "payment.edit", "payment.submit", "payment.cancel",
+                            "customer_refund.create", "customer_refund.submit", "customer_refund.cancel",
+                            "customer_refund.approve", "customer_refund.rehearse",
+                            "customer_refund_recovery.create", "customer_refund_recovery.submit",
+                            "customer_refund_recovery.cancel", "customer_refund_recovery.approve",
+                            "customer_refund_recovery.rehearse",
+                            "customer_price_credit.create", "customer_price_credit.submit", "customer_price_credit.cancel",
+                            "customer_price_credit.approve", "customer_price_credit.rehearse",
                             "credit.limit.prepare", "credit.override.prepare", "collection.manage", "collection.escalation.prepare",
                             "cash.account.prepare", "bank.statement.import", "bank.reconcile.prepare",
+                            "fx.rate.read", "fx.rate.prepare",
                             "financial_report.read", "posting.execute", "posting.reverse", "enterprise.setup", "enterprise.approve"],
             "allowed_locations": ["*"],
         }]
@@ -42,8 +50,18 @@ def load_provisioned_users(path: str | None, fallback_username: str, fallback_ha
         roles = tuple(raw.get("roles") or ())
         permissions = set(raw.get("permissions") or ())
         if "operations_administrator" in roles:
+            permissions.update({"customer_price_credit.create", "customer_price_credit.submit",
+                                "customer_price_credit.cancel", "customer_refund.create",
+                                "customer_refund.submit", "customer_refund.cancel",
+                                "customer_refund_recovery.create", "customer_refund_recovery.submit",
+                                "customer_refund_recovery.cancel"})
+            permissions.update({"fx.rate.read", "fx.rate.prepare"})
+            permissions.update({"trade.quote.prepare", "trade.order.prepare",
+                                "trade.delivery.prepare", "trade.dispatch.prepare",
+                                "export_tax.prepare"})
             permissions.update({"barcode.manage", "serial.manage", "warehouse.scan",
-                                "product.manage", "recall.manage", "warehouse.task.execute"})
+                                "product.manage", "customer.manage", "supplier.manage",
+                                "recall.manage", "warehouse.task.execute"})
             permissions.update({"hrm.read", "hrm.manage", "hrm.lifecycle.prepare"})
             permissions.update({"pos.read", "pos.manage", "pos.sale", "cash.close.prepare"})
             permissions.update({"van.read", "van.route.prepare", "van.shift", "van.sale",
@@ -63,6 +81,13 @@ def load_provisioned_users(path: str | None, fallback_username: str, fallback_ha
             permissions.update({"cutover_rehearsal.read", "cutover_rehearsal.prepare",
                                 "cutover_rehearsal.submit", "cutover_rehearsal.export"})
         if {"finance_approver", "independent_approver"}.intersection(roles):
+            permissions.update({"customer_price_credit.approve", "customer_price_credit.rehearse",
+                                "customer_refund.approve", "customer_refund.rehearse",
+                                "customer_refund_recovery.approve", "customer_refund_recovery.rehearse"})
+            permissions.update({"fx.rate.read", "fx.rate.approve"})
+            permissions.update({"trade.quote.approve", "trade.order.approve",
+                                "trade.delivery.approve", "trade.dispatch.approve",
+                                "export_tax.approve"})
             permissions.update({"expense.approve", "expense.rehearse", "petty_cash.approve",
                                 "fixed_asset.approve", "fixed_asset.disposal.approve",
                                 "fixed_asset.rehearse", "vat.period.approve",
@@ -74,8 +99,11 @@ def load_provisioned_users(path: str | None, fallback_username: str, fallback_ha
                                 "audit_compliance.export"})
             permissions.update({"cutover_rehearsal.read", "cutover_rehearsal.approve",
                                 "cutover_rehearsal.export"})
+        if "tax_officer" in roles:
+            permissions.add("export_tax.prepare")
         if "independent_approver" in roles:
-            permissions.update({"recall.approve", "warehouse.task.execute"})
+            permissions.update({"recall.approve", "product.approve", "customer.approve",
+                                "supplier.approve", "warehouse.task.execute"})
             permissions.update({"hrm.read", "hrm.lifecycle.approve"})
             permissions.update({"pos.read", "cash.close.approve"})
             permissions.update({"van.read", "van.shift.approve", "van.stock.approve", "van.close.approve"})

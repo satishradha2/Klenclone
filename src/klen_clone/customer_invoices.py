@@ -12,16 +12,16 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
-from .delivery_fulfillment import OperationalDeliveryFulfillment
+from .delivery_fulfillment import OperationalDeliveryFulfillment, OperationalDeliveryStockMovement
 from .operational import MONEY, OperationalAuditEvent, OperationalBase, OperationalFiscalPeriod, utc_now
-from .sales_orders import OperationalSalesOrder
+from .sales_orders import OperationalSalesOrder, assert_allocated_sales_totals
 
 
 class OperationalCustomerInvoice(OperationalBase):
     __tablename__ = "operational_customer_invoices"
     __table_args__ = (
         UniqueConstraint("fulfillment_id", name="uq_customer_invoice_fulfillment"),
-        CheckConstraint("status IN ('draft','submitted','approved','rejected','cancelled')", name="ck_customer_invoice_status"),
+        CheckConstraint("status IN ('draft','submitted','approved','rejected','cancelled','posted','reversed')", name="ck_customer_invoice_status"),
         CheckConstraint("posting_enabled = false", name="ck_customer_invoice_no_posting"),
         CheckConstraint("subtotal >= 0 AND discount_amount >= 0 AND tax_amount >= 0 AND total_amount >= 0", name="ck_customer_invoice_totals"),
     )
@@ -40,10 +40,10 @@ class OperationalCustomerInvoice(OperationalBase):
     invoice_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     due_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     currency_code: Mapped[str] = mapped_column(String(3), nullable=False, default="AED")
-    subtotal: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
-    discount_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
-    tax_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
-    total_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    subtotal: Mapped[Decimal] = mapped_column(Numeric(19, 3), nullable=False)
+    discount_amount: Mapped[Decimal] = mapped_column(Numeric(19, 3), nullable=False)
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(19, 3), nullable=False)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(19, 3), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft", index=True)
     posting_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     notes: Mapped[str | None] = mapped_column(Text)
@@ -83,9 +83,10 @@ class OperationalCustomerInvoiceLine(OperationalBase):
     quantity_base: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
     unit_price: Mapped[Decimal] = mapped_column(Numeric(18, 4), nullable=False)
     tax_rate: Mapped[Decimal] = mapped_column(Numeric(7, 4), nullable=False)
-    net_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
-    tax_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
-    gross_amount: Mapped[Decimal] = mapped_column(Numeric(18, 2), nullable=False)
+    net_amount: Mapped[Decimal] = mapped_column(Numeric(19, 3), nullable=False)
+    discount_amount: Mapped[Decimal] = mapped_column(Numeric(19, 3), nullable=False, default=Decimal("0"))
+    tax_amount: Mapped[Decimal] = mapped_column(Numeric(19, 3), nullable=False)
+    gross_amount: Mapped[Decimal] = mapped_column(Numeric(19, 3), nullable=False)
     invoice: Mapped[OperationalCustomerInvoice] = relationship(back_populates="lines")
 
 
@@ -126,6 +127,48 @@ def _money(value) -> Decimal:
     return Decimal(str(value or 0)).quantize(MONEY, rounding=ROUND_HALF_UP)
 
 
+def invoice_dispatch_valuation(session: Session, invoice: OperationalCustomerInvoice) -> tuple[Decimal, list[dict]]:
+    """Tie each invoiced quantity to its immutable, physical dispatch cost."""
+    if not invoice.lines:
+        raise ValueError("Customer invoice has no delivered lines")
+    movements = list(session.scalars(select(OperationalDeliveryStockMovement).where(
+        OperationalDeliveryStockMovement.fulfillment_id == invoice.fulfillment_id).with_for_update()))
+    by_line = {row.fulfillment_line_id: row for row in movements}
+    if len(movements) != len(invoice.lines) or len(by_line) != len(invoice.lines):
+        raise ValueError("Invoice and dispatch issue lines do not reconcile")
+    evidence = []
+    for line in invoice.lines:
+        movement = by_line.get(line.delivery_line_id)
+        if (movement is None or movement.sku != line.sku or
+                movement.location_code != invoice.location_code or
+                Decimal(movement.quantity_base) != Decimal(line.quantity_base)):
+            raise ValueError(f"Invoice and dispatch issue do not reconcile for {line.sku}")
+        if movement.unit_cost_snapshot is None or movement.issue_value_snapshot is None:
+            raise ValueError(f"Dispatch issue valuation is missing for {line.sku}; legacy evidence requires review")
+        if Decimal(movement.unit_cost_snapshot) <= 0:
+            raise ValueError(f"Dispatch issue cost for {line.sku} is zero; cost evidence requires review")
+        expected = _money(Decimal(movement.quantity_base) * Decimal(movement.unit_cost_snapshot))
+        if expected != _money(movement.issue_value_snapshot):
+            raise ValueError(f"Dispatch issue valuation does not reconcile for {line.sku}")
+        evidence.append({"movement_key": movement.movement_key, "delivery_line_id": line.delivery_line_id,
+            "sku": line.sku, "quantity_base": str(line.quantity_base),
+            "unit_cost_snapshot": str(movement.unit_cost_snapshot),
+            "issue_value_snapshot": str(movement.issue_value_snapshot)})
+    return sum((_money(row["issue_value_snapshot"]) for row in evidence), Decimal("0.00")), evidence
+
+
+def _rehearsal_fingerprint(invoice: OperationalCustomerInvoice, period_key: str,
+                           journal: list[dict], dispatch_evidence: list[dict]) -> str:
+    source = json.dumps({
+        "invoice_key": invoice.invoice_key, "revision": invoice.revision,
+        "period_key": period_key, "journal": journal,
+        "delivery_note": invoice.delivery_note_no_snapshot,
+        "pod_reference": invoice.pod_reference_snapshot,
+        "dispatch_evidence": dispatch_evidence,
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
 def create_customer_invoice(
     session: Session, fulfillment: OperationalDeliveryFulfillment, *, actor: str,
     invoice_date: date, due_date: date, notes: str | None = None,
@@ -143,6 +186,17 @@ def create_customer_invoice(
     if due_date < invoice_date:
         raise ValueError("Invoice due date cannot be earlier than its invoice date")
     order = fulfillment.sales_order
+    foreign = order.customer_country_code not in (None, "AE")
+    tax_decision = None
+    if foreign:
+        from .cross_border_invoice_tax import approved_export_tax_decision
+        from .country_catalog import quotation_money_quantum
+        tax_decision = approved_export_tax_decision(session, fulfillment, invoice_date=invoice_date)
+        quantum = quotation_money_quantum(order.currency_code)
+        if any(Decimal(value) != Decimal(value).quantize(quantum) for value in
+               (order.subtotal, order.discount_amount, order.tax_amount, order.total_amount)):
+            raise ValueError("Order totals do not match invoice currency precision")
+    assert_allocated_sales_totals(order)
     order_lines = {line.line_no: line for line in order.lines}
     if len(order_lines) != len(fulfillment.lines):
         raise ValueError("Delivered lines do not match the source sales order")
@@ -172,9 +226,17 @@ def create_customer_invoice(
             factor_to_base_snapshot=source.factor_to_base_snapshot,
             quantity_base=source.quantity_base, unit_price=source.unit_price,
             tax_rate=source.tax_rate, net_amount=source.net_amount,
+            discount_amount=source.discount_amount,
             tax_amount=source.tax_amount, gross_amount=source.gross_amount,
         ))
     session.add(invoice); session.flush()
+    if tax_decision:
+        from .cross_border_invoice_tax import OperationalExportTaxInvoiceUse
+        tax_decision.status = "consumed"
+        tax_decision.revision += 1
+        tax_decision.consumed_by = actor
+        tax_decision.consumed_at = utc_now()
+        session.add(OperationalExportTaxInvoiceUse(decision_id=tax_decision.id, invoice_id=invoice.id))
     session.add(OperationalAuditEvent(
         event_key=str(uuid.uuid4()), event_type="customer_invoice.created", actor=actor,
         resource_key=invoice.invoice_key,
@@ -199,6 +261,8 @@ def transition_customer_invoice(
     target = transitions.get((invoice.status, action))
     if not target:
         raise ValueError(f"Action {action} is not allowed from {invoice.status}")
+    if invoice.sales_order.customer_country_code not in (None, "AE") and action not in {"cancel"}:
+        raise ValueError("Foreign invoice submission and approval remain held pending settlement and tax-policy acceptance")
     if action in {"approve", "reject"}:
         if invoice.created_by == actor:
             raise PermissionError("Maker-checker control prevents the creator from deciding this customer invoice")
@@ -235,6 +299,7 @@ def customer_invoice_rehearsal_payload(
         "rehearsal_key": row.rehearsal_key, "invoice_key": invoice.invoice_key,
         "invoice_no": invoice.invoice_no, "invoice_revision": row.invoice_revision,
         "period_key": row.period_key, "posting_fingerprint": row.posting_fingerprint,
+        "idempotency_key": f"customer-invoice:{invoice.invoice_key}:{row.invoice_revision}:{row.posting_fingerprint[:20]}",
         "journal": journal, "reversal": reversal, "debit": debit, "credit": credit,
         "inventory_movements": [], "stock_issue_source": invoice.delivery_note_no_snapshot,
         "posting_performed": False, "posting_enabled": False,
@@ -247,6 +312,7 @@ def rehearse_customer_invoice(
 ) -> dict:
     if invoice.status != "approved":
         raise ValueError("Only an approved customer invoice can enter posting rehearsal")
+    cogs, dispatch_evidence = invoice_dispatch_valuation(session, invoice)
     period = session.scalar(select(OperationalFiscalPeriod).where(
         OperationalFiscalPeriod.starts_on <= invoice.invoice_date,
         OperationalFiscalPeriod.ends_on >= invoice.invoice_date).with_for_update())
@@ -256,12 +322,23 @@ def rehearse_customer_invoice(
         OperationalCustomerInvoicePostingRehearsal.invoice_id == invoice.id,
         OperationalCustomerInvoicePostingRehearsal.invoice_revision == invoice.revision))
     if existing:
+        recorded_journal = json.loads(existing.journal_json)
+        if [row["account_code"] for row in recorded_journal] != ["1200", "4000", "2120", "5000", "1300"]:
+            raise ValueError("Customer-invoice rehearsal predates dispatch valuation and requires review")
+        recorded_cogs = sum((_money(row["debit"]) for row in recorded_journal
+                             if row["account_code"] == "5000"), Decimal("0.00"))
+        if recorded_cogs != cogs:
+            raise ValueError("Dispatch valuation changed after customer-invoice rehearsal")
+        if _rehearsal_fingerprint(invoice, period.period_key, recorded_journal, dispatch_evidence) != existing.posting_fingerprint:
+            raise ValueError("Customer-invoice posting evidence changed after rehearsal")
         return customer_invoice_rehearsal_payload(existing, invoice, idempotent_replay=True)
     revenue = _money(invoice.subtotal - invoice.discount_amount)
     journal = [
         {"account": "Trade receivables", "account_code": "1200", "debit": str(_money(invoice.total_amount)), "credit": "0"},
         {"account": "Sales revenue", "account_code": "4000", "debit": "0", "credit": str(revenue)},
         {"account": "Output VAT payable", "account_code": "2120", "debit": "0", "credit": str(_money(invoice.tax_amount))},
+        {"account": "Cost of goods sold", "account_code": "5000", "debit": str(cogs), "credit": "0"},
+        {"account": "Inventory", "account_code": "1300", "debit": "0", "credit": str(cogs)},
     ]
     debit = sum((_money(line["debit"]) for line in journal), Decimal("0.00"))
     credit = sum((_money(line["credit"]) for line in journal), Decimal("0.00"))
@@ -269,16 +346,10 @@ def rehearse_customer_invoice(
         raise RuntimeError(f"Customer invoice rehearsal is not balanced: debit {debit}, credit {credit}")
     reversal = {"journal": [{**line, "debit": line["credit"], "credit": line["debit"]}
                             for line in reversed(journal)], "inventory_movements": []}
-    fingerprint_source = json.dumps({
-        "invoice_key": invoice.invoice_key, "revision": invoice.revision,
-        "period_key": period.period_key, "journal": journal,
-        "delivery_note": invoice.delivery_note_no_snapshot,
-        "pod_reference": invoice.pod_reference_snapshot,
-    }, sort_keys=True, separators=(",", ":"))
     row = OperationalCustomerInvoicePostingRehearsal(
         rehearsal_key=str(uuid.uuid4()), invoice_id=invoice.id,
         invoice_revision=invoice.revision, period_key=period.period_key,
-        posting_fingerprint=hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest(),
+        posting_fingerprint=_rehearsal_fingerprint(invoice, period.period_key, journal, dispatch_evidence),
         journal_json=json.dumps(journal, sort_keys=True),
         reversal_json=json.dumps(reversal, sort_keys=True), status="verified",
         posting_enabled=False, generated_by=actor)
@@ -286,7 +357,7 @@ def rehearse_customer_invoice(
     session.add(OperationalAuditEvent(
         event_key=str(uuid.uuid4()), event_type="customer_invoice.posting_rehearsed",
         actor=actor, resource_key=invoice.invoice_key,
-        detail=f"balanced {debit}; AR/revenue/VAT only; stock already issued by {invoice.delivery_note_no_snapshot}; non-posting rehearsal"))
+        detail=f"balanced {debit}; AR/revenue/VAT and dispatch-cost COGS/inventory; stock already issued by {invoice.delivery_note_no_snapshot}; non-posting rehearsal"))
     session.commit()
     return customer_invoice_rehearsal_payload(row, invoice)
 
@@ -305,6 +376,10 @@ def customer_invoice_control_counts(session: Session) -> dict:
             OperationalCustomerInvoice.status == "submitted")) or 0,
         "approved": session.scalar(select(func.count(OperationalCustomerInvoice.id)).where(
             OperationalCustomerInvoice.status == "approved")) or 0,
+        "posted": session.scalar(select(func.count(OperationalCustomerInvoice.id)).where(
+            OperationalCustomerInvoice.status == "posted")) or 0,
+        "reversed": session.scalar(select(func.count(OperationalCustomerInvoice.id)).where(
+            OperationalCustomerInvoice.status == "reversed")) or 0,
         "rehearsals": session.scalar(select(func.count(OperationalCustomerInvoicePostingRehearsal.id))) or 0,
         "posting_enabled": False,
     }

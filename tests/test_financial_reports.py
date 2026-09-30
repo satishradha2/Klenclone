@@ -7,8 +7,10 @@ from klen_clone.financial_reports import ageing_bucket, build_accounting_summary
 from klen_clone.models import (Base, ErpParty, ErpTransactionDocument, RawFileManifest,
                                RawRecord, SourceSnapshot, StgContact)
 from klen_clone.operational import (OperationalOpeningBalanceBatch, OperationalOpeningPartyBalance,
-                                    initialize_operational_database, make_operational_engine)
-from klen_clone.payments import create_payment, transition_payment
+                                    OperationalFiscalPeriod, initialize_operational_database,
+                                    make_operational_engine)
+from klen_clone.payments import create_payment, rehearse_payment_posting, transition_payment
+from klen_clone.posting_integration import execute_integrated_posting
 
 
 def report_sessions(tmp_path):
@@ -90,6 +92,31 @@ def test_ageing_keeps_opening_control_and_invoice_evidence_separate(tmp_path):
     assert row["net_exposure"] == Decimal("65.00")
     assert row["reconciliation_status"] == "review_required"
     assert report["due_date_available"] is False and report["posting_enabled"] is False
+
+
+def test_ageing_keeps_posted_claims_and_applies_as_of_cutoff(tmp_path):
+    clone, operational, snapshot_id = report_sessions(tmp_path)
+    before = build_ageing_report(clone, operational, snapshot_id=snapshot_id,
+        ledger_kind="receivable", as_of=date(2026, 9, 8))
+    assert before["items"][0]["submitted_allocation"] == Decimal("0.00")
+    assert before["items"][0]["invoice_evidence_outstanding"] == Decimal("110.00")
+    operational.add(OperationalFiscalPeriod(period_key="2026-09", starts_on=date(2026, 9, 1),
+        ends_on=date(2026, 9, 30), status="open", rehearsal_enabled=True,
+        approval_reference="synthetic-report-test", configured_by="finance"))
+    operational.commit()
+    from klen_clone.payments import OperationalPayment
+    payment = operational.query(OperationalPayment).one()
+    payment = transition_payment(operational, payment, expected_revision=2,
+        action="approve", actor="checker")
+    plan = rehearse_payment_posting(operational, payment, actor="checker")
+    execute_integrated_posting(operational, resource_type="payment",
+        resource_key=payment.payment_key, idempotency_key=plan["idempotency_key"], actor="checker")
+    after = build_ageing_report(clone, operational, snapshot_id=snapshot_id,
+        ledger_kind="receivable", as_of=date(2026, 9, 9))
+    assert after["items"][0]["approved_unposted_allocation"] == Decimal("0.00")
+    assert after["items"][0]["posted_allocation"] == Decimal("20.00")
+    assert after["items"][0]["posted_advance"] == Decimal("10.00")
+    assert after["items"][0]["invoice_evidence_outstanding"] == Decimal("90.00")
 
 
 def test_accounting_summary_is_evidence_only_and_balanced_at_zero(tmp_path):

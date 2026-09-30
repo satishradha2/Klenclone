@@ -13,6 +13,7 @@ from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from .operational import MONEY, OperationalAuditEvent, OperationalBase, utc_now
 from .payments import OperationalPayment
+from .customer_refunds import OperationalCustomerRefund, OperationalCustomerRefundRecovery
 
 
 def _money(value) -> Decimal:
@@ -101,6 +102,9 @@ class OperationalStatementLine(OperationalBase):
     status: Mapped[str] = mapped_column(String(20), default="unmatched", nullable=False)
     suggested_payment_id: Mapped[int | None] = mapped_column(ForeignKey("operational_payments.id"))
     matched_payment_id: Mapped[int | None] = mapped_column(ForeignKey("operational_payments.id"))
+    matched_refund_id: Mapped[int | None] = mapped_column(ForeignKey("operational_customer_refunds.id"), unique=True)
+    matched_recovery_id: Mapped[int | None] = mapped_column(
+        ForeignKey("operational_customer_refund_recoveries.id"), unique=True)
     match_basis: Mapped[str | None] = mapped_column(String(100))
     exception_category: Mapped[str | None] = mapped_column(String(30))
     exception_reason: Mapped[str | None] = mapped_column(Text)
@@ -109,6 +113,9 @@ class OperationalStatementLine(OperationalBase):
     batch: Mapped[OperationalStatementBatch] = relationship(back_populates="lines")
     suggested_payment: Mapped[OperationalPayment | None] = relationship(foreign_keys=[suggested_payment_id])
     matched_payment: Mapped[OperationalPayment | None] = relationship(foreign_keys=[matched_payment_id])
+    matched_refund: Mapped[OperationalCustomerRefund | None] = relationship(foreign_keys=[matched_refund_id])
+    matched_recovery: Mapped[OperationalCustomerRefundRecovery | None] = relationship(
+        foreign_keys=[matched_recovery_id])
 
 
 class OperationalReconciliationRehearsal(OperationalBase):
@@ -308,6 +315,50 @@ def match_statement_line(session: Session, batch: OperationalStatementBatch,
     return line
 
 
+def match_refund_statement_line(session: Session, batch: OperationalStatementBatch,
+                                line: OperationalStatementLine, refund, *, actor: str) -> OperationalStatementLine:
+    if batch.status != "draft" or line.status != "unmatched":
+        raise ValueError("Only an unmatched draft bank line can confirm a refund")
+    if refund.status != "approved" or refund.cash_account_code != batch.account.account_code:
+        raise ValueError("An approved refund at this bank account is required")
+    if line.debit_amount != refund.amount or line.credit_amount != 0 or line.transaction_date != refund.refund_date:
+        raise ValueError("Bank debit amount, direction or date does not match the approved refund")
+    if session.scalar(select(OperationalStatementLine.id).where(
+            OperationalStatementLine.matched_refund_id == refund.id)):
+        raise ValueError("This refund is already matched to a bank debit")
+    line.status, line.matched_refund_id = "matched", refund.id
+    line.match_basis = "exact approved customer refund: account + debit + amount + date"
+    line.resolved_by, line.resolved_at = actor, utc_now()
+    session.add(OperationalAuditEvent(event_key=str(uuid.uuid4()), event_type="bank_statement.refund_matched",
+        actor=actor, resource_key=batch.batch_key,
+        detail=f"line {line.line_no}; {refund.refund_no}; AED {refund.amount}"))
+    session.commit()
+    return line
+
+
+def match_recovery_statement_line(session: Session, batch: OperationalStatementBatch,
+                                  line: OperationalStatementLine, recovery, *, actor: str):
+    if batch.status != "draft" or line.status != "unmatched":
+        raise ValueError("Only an unmatched draft bank line can confirm a recovery")
+    if recovery.status != "approved" or recovery.cash_account_code != batch.account.account_code:
+        raise ValueError("An approved recovery at this bank account is required")
+    if (line.credit_amount != recovery.amount or line.debit_amount != 0
+            or line.transaction_date != recovery.recovery_date):
+        raise ValueError("Recovery bank credit amount, direction or date does not match")
+    if session.scalar(select(OperationalStatementLine.id).where(
+            OperationalStatementLine.matched_recovery_id == recovery.id)):
+        raise ValueError("This recovery is already matched to a bank credit")
+    line.status, line.matched_recovery_id = "matched", recovery.id
+    line.match_basis = "exact approved refund recovery: account + credit + amount + date"
+    line.resolved_by, line.resolved_at = actor, utc_now()
+    session.add(OperationalAuditEvent(event_key=str(uuid.uuid4()),
+        event_type="bank_statement.recovery_matched", actor=actor,
+        resource_key=batch.batch_key,
+        detail=f"line {line.line_no}; {recovery.recovery_no}; AED {recovery.amount}"))
+    session.commit()
+    return line
+
+
 def explain_statement_line(session: Session, batch: OperationalStatementBatch,
                            line: OperationalStatementLine, *, category: str,
                            reason: str, actor: str) -> OperationalStatementLine:
@@ -418,6 +469,10 @@ def statement_payload(session: Session, batch: OperationalStatementBatch) -> dic
             "suggested_payment_no": line.suggested_payment.payment_no if line.suggested_payment else None,
             "matched_payment_key": line.matched_payment.payment_key if line.matched_payment else None,
             "matched_payment_no": line.matched_payment.payment_no if line.matched_payment else None,
+            "matched_refund_key": line.matched_refund.refund_key if line.matched_refund else None,
+            "matched_refund_no": line.matched_refund.refund_no if line.matched_refund else None,
+            "matched_recovery_key": line.matched_recovery.recovery_key if line.matched_recovery else None,
+            "matched_recovery_no": line.matched_recovery.recovery_no if line.matched_recovery else None,
             "match_basis": line.match_basis, "exception_category": line.exception_category,
             "exception_reason": line.exception_reason, "resolved_by": line.resolved_by}
             for line in batch.lines]}

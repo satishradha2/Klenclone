@@ -13,6 +13,7 @@ dependencies = [
   "fastapi>=0.115,<1",
   "uvicorn>=0.30,<1",
   "alembic>=1.13,<2",
+  "pycountry==26.2.16",
   "tzdata>=2025.2; platform_system == 'Windows'",
 ]
 

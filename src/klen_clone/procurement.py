@@ -192,6 +192,8 @@ def _supplier(session: Session, code: str) -> OperationalPartyMaster:
         OperationalPartyMaster.party_code == code.strip(), OperationalPartyMaster.status == "active"))
     if row is None or row.party_kind not in {"supplier", "both"}:
         raise ValueError(f"Active supplier {code} was not found")
+    if row.country_code not in (None, "AE"):
+        raise ValueError("Cross-border supplier sourcing is held until tax, FX and trade controls are configured")
     return row
 
 

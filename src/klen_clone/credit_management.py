@@ -159,6 +159,7 @@ def _money(value) -> Decimal:
 
 def customer_exposure(session: Session, party_code: str, *, as_of: date) -> dict:
     from .customer_invoices import OperationalCustomerInvoice
+    from .sales_returns import target_invoice_credit_total
     from .sales_orders import OperationalSalesOrder
 
     opening_receivable = _money(session.scalar(select(func.coalesce(func.sum(
@@ -173,14 +174,16 @@ def customer_exposure(session: Session, party_code: str, *, as_of: date) -> dict
             OperationalOpeningPartyBalance.balance_type == "customer_advance")) or 0)
     approved_invoices = list(session.scalars(select(OperationalCustomerInvoice).where(
         OperationalCustomerInvoice.customer_code == party_code,
-        OperationalCustomerInvoice.status == "approved",
+        OperationalCustomerInvoice.status.in_(("approved", "posted")),
         OperationalCustomerInvoice.invoice_date <= as_of)))
     invoice_total = _money(sum((invoice.total_amount for invoice in approved_invoices), Decimal("0")))
+    credit_total = _money(sum((target_invoice_credit_total(
+        session, invoice.invoice_key, as_of=as_of) for invoice in approved_invoices), Decimal("0")))
     approved_receipts = _money(session.scalar(select(func.coalesce(func.sum(
         OperationalPayment.amount), 0)).where(
             OperationalPayment.party_code == party_code,
             OperationalPayment.payment_type == "customer_receipt",
-            OperationalPayment.status == "approved",
+            OperationalPayment.status.in_(("approved", "posted")),
             OperationalPayment.payment_date <= as_of)) or 0)
     pending_receipts = _money(session.scalar(select(func.coalesce(func.sum(
         OperationalPayment.amount), 0)).where(
@@ -188,11 +191,11 @@ def customer_exposure(session: Session, party_code: str, *, as_of: date) -> dict
             OperationalPayment.payment_type == "customer_receipt",
             OperationalPayment.status == "submitted",
             OperationalPayment.payment_date <= as_of)) or 0)
-    exposure = _money(opening_receivable - opening_advance + invoice_total - approved_receipts)
+    exposure = _money(opening_receivable - opening_advance + invoice_total - credit_total - approved_receipts)
 
     invoiced_orders = select(OperationalCustomerInvoice.sales_order_id)
     open_order_total = _money(session.scalar(select(func.coalesce(func.sum(
-        OperationalSalesOrder.total_amount), 0)).where(
+        func.coalesce(OperationalSalesOrder.aed_total_snapshot, OperationalSalesOrder.total_amount)), 0)).where(
             OperationalSalesOrder.customer_code == party_code,
             OperationalSalesOrder.status == "confirmed",
             OperationalSalesOrder.id.not_in(invoiced_orders))) or 0)
@@ -200,7 +203,7 @@ def customer_exposure(session: Session, party_code: str, *, as_of: date) -> dict
     overdue = []
     overdue_total = Decimal("0.00")
     for invoice in approved_invoices:
-        settlement = customer_invoice_settlement(session, invoice)
+        settlement = customer_invoice_settlement(session, invoice, as_of=as_of)
         outstanding = _money(settlement["outstanding_amount"])
         if outstanding > 0 and invoice.due_date < as_of:
             days = (as_of - invoice.due_date).days
@@ -211,7 +214,8 @@ def customer_exposure(session: Session, party_code: str, *, as_of: date) -> dict
     overdue.sort(key=lambda row: (-row["days_overdue"], row["invoice_no"]))
     return {
         "opening_receivable": opening_receivable, "opening_advance": opening_advance,
-        "approved_invoice_total": invoice_total, "approved_receipt_total": approved_receipts,
+        "approved_invoice_total": invoice_total, "approved_credit_total": credit_total,
+        "approved_receipt_total": approved_receipts,
         "pending_receipt_total": pending_receipts, "receivable_exposure": max(Decimal("0.00"), exposure),
         "open_order_commitment": open_order_total,
         "credit_exposure": max(Decimal("0.00"), _money(exposure + open_order_total)),
@@ -293,6 +297,8 @@ def credit_workspace_payload(session: Session, parties: list[dict], *, as_of: da
     for quotation in session.scalars(select(OperationalSalesQuotation).where(
             OperationalSalesQuotation.status == "accepted").order_by(
             OperationalSalesQuotation.created_at.desc()).limit(200)):
+        if quotation.customer_country_code not in (None, "AE"):
+            continue  # Cross-border orders require AED credit without the legacy override path.
         block = customer_credit_block(session, quotation.customer_code,
                                       order_amount=quotation.total_amount, as_of=as_of)
         if block:
@@ -354,6 +360,8 @@ def create_credit_override_request(session: Session, quotation, *, valid_until: 
                                    as_of: date) -> OperationalCreditOverrideRequest:
     if quotation.status != "accepted":
         raise ValueError("Only a customer-accepted quotation can request a credit override")
+    if quotation.customer_country_code not in (None, "AE"):
+        raise ValueError("Cross-border credit overrides require a separate currency-safe approval workflow")
     if valid_until < as_of:
         raise ValueError("Credit override validity cannot be in the past")
     if (valid_until - as_of).days > 30:

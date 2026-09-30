@@ -54,7 +54,8 @@ def test_approval_creates_linked_credit_note_and_balanced_rehearsal(tmp_path):
     assert plan["original_invoice_reference"]=="INV-100"
     assert rehearse_sales_return_posting(session,document,actor="approver")["idempotent_replay"] is True
     assert session.scalar(select(func.count(OperationalSalesReturnPostingRehearsal.id)))==1
-    assert sales_return_control_counts(session)=={"returns":1,"credit_notes":1,"posted":0}
+    assert sales_return_control_counts(session)=={"returns":1,"credit_notes":1,"posted":0,
+                                                  "refund_payable":Decimal("0.00")}
     assert session.scalar(select(func.count(OperationalSalesReturnWorkflowEvent.id)))==2
     assert session.scalar(select(func.count(OperationalAuditEvent.id)))==4
 

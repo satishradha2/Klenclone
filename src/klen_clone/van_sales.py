@@ -5,7 +5,7 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 
-from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, select
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, or_, select
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from .enterprise_setup import OperationalVan
@@ -117,6 +117,8 @@ def create_route(session: Session, *, van_code: str, route_date: date, driver_na
         row=session.scalar(select(OperationalPartyMaster).where(OperationalPartyMaster.party_code==code,
             OperationalPartyMaster.party_kind.in_(("customer","both")), OperationalPartyMaster.status=="active"))
         if not row: raise ValueError(f"Active customer not found: {code}")
+        if row.country_code not in (None, "AE"):
+            raise ValueError("Cross-border van sales are held until tax, FX and trade controls are configured")
         customers.append(row)
     key=str(uuid.uuid4()); opening=_money(opening_float)
     route=OperationalVanRoute(route_key=key, route_no=f"VAN-{route_date:%Y%m%d}-{key[:7].upper()}",
@@ -198,7 +200,7 @@ def van_workspace_payload(session: Session) -> dict:
     events=list(session.scalars(select(OperationalVanOfflineEvent).order_by(OperationalVanOfflineEvent.synced_at.desc())))
     return {"controls":{"routes":len(routes),"active_routes":sum(x.status=="active" for x in routes),"pending_approvals":sum(x.status in {"load_submitted","close_submitted"} for x in routes),"synced_events":len(events),"posting_enabled":False},
         "vans":[{"van_code":x.van_code,"name":x.name,"status":x.status} for x in session.scalars(select(OperationalVan).order_by(OperationalVan.van_code))],
-        "customers":[{"code":x.party_code,"name":x.legal_or_business_name} for x in session.scalars(select(OperationalPartyMaster).where(OperationalPartyMaster.party_kind.in_(("customer","both")),OperationalPartyMaster.status=="active").order_by(OperationalPartyMaster.legal_or_business_name).limit(500))],
+        "customers":[{"code":x.party_code,"name":x.legal_or_business_name} for x in session.scalars(select(OperationalPartyMaster).where(OperationalPartyMaster.party_kind.in_(("customer","both")),OperationalPartyMaster.status=="active",or_(OperationalPartyMaster.country_code=="AE",OperationalPartyMaster.country_code.is_(None))).order_by(OperationalPartyMaster.legal_or_business_name).limit(500))],
         "products":[{"sku":x.sku,"name":x.name,"uom":x.base_uom,"price":x.selling_price} for x in session.scalars(select(OperationalProductMaster).where(OperationalProductMaster.status=="active").order_by(OperationalProductMaster.name).limit(500))],
         "routes":[{"route_key":x.route_key,"route_no":x.route_no,"van_code":x.van.van_code,"route_date":x.route_date,"driver_name":x.driver_name,"device_id":x.device_id,"status":x.status,"opening_float":x.opening_float,"expected_cash":x.expected_cash,"counted_cash":x.counted_cash,"variance":x.variance,"created_by":x.created_by,"approved_by":x.approved_by,"close_approved_by":x.close_approved_by,"revision":x.revision,"stops":[{"sequence":s.sequence_no,"customer_code":s.customer_code,"customer_name":s.customer_name_snapshot} for s in x.stops],"loads":[{"sku":l.sku,"product_name":l.product_name_snapshot,"quantity":l.quantity,"uom":l.uom} for l in x.loads]} for x in routes],
         "events":[{"event_key":x.event_key,"route_key":next(r.route_key for r in routes if r.id==x.route_id),"client_reference":x.client_reference,"event_type":x.event_type,"customer_code":x.customer_code,"amount":x.amount,"tax_amount":x.tax_amount,"payment_method":x.payment_method,"captured_at":x.captured_at,"synced_at":x.synced_at} for x in events],

@@ -6,7 +6,7 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 
-from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func, select
+from sqlalchemy import Boolean, CheckConstraint, Date, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func, or_, select
 from sqlalchemy.orm import Mapped, Session, mapped_column, relationship
 
 from .operational import (MONEY, OperationalAuditEvent, OperationalBase,
@@ -247,9 +247,11 @@ def list_payments(session: Session, *, allowed_locations: tuple[str, ...] = ("*"
     return list(session.scalars(query.order_by(OperationalPayment.created_at.desc()).limit(limit)))
 
 
-def customer_invoice_settlement(session: Session, invoice) -> dict:
-    """Calculate settlement from active receipt claims without mutating the invoice."""
-    rows = session.execute(select(
+def customer_invoice_settlement(session: Session, invoice, *, as_of: date | None = None) -> dict:
+    """Calculate settlement from live receipt claims and target credits without mutating the invoice."""
+    from .sales_returns import OperationalSalesReturn
+    from .customer_price_credits import OperationalCustomerPriceCredit
+    query = select(
         OperationalPayment.status,
         func.coalesce(func.sum(OperationalPaymentAllocationClaim.amount), 0),
     ).join(
@@ -259,24 +261,87 @@ def customer_invoice_settlement(session: Session, invoice) -> dict:
         OperationalPayment.party_code == invoice.customer_code,
         OperationalPaymentAllocationClaim.source_type == "invoice",
         OperationalPaymentAllocationClaim.source_reference_key == invoice.invoice_no,
-        OperationalPaymentAllocationClaim.status == "active",
-        OperationalPayment.status.in_(("submitted", "approved")),
-    ).group_by(OperationalPayment.status)).all()
+        OperationalPaymentAllocationClaim.status.in_(("active", "consumed")),
+        OperationalPayment.status.in_(("submitted", "approved", "posted")),
+    )
+    if as_of is not None:
+        query = query.where(OperationalPayment.payment_date <= as_of)
+    rows = session.execute(query.group_by(OperationalPayment.status)).all()
     by_status = {status: _money(amount) for status, amount in rows}
     total = _money(invoice.total_amount)
-    paid = min(total, by_status.get("approved", Decimal("0.00")))
-    pending = min(max(Decimal("0.00"), total - paid),
+    credit_query = select(OperationalSalesReturn.status, func.coalesce(func.sum(
+        OperationalSalesReturn.total_amount), 0)).where(
+            OperationalSalesReturn.original_invoice_origin == "target_erp",
+            OperationalSalesReturn.original_invoice_target_key == invoice.invoice_key,
+            OperationalSalesReturn.status.in_(("submitted", "approved", "posted")))
+    if as_of is not None:
+        credit_query = credit_query.where(OperationalSalesReturn.return_date <= as_of)
+    credits = {status: _money(amount) for status, amount in session.execute(
+        credit_query.group_by(OperationalSalesReturn.status)).all()}
+    price_query = select(OperationalCustomerPriceCredit.status, func.coalesce(func.sum(
+        OperationalCustomerPriceCredit.total_amount), 0)).where(
+        OperationalCustomerPriceCredit.invoice_id == invoice.id,
+        OperationalCustomerPriceCredit.status.in_(("submitted", "approved", "posted")))
+    if as_of is not None:
+        price_query = price_query.where(OperationalCustomerPriceCredit.credit_date <= as_of)
+    for status, amount in session.execute(price_query.group_by(OperationalCustomerPriceCredit.status)):
+        credits[status] = credits.get(status, Decimal("0.00")) + _money(amount)
+    applied_credit = credits.get("approved", Decimal("0.00")) + credits.get("posted", Decimal("0.00"))
+    pending_credit = credits.get("submitted", Decimal("0.00"))
+    net_total = max(Decimal("0.00"), total - applied_credit)
+    received = by_status.get("approved", Decimal("0.00")) + by_status.get("posted", Decimal("0.00"))
+    from .customer_refunds import OperationalCustomerRefund, OperationalCustomerRefundRecovery
+    paid_refund_query = select(func.coalesce(func.sum(
+        OperationalCustomerRefund.amount), 0)).join(OperationalSalesReturn,
+        OperationalSalesReturn.id == OperationalCustomerRefund.sales_return_id).where(
+        OperationalSalesReturn.original_invoice_target_key == invoice.invoice_key,
+        OperationalCustomerRefund.status == "posted")
+    if as_of is not None:
+        paid_refund_query = paid_refund_query.where(OperationalCustomerRefund.refund_date <= as_of)
+    paid_refunds = Decimal(session.scalar(paid_refund_query) or 0)
+    price_refunds = select(func.coalesce(func.sum(OperationalCustomerRefund.amount), 0)).join(
+        OperationalCustomerPriceCredit,
+        OperationalCustomerPriceCredit.id == OperationalCustomerRefund.price_credit_id).where(
+        OperationalCustomerPriceCredit.invoice_id == invoice.id,
+        OperationalCustomerRefund.status == "posted")
+    if as_of is not None:
+        price_refunds = price_refunds.where(OperationalCustomerRefund.refund_date <= as_of)
+    paid_refunds += Decimal(session.scalar(price_refunds) or 0)
+    recovery_query = select(func.coalesce(func.sum(OperationalCustomerRefundRecovery.amount), 0)).join(
+        OperationalCustomerRefund,
+        OperationalCustomerRefund.id == OperationalCustomerRefundRecovery.refund_id).where(
+        OperationalCustomerRefundRecovery.status == "posted",
+        or_(OperationalCustomerRefund.sales_return_id.in_(
+            select(OperationalSalesReturn.id).where(
+                OperationalSalesReturn.original_invoice_target_key == invoice.invoice_key)),
+            OperationalCustomerRefund.price_credit_id.in_(
+                select(OperationalCustomerPriceCredit.id).where(
+                    OperationalCustomerPriceCredit.invoice_id == invoice.id))))
+    if as_of is not None:
+        recovery_query = recovery_query.where(OperationalCustomerRefundRecovery.recovery_date <= as_of)
+    recovered_refunds = Decimal(session.scalar(recovery_query) or 0)
+    paid_refunds = max(Decimal("0.00"), paid_refunds - recovered_refunds)
+    refundable = max(Decimal("0.00"), received - net_total - paid_refunds)
+    paid = min(net_total, received)
+    pending = min(max(Decimal("0.00"), net_total - paid),
                   by_status.get("submitted", Decimal("0.00")))
-    outstanding = max(Decimal("0.00"), total - paid)
-    available = max(Decimal("0.00"), outstanding - pending)
-    status = "paid" if outstanding == 0 else ("partially_paid" if paid > 0 else "unpaid")
-    return {
+    outstanding = max(Decimal("0.00"), net_total - paid)
+    available = max(Decimal("0.00"), outstanding - pending - pending_credit)
+    status = ("refund_due" if refundable > 0 else "refunded" if paid_refunds > 0 and outstanding == 0
+              else "paid" if outstanding == 0
+              else "partially_paid" if paid > 0 else "unpaid")
+    result = {
         "settlement_status": status,
         "paid_amount": _money(paid),
         "pending_allocation_amount": _money(pending),
         "outstanding_amount": _money(outstanding),
         "available_outstanding": _money(available),
     }
+    if refundable:
+        result["refundable_amount"] = _money(refundable)
+    if paid_refunds:
+        result["refunded_amount"] = _money(paid_refunds)
+    return result
 
 
 def customer_invoice_open_items(session: Session, party_code: str) -> list[dict]:
@@ -285,13 +350,15 @@ def customer_invoice_open_items(session: Session, party_code: str) -> list[dict]
 
     invoices = session.scalars(select(OperationalCustomerInvoice).where(
         OperationalCustomerInvoice.customer_code == party_code,
-        OperationalCustomerInvoice.status == "approved",
+        OperationalCustomerInvoice.status.in_(("approved", "posted")),
     ).order_by(OperationalCustomerInvoice.invoice_date.desc(),
                OperationalCustomerInvoice.invoice_no.desc())).all()
     items = []
     for invoice in invoices:
         settlement = customer_invoice_settlement(session, invoice)
-        outstanding = _money(invoice.total_amount)
+        from .sales_returns import target_invoice_credit_total
+        outstanding = max(Decimal("0.00"), _money(invoice.total_amount) -
+                          target_invoice_credit_total(session, invoice.invoice_key, include_submitted=True))
         claimed = _money(settlement["paid_amount"] + settlement["pending_allocation_amount"])
         available = settlement["available_outstanding"]
         if available > 0:
@@ -309,6 +376,24 @@ def customer_invoice_open_items(session: Session, party_code: str) -> list[dict]
     return items
 
 
+def _source_outstanding_after_target_credits(session: Session, payment: OperationalPayment,
+                                             line: OperationalPaymentAllocation) -> Decimal:
+    from .customer_invoices import OperationalCustomerInvoice
+    from .sales_returns import target_invoice_credit_total
+    if payment.payment_type != "customer_receipt" or line.source_type != "invoice":
+        return line.source_outstanding_snapshot
+    invoice = session.scalar(select(OperationalCustomerInvoice).where(
+        OperationalCustomerInvoice.customer_code == payment.party_code,
+        OperationalCustomerInvoice.invoice_no == line.source_reference_key).with_for_update())
+    if not invoice:
+        return line.source_outstanding_snapshot
+    if invoice.status not in ("approved", "posted"):
+        raise ValueError(f"Target invoice {invoice.invoice_no} is not eligible for receipt allocation")
+    return min(line.source_outstanding_snapshot, max(Decimal("0.00"),
+        invoice.total_amount - target_invoice_credit_total(
+            session, invoice.invoice_key, include_submitted=True)))
+
+
 def _claim_allocations(session: Session, payment: OperationalPayment) -> None:
     # All migration-era invoice allocations share the party's approved opening
     # control balance. This prevents invoice detail and the opening-balance row
@@ -318,13 +403,14 @@ def _claim_allocations(session: Session, payment: OperationalPayment) -> None:
         OperationalPayment.payment_type == payment.payment_type
     ).order_by(OperationalPaymentAllocation.id).with_for_update()).all()
     for line in sorted(payment.allocations, key=lambda row: (row.source_type, row.source_reference_key)):
+        source_outstanding = _source_outstanding_after_target_credits(session, payment, line)
         claimed = session.scalar(select(func.coalesce(func.sum(OperationalPaymentAllocationClaim.amount), 0)).where(
             OperationalPaymentAllocationClaim.party_code == payment.party_code,
             OperationalPaymentAllocationClaim.source_type == line.source_type,
             OperationalPaymentAllocationClaim.source_reference_key == line.source_reference_key,
-            OperationalPaymentAllocationClaim.status == "active")) or Decimal("0")
-        if claimed + line.allocation_amount > line.source_outstanding_snapshot:
-            remaining = max(Decimal("0"), line.source_outstanding_snapshot - claimed)
+            OperationalPaymentAllocationClaim.status.in_(("active", "consumed")))) or Decimal("0")
+        if claimed + line.allocation_amount > source_outstanding:
+            remaining = max(Decimal("0"), source_outstanding - claimed)
             raise ValueError(f"Allocation exceeds remaining outstanding for {line.source_reference_key}: AED {remaining}")
     balance_type = "receivable" if payment.payment_type == "customer_receipt" else "payable"
     control_total = session.scalar(select(func.coalesce(func.sum(OperationalOpeningPartyBalance.amount), 0)).where(
@@ -335,18 +421,25 @@ def _claim_allocations(session: Session, payment: OperationalPayment) -> None:
         new_erp_receivables = session.scalar(select(func.coalesce(
             func.sum(OperationalCustomerInvoice.total_amount), 0)).where(
                 OperationalCustomerInvoice.customer_code == payment.party_code,
-                OperationalCustomerInvoice.status == "approved")) or Decimal("0")
-        control_total += new_erp_receivables
+                OperationalCustomerInvoice.status.in_(("approved", "posted")))) or Decimal("0")
+        from .sales_returns import OperationalSalesReturn
+        target_credits = session.scalar(select(func.coalesce(func.sum(
+            OperationalSalesReturn.total_amount), 0)).where(
+                OperationalSalesReturn.customer_code == payment.party_code,
+                OperationalSalesReturn.original_invoice_origin == "target_erp",
+                OperationalSalesReturn.status.in_(("submitted", "approved", "posted")))) or Decimal("0")
+        control_total += new_erp_receivables - target_credits
     if control_total > 0:
         party_claimed = session.scalar(select(func.coalesce(func.sum(OperationalPaymentAllocationClaim.amount), 0)).join(
             OperationalPayment, OperationalPayment.id == OperationalPaymentAllocationClaim.payment_id).where(
                 OperationalPayment.party_code == payment.party_code,
                 OperationalPayment.payment_type == payment.payment_type,
-                OperationalPaymentAllocationClaim.status == "active")) or Decimal("0")
+                OperationalPaymentAllocationClaim.status.in_(("active", "consumed")))) or Decimal("0")
         if party_claimed + payment.allocated_amount > control_total:
             remaining = max(Decimal("0"), control_total - party_claimed)
             raise ValueError(f"Allocation exceeds the party opening control balance: AED {remaining} remains")
     for line in sorted(payment.allocations, key=lambda row: (row.source_type, row.source_reference_key)):
+        source_outstanding = _source_outstanding_after_target_credits(session, payment, line)
         # Lock every persisted contender for this source before calculating the
         # claim total. PostgreSQL therefore serializes simultaneous submissions
         # even though the authoritative invoice remains in the immutable clone.
@@ -359,9 +452,9 @@ def _claim_allocations(session: Session, payment: OperationalPayment) -> None:
             OperationalPaymentAllocationClaim.party_code == payment.party_code,
             OperationalPaymentAllocationClaim.source_type == line.source_type,
             OperationalPaymentAllocationClaim.source_reference_key == line.source_reference_key,
-            OperationalPaymentAllocationClaim.status == "active")) or Decimal("0")
-        if claimed + line.allocation_amount > line.source_outstanding_snapshot:
-            remaining = max(Decimal("0"), line.source_outstanding_snapshot - claimed)
+            OperationalPaymentAllocationClaim.status.in_(("active", "consumed")))) or Decimal("0")
+        if claimed + line.allocation_amount > source_outstanding:
+            remaining = max(Decimal("0"), source_outstanding - claimed)
             raise ValueError(f"Allocation exceeds remaining outstanding for {line.source_reference_key}: AED {remaining}")
         session.add(OperationalPaymentAllocationClaim(claim_key=str(uuid.uuid4()), payment_id=payment.id,
                     payment_allocation_id=line.id, party_code=payment.party_code, source_type=line.source_type,

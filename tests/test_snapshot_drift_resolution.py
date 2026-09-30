@@ -6,7 +6,7 @@ from klen_clone.resolve_snapshot_drift import build_resolution_evidence, resolut
 def test_builds_only_checksum_proven_snapshot_relationship_resolutions():
     evidence = build_resolution_evidence(Path("source_exports"))
 
-    assert len(evidence) == 168
+    assert len(evidence) == 175
     assert evidence[151]["control_disposition"] == "invalid_hierarchical_row_sum_not_a_ledger_balance"
     assert evidence[151]["supplier_parent_aed"] == evidence[151]["supplier_children_net_aed"] == "38953.43"
     assert evidence[152]["control_disposition"] == "non_atomic_capture_timing_reconciled"
@@ -25,13 +25,7 @@ def test_builds_only_checksum_proven_snapshot_relationship_resolutions():
     assert evidence[146]["parent_document"] == "AK2026-01088"
     assert evidence[149]["settlement_disposition"] == "preserve_as_historical_nonposting_payment_without_synthetic_cash_event"
     assert 141 not in evidence
-    assert 50 not in evidence
-    assert 64 not in evidence
-    assert 65 not in evidence
     assert 81 not in evidence
-    assert 83 not in evidence
-    assert 84 not in evidence
-    assert 85 not in evidence
     assert 92 not in evidence
     assert evidence[165]["positive_positions"] == 579
     assert evidence[165]["negative_positions_quarantined"] == 4
@@ -50,6 +44,19 @@ def test_builds_only_checksum_proven_snapshot_relationship_resolutions():
     assert evidence[99]["supporting_evidence_ids"] == [40, 44, 45, 47, 49]
     assert evidence[102]["supporting_evidence_ids"] == [58, 59, 60, 61]
     assert evidence[176]["quantity_base"] == "0.00"
+    assert evidence[178]["quantity_base"] == "0.00"
+    assert evidence[178]["supporting_evidence_ids"] == [188]
+    assert evidence[64]["posting_disposition"] == "pending_historical_transfer_retained_as_evidence_not_stock_posted"
+    assert evidence[65]["direction"] == "transfer_in"
+    assert evidence[64]["availability_enabled"] is False
+    assert resolution_code(64) == "PENDING_TRANSFER_PRESERVED_WITHOUT_STOCK_POSTING"
+    assert evidence[50]["sku"] == "6290429015714"
+    assert evidence[50]["factor_to_base_snapshot"] == "6"
+    assert evidence[50]["quantity_base"] == "3.00"
+    assert resolution_code(50) == "PRODUCT_SPECIFIC_UOM_MOVEMENT_PROVEN"
+    assert evidence[83]["supporting_evidence_ids"] == [125]
+    assert evidence[84]["supporting_evidence_ids"] == [126]
+    assert evidence[85]["supporting_evidence_ids"] == [127]
     assert evidence[69]["supporting_evidence_ids"] == [110]
     assert evidence[71]["supporting_evidence_ids"] == [112, 113]
     assert evidence[86]["supporting_evidence_ids"] == [128]
@@ -128,3 +135,4 @@ def test_builds_only_checksum_proven_snapshot_relationship_resolutions():
     assert resolution_code(172) == "NEGATIVE_STOCK_QUARANTINED_NOT_AVAILABLE"
     assert resolution_code(99) == "PRODUCT_SPECIFIC_UOM_CONVERSION_GROUP_RECONCILED"
     assert resolution_code(176) == "ZERO_QUANTITY_LOCATIONLESS_STOCK_EXCLUDED"
+    assert resolution_code(178) == "ZERO_QUANTITY_LOCATIONLESS_STOCK_EXCLUDED"

@@ -2,7 +2,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, inspect, select, text
 
 from klen_clone.operational import (
     OperationalAuditEvent, OperationalJournalBatch, OperationalStockReservation,
@@ -70,7 +70,9 @@ def test_quotation_accepts_shared_master_preparation_cost_fields(session):
 
 def test_revision_maker_checker_acceptance_and_idempotent_conversion(session):
     quote = make_quote(session)
-    assert quote.status == "draft" and quote.total_amount == Decimal("20.00")
+    assert quote.status == "draft" and quote.total_amount == Decimal("19.95")
+    assert quote.lines[0].discount_amount == Decimal("1.00")
+    assert quote.lines[0].tax_amount == Decimal("0.95")
     quote = replace_sales_quotation(session, quote, expected_revision=1,
         customer_code="C-1", customer_name_snapshot="Customer One", location_code="MAIN",
         quotation_date=date.today(), valid_until=date.today()+timedelta(days=20),
@@ -97,6 +99,56 @@ def test_revision_maker_checker_acceptance_and_idempotent_conversion(session):
     assert session.scalar(select(func.count(OperationalSalesQuotationWorkflowEvent.id))) == 4
     assert session.scalar(select(func.count(OperationalAuditEvent.id)).where(
         OperationalAuditEvent.resource_key.in_((quote.quotation_key, order.order_key)))) >= 6
+
+
+def test_header_discount_allocates_across_mixed_tax_lines_without_rounding_drift(session):
+    first = line(sku="SKU-1", quantity="1", price="10")
+    second = line(sku="SKU-2", quantity="1", price="20")
+    second.update(tax_rate=Decimal("0"), tax_amount=Decimal("0"), gross_amount=Decimal("20"))
+    quote = create_sales_quotation(session, customer_code="C-1", customer_name_snapshot="Customer One",
+        location_code="MAIN", quotation_date=date.today(), valid_until=date.today() + timedelta(days=7),
+        discount_amount=Decimal("1.00"), payment_terms=None, delivery_terms=None, notes=None,
+        actor="maker", lines=[first, second])
+    assert [item.discount_amount for item in quote.lines] == [Decimal("0.33"), Decimal("0.67")]
+    assert [item.tax_amount for item in quote.lines] == [Decimal("0.48"), Decimal("0.00")]
+    assert quote.subtotal == Decimal("30.00")
+    assert quote.total_amount == sum(item.gross_amount for item in quote.lines) == Decimal("29.48")
+
+
+def test_aed_discount_rejects_three_minor_unit_digits(session):
+    with pytest.raises(ValueError, match="minor-unit precision"):
+        create_sales_quotation(session, customer_code="C-1", customer_name_snapshot="Customer One",
+            location_code="MAIN", quotation_date=date.today(),
+            valid_until=date.today() + timedelta(days=7), discount_amount=Decimal("0.001"),
+            payment_terms=None, delivery_terms=None, notes=None, actor="maker", lines=[line()])
+
+
+def test_legacy_unallocated_discount_cannot_convert(session):
+    quote = make_quote(session)
+    quote = transition_sales_quotation(session, quote, expected_revision=1, action="submit", actor="maker")
+    quote = transition_sales_quotation(session, quote, expected_revision=2, action="approve",
+        actor="checker", note="Reviewed offer")
+    quote = accept_sales_quotation(session, quote, expected_revision=3, actor="maker",
+        acceptance_reference="Customer PO")
+    quote.lines[0].discount_amount = Decimal("0")
+    quote.lines[0].gross_amount = quote.lines[0].net_amount + quote.lines[0].tax_amount
+    session.commit()
+    with pytest.raises(ValueError, match="do not reconcile"):
+        convert_sales_quotation(session, quote, expected_revision=4, actor="maker")
+
+
+def test_existing_line_tables_receive_additive_discount_columns(tmp_path):
+    engine = make_operational_engine(f"sqlite:///{tmp_path / 'upgrade.db'}")
+    initialize_operational_database(engine)
+    tables = ("operational_sales_quotation_lines", "operational_sales_order_lines",
+              "operational_customer_invoice_lines")
+    with engine.begin() as connection:
+        for table in tables:
+            connection.execute(text(f"ALTER TABLE {table} DROP COLUMN discount_amount"))
+    initialize_operational_database(engine)
+    for table in tables:
+        assert "discount_amount" in {column["name"] for column in inspect(engine).get_columns(table)}
+    engine.dispose()
 
 
 def test_expired_approved_quotation_cannot_be_accepted(session):

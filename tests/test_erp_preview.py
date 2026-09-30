@@ -1,8 +1,11 @@
+import base64
 import json
+import os
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -25,7 +28,7 @@ from klen_clone.operational import (
     OperationalSubledgerEntry, OperationalWorkflowEvent, execute_posting, execute_reversal,
 )
 from klen_clone.operational_masters import OperationalLocationMaster, OperationalPartyMaster, OperationalProductMaster
-from klen_clone.warehouse_controls import register_product_uom
+from klen_clone.warehouse_controls import register_barcode, register_product_uom
 from klen_clone.posting_integration import (
     OperationalIntegratedJournalLine, OperationalIntegratedPostingBatch,
     OperationalIntegratedStockEntry, execute_integrated_posting, execute_integrated_reversal,
@@ -39,6 +42,7 @@ from klen_clone.finance_foundation import OperationalChartAccount, OperationalFi
 from klen_clone.finance_reconciliation import (
     OperationalFinanceReconciliationReview, initialize_finance_reconciliation,
 )
+from klen_clone.opening_ledger import OperationalOpeningLedgerPackage
 from klen_clone.finance_ledger import OperationalGeneralJournal
 from klen_clone.hrm import (
     OperationalHrmAttendance, OperationalHrmEmployee, OperationalHrmImportBatch, OperationalHrmShift,
@@ -49,6 +53,9 @@ from klen_clone.hrm_operations import (
 )
 from klen_clone.procurement import OperationalPurchaseOrder, OperationalSupplierQuotation
 from klen_clone.cash_management import create_cash_account, decide_cash_account
+from klen_clone.credit_management import OperationalCustomerCreditProfile
+from klen_clone.delivery_fulfillment import OperationalDeliveryStockMovement
+from klen_clone.payments import OperationalPayment, customer_invoice_open_items
 
 
 def preview_client(tmp_path, *, include_hrm: bool = False) -> TestClient:
@@ -220,6 +227,112 @@ def test_preview_is_independent_read_only_with_hrm_enabled_and_payroll_excluded(
     assert rejected.headers["x-request-id"]
 
 
+def test_party_quick_create_api_requires_independent_approval(tmp_path, monkeypatch):
+    password = "party workflow test password"
+    users_file = tmp_path / "party-users.json"
+    users_file.write_text(json.dumps({"users": [
+        {"id": 1, "username": "party-maker", "password_hash": hash_password(password),
+         "roles": [], "permissions": ["clone.read", "draft.create", "customer.manage", "supplier.manage"],
+         "allowed_locations": ["SHJ"]},
+        {"id": 2, "username": "party-checker", "password_hash": hash_password(password),
+         "roles": [], "permissions": ["clone.read", "customer.approve", "supplier.approve", "migration.review"],
+         "allowed_locations": ["SHJ"]},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'party-operational.db'}")
+    client = preview_client(tmp_path)
+    login = client.post("/api/v1/auth/login", json={"username": "party-maker", "password": password})
+    assert login.status_code == 200
+    headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    protected = client.post("/api/v1/master-data/party-requests", headers=headers, json={
+        "party_code": "CO-001", "party_kind": "customer",
+        "legal_or_business_name": "A second customer",
+        "country_code": "AE", "preferred_currency_code": "AED",
+    })
+    assert protected.status_code == 409
+    created = client.post("/api/v1/master-data/party-requests", headers=headers, json={
+        "party_code": "C-QUICK", "party_kind": "customer",
+        "legal_or_business_name": "Quick Customer LLC", "tax_number": "100000000000001",
+        "country_code": "AE", "preferred_currency_code": "AED",
+        "tax_registration_type": "vat", "tax_country_code": "AE",
+    })
+    assert created.status_code == 200
+    key = created.json()["request_key"]
+    assert created.json()["status"] == "pending"
+    assert not client.get("/api/v1/selectors/parties?kind=customer&q=C-QUICK").json()["items"]
+    assert client.post(f"/api/v1/master-data/party-requests/{key}/approve", headers=headers,
+        json={"note": "Own request cannot pass"}).status_code == 403
+    assert client.get("/api/v1/master-data/party-requests?kind=customer").json()["items"][0]["status"] == "pending"
+    login = client.post("/api/v1/auth/login", json={"username": "party-checker", "password": password})
+    checker = {"X-CSRF-Token": login.json()["csrf_token"]}
+    assert client.post("/api/v1/master-data/party-requests", headers=checker, json={
+        "party_code": "S-DENIED", "party_kind": "supplier",
+        "legal_or_business_name": "Should not create",
+        "country_code": "AE", "preferred_currency_code": "AED",
+    }).status_code == 403
+    approved = client.post(f"/api/v1/master-data/party-requests/{key}/approve", headers=checker,
+        json={"note": "Verified legal and tax details"})
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+    assert client.get("/api/v1/selectors/parties?kind=customer&q=C-QUICK").json()["items"][0]["party_code"] == "C-QUICK"
+    assert approved.json()["market_scope"] == "uae"
+    catalog = client.get("/api/v1/master-data/country-catalog")
+    assert catalog.status_code == 200
+    assert {"AE", "SA", "DE"}.issubset({item["code"] for item in catalog.json()["countries"]})
+    login = client.post("/api/v1/auth/login", json={"username": "party-maker", "password": password})
+    maker = {"X-CSRF-Token": login.json()["csrf_token"]}
+    foreign = client.post("/api/v1/master-data/party-requests", headers=maker, json={
+        "party_code": "S-FOREIGN", "party_kind": "supplier",
+        "legal_or_business_name": "Foreign Supplier GmbH",
+        "country_code": "DE", "preferred_currency_code": "EUR",
+    })
+    assert foreign.status_code == 200
+    login = client.post("/api/v1/auth/login", json={"username": "party-checker", "password": password})
+    checker = {"X-CSRF-Token": login.json()["csrf_token"]}
+    accepted = client.post(f"/api/v1/master-data/party-requests/{foreign.json()['request_key']}/approve",
+        headers=checker, json={"note": "Verified foreign supplier identity"})
+    assert accepted.status_code == 200
+    assert accepted.json()["market_scope"] == "international"
+    assert not client.get("/api/v1/selectors/parties?kind=supplier&q=S-FOREIGN").json()["items"]
+    listed = client.get("/api/v1/suppliers?q=S-FOREIGN").json()["items"]
+    assert listed[0]["country_code"] == "DE"
+    assert listed[0]["preferred_currency_code"] == "EUR"
+    assert listed[0]["market_scope"] == "international"
+    corrected = client.patch("/api/v1/master-data/parties/S-FOREIGN", headers=checker, json={
+        "expected_revision": listed[0]["revision"],
+        "legal_or_business_name": "Foreign Supplier GmbH",
+        "country_code": "DE", "preferred_currency_code": "USD",
+    })
+    assert corrected.status_code == 200
+    assert corrected.json()["preferred_currency_code"] == "USD"
+    assert corrected.json()["transaction_ready"] is False
+    login = client.post("/api/v1/auth/login", json={"username": "party-maker", "password": password})
+    maker = {"X-CSRF-Token": login.json()["csrf_token"]}
+    gcc = client.post("/api/v1/master-data/party-requests", headers=maker, json={
+        "party_code": "C-GCC", "party_kind": "customer",
+        "legal_or_business_name": "GCC Customer LLC",
+        "country_code": "SA", "preferred_currency_code": "SAR",
+    })
+    assert gcc.status_code == 200
+    login = client.post("/api/v1/auth/login", json={"username": "party-checker", "password": password})
+    checker = {"X-CSRF-Token": login.json()["csrf_token"]}
+    assert client.post(f"/api/v1/master-data/party-requests/{gcc.json()['request_key']}/approve",
+        headers=checker, json={"note": "Verified GCC customer identity"}).status_code == 200
+    assert not client.get("/api/v1/selectors/parties?kind=customer&q=C-GCC").json()["items"]
+    login = client.post("/api/v1/auth/login", json={"username": "party-maker", "password": password})
+    maker = {"X-CSRF-Token": login.json()["csrf_token"]}
+    quote = client.post("/api/v1/sales-orders/quotations", headers=maker, json={
+        "customer_code": "C-GCC", "location_code": "SHJ",
+        "quotation_date": date.today().isoformat(),
+        "valid_until": (date.today() + timedelta(days=30)).isoformat(),
+        "lines": [{"sku": "SKU-001", "quantity": "1", "uom": "Piece",
+                   "unit_price": "10", "tax_rate": "0"}],
+    })
+    assert quote.status_code == 422
+    assert "Quotation currency must match" in quote.json()["detail"]
+
+
 def test_navigation_policy_is_server_owned_and_mutation_middleware_allows_controlled_workflows(tmp_path, monkeypatch):
     password = "navigation policy test password"
     users_file = tmp_path / "navigation-users.json"
@@ -349,6 +462,256 @@ def test_commercial_pricing_api_validates_masters_and_enforces_quotation_prices(
     assert accepted.json()["posting_enabled"] is False
 
 
+@pytest.mark.parametrize(("country", "currency", "unit_price", "discount_amount", "expected_total", "expected_aed"), [
+    ("SA", "SAR", "10", "1.00", 19.0, 18.61),
+    ("KW", "KWD", "1.234", "0.001", 2.467, 2.42),
+])
+def test_cross_border_quotation_api_uses_approved_trade_fx_and_currency_pricing(
+        tmp_path, monkeypatch, country, currency, unit_price, discount_amount, expected_total, expected_aed):
+    password = "cross border quotation test password"
+    users_file = tmp_path / "cross-border-users.json"
+    users_file.write_text(json.dumps({"users": [
+        {"id": 1, "username": "cross-maker", "password_hash": hash_password(password),
+         "roles": [], "permissions": ["clone.read", "draft.create", "draft.submit", "customer_invoice.create", "delivery.allocate", "delivery.pick", "delivery.dispatch", "delivery.pod", "price_list.manage",
+                                      "trade.quote.prepare", "trade.order.prepare", "trade.delivery.prepare", "trade.dispatch.prepare", "export_tax.prepare", "fx.rate.read", "fx.rate.prepare"],
+         "allowed_locations": ["SHJ"]},
+        {"id": 2, "username": "cross-checker", "password_hash": hash_password(password),
+         "roles": [], "permissions": ["clone.read", "draft.approve", "discount.approve", "trade.quote.approve", "trade.order.approve", "trade.delivery.approve", "trade.dispatch.approve", "export_tax.approve",
+                                      "fx.rate.read", "fx.rate.approve"],
+         "allowed_locations": ["SHJ"]},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    postgres_template = os.getenv("KLEN_TEST_OPERATIONAL_DATABASE_URL_TEMPLATE", "").strip()
+    operational_url = (postgres_template.format(country=country.lower()) if postgres_template
+                       else f"sqlite:///{tmp_path / 'cross-border.db'}")
+    if postgres_template:
+        assert operational_url.startswith("postgresql+psycopg://")
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", operational_url)
+    client = preview_client(tmp_path)
+    with client.app.state.operational_sessions() as session:
+        session.add(OperationalPartyMaster(party_key=f"C-{country}-controlled", party_code=f"C-{country}",
+            party_kind="customer", legal_or_business_name=f"{country} Customer", country_code=country,
+            preferred_currency_code=currency, status="active", source_promoted=False,
+            source_snapshot_name="test", source_checksum="a" * 64,
+            created_by="test", updated_by="test"))
+        session.commit()
+
+    def login(username):
+        response = client.post("/api/v1/auth/login", json={"username": username, "password": password})
+        assert response.status_code == 200
+        return {"X-CSRF-Token": response.json()["csrf_token"]}
+
+    maker = login("cross-maker")
+    currencies = {item["code"]: item["minor_units"] for item in
+                  client.get("/api/v1/sales-orders").json()["quotation_currencies"]}
+    assert currencies["AED"] == 2 and currencies["KWD"] == 3
+    assert client.get(f"/api/v1/selectors/parties?kind=customer&q=C-{country}").json()["items"] == []
+    assert client.get(f"/api/v1/selectors/parties?kind=customer&include_foreign=true&q=C-{country}").json()["items"][0]["country_code"] == country
+    assert client.post("/api/v1/commercial-pricing/groups", headers=maker,
+        json={"group_code": "GCC", "name": "GCC customers"}).status_code == 201
+    assert client.put(f"/api/v1/commercial-pricing/customers/C-{country}/group", headers=maker,
+        json={"group_code": "GCC"}).status_code == 200
+    day = date.today().isoformat()
+    price = client.post("/api/v1/commercial-pricing/price-lists", headers=maker, json={
+        "name": f"{currency} price", "customer_group": "GCC", "currency_code": currency,
+        "effective_from": day, "max_discount_percent": "5",
+        "items": [{"sku": "SKU-001", "unit_price": unit_price}],
+    })
+    assert price.status_code == 201
+    trade = client.post("/api/v1/sales-orders/trade-decisions", headers=maker, json={
+        "customer_code": f"C-{country}", "currency_code": currency, "quotation_date": day,
+        "line_tax_rates": [{"sku": "SKU-001", "tax_rate": "0"}],
+        "provisional_tax_basis": "Export quote pending proof", "trade_terms": "FCA Dubai",
+        "evidence_reference": "TRADE-001",
+    })
+    assert trade.status_code == 201, trade.text
+    assert trade.json()["invoice_tax_final"] is False
+    fx = client.post("/api/v1/finance/fx-rates", headers=maker, json={
+        "currency_code": currency, "rate_date": day, "aed_per_unit": "0.97930000",
+        "source_name": "Commercial source", "source_reference": "FX-001", "reason": "Quote planning",
+    })
+    assert fx.status_code == 201, fx.text
+    assert client.post(f"/api/v1/sales-orders/trade-decisions/{trade.json()['decision_key']}/approve",
+        headers=maker, json={"expected_revision": 1, "note": "Self approve"}).status_code == 403
+    checker = login("cross-checker")
+    assert client.post(f"/api/v1/commercial-pricing/price-lists/{price.json()['price_list_key']}/approve",
+        headers=checker, json={}).status_code == 200
+    assert client.post(f"/api/v1/sales-orders/trade-decisions/{trade.json()['decision_key']}/approve",
+        headers=checker, json={"expected_revision": 1, "note": "Independent review"}).status_code == 200
+    assert client.post(f"/api/v1/finance/fx-rates/{fx.json()['rate_key']}/approve",
+        headers=checker, json={"expected_revision": 1, "note": "Independent FX review"}).status_code == 200
+    maker = login("cross-maker")
+    payload = {"customer_code": f"C-{country}", "location_code": "SHJ", "quotation_date": day,
+        "valid_until": (date.today() + timedelta(days=30)).isoformat(), "currency_code": currency,
+        "trade_decision_key": trade.json()["decision_key"], "discount_amount": discount_amount,
+        "lines": [{"sku": "SKU-001", "quantity": "2", "uom": "Piece",
+                   "unit_price": unit_price, "tax_rate": "0"}]}
+    wrong_tax = client.post("/api/v1/sales-orders/quotations", headers=maker,
+        json={**payload, "lines": [{**payload["lines"][0], "tax_rate": "5"}]})
+    assert wrong_tax.status_code == 422
+    accepted = client.post("/api/v1/sales-orders/quotations", headers=maker, json=payload)
+    assert accepted.status_code == 201, accepted.text
+    assert accepted.json()["currency_code"] == currency
+    assert accepted.json()["discount_amount"] == float(discount_amount)
+    assert accepted.json()["lines"][0]["discount_amount"] == float(discount_amount)
+    assert accepted.json()["total_amount"] == expected_total
+    assert accepted.json()["aed_total_snapshot"] == expected_aed
+    assert accepted.json()["posting_enabled"] is False
+    quote_key = accepted.json()["quotation_key"]
+    submitted = client.post(f"/api/v1/sales-orders/quotations/{quote_key}/submit",
+        headers=maker, json={"expected_revision": 1})
+    assert submitted.status_code == 200, submitted.text
+    checker = login("cross-checker")
+    approved = client.post(f"/api/v1/sales-orders/quotations/{quote_key}/approve",
+        headers=checker, json={"expected_revision": 2, "note": "Independent quote review"})
+    assert approved.status_code == 200, approved.text
+    maker = login("cross-maker")
+    accepted_quote = client.post(f"/api/v1/sales-orders/quotations/{quote_key}/accept",
+        headers=maker, json={"expected_revision": 3, "acceptance_reference": "Customer PO 001"})
+    assert accepted_quote.status_code == 200, accepted_quote.text
+    convert_url = f"/api/v1/sales-orders/quotations/{quote_key}/convert"
+    convert_payload = {"expected_revision": 4, "conversion_note": "Customer PO 001 accepted"}
+    assert client.post(convert_url, headers=maker, json=convert_payload).status_code == 409
+    release = client.post("/api/v1/sales-orders/order-releases", headers=maker, json={
+        "quotation_key": quote_key, "expected_revision": 4,
+        "order_tax_review_basis": "Order stage tax assumption reviewed",
+        "fulfillment_evidence_required": "Customs and export documents before delivery",
+        "evidence_reference": "ORDER-UAT-001", "valid_until": payload["valid_until"],
+    })
+    assert release.status_code == 201, release.text
+    assert release.json()["fulfillment_released"] is False
+    assert client.get("/api/v1/sales-orders/order-releases").json()["items"][0]["release_key"] == release.json()["release_key"]
+    release_url = f"/api/v1/sales-orders/order-releases/{release.json()['release_key']}/approve"
+    assert client.post(release_url, headers=maker, json={
+        "expected_revision": 1, "note": "Self review attempt"}).status_code == 403
+    checker = login("cross-checker")
+    approved_release = client.post(release_url, headers=checker, json={
+        "expected_revision": 1, "note": "Independent order-stage review"})
+    assert approved_release.status_code == 200, approved_release.text
+    maker = login("cross-maker")
+    assert client.post(convert_url, headers=maker, json=convert_payload).status_code == 409
+    with client.app.state.operational_sessions() as session:
+        session.add(OperationalCustomerCreditProfile(profile_key=f"credit-{country}",
+            party_code=f"C-{country}", party_name_snapshot=f"{country} Customer",
+            credit_limit=100, payment_terms_days=30, status="active", posting_enabled=False,
+            created_by="credit-maker", approved_by="credit-checker", updated_by="credit-checker"))
+        session.commit()
+    converted = client.post(convert_url, headers=maker, json=convert_payload)
+    assert converted.status_code == 200, converted.text
+    assert converted.json()["currency_code"] == currency
+    assert converted.json()["total_amount"] == expected_total
+    assert converted.json()["fulfillment_held"] is True
+    assert converted.json()["order_release_key"] == release.json()["release_key"]
+    assert client.post(f"/api/v1/deliveries/orders/{converted.json()['order_key']}/allocate",
+        headers=maker, json={"note": "Must remain held"}).status_code == 409
+    readiness = client.post("/api/v1/deliveries/readiness", headers=maker, json={
+        "order_key": converted.json()["order_key"], "transport_plan": "Road freight carrier booking",
+        "customs_evidence_plan": "Declaration and exit proof to be collected",
+        "evidence_reference": "PLAN-001", "valid_until": payload["valid_until"],
+    })
+    assert readiness.status_code == 201, readiness.text
+    readiness_url = f"/api/v1/deliveries/readiness/{readiness.json()['readiness_key']}/approve"
+    assert client.post(readiness_url, headers=maker, json={
+        "expected_revision": 1, "note": "Self approval attempt"}).status_code == 403
+    checker = login("cross-checker")
+    assert client.post(readiness_url, headers=checker, json={
+        "expected_revision": 1, "note": "Checked shipment plan"}).status_code == 200
+    with client.app.state.operational_sessions() as session:
+        session.add(OperationalStockPosition(location_code="SHJ", sku="SKU-001",
+            canonical_uom="piece", quantity_on_hand="10", quantity_reserved="0",
+            average_unit_cost="2", availability_enabled=True, source_status="test_reconciled"))
+        session.commit()
+    maker = login("cross-maker")
+    allocated = client.post(f"/api/v1/deliveries/orders/{converted.json()['order_key']}/allocate",
+        headers=maker, json={"note": "Reserve approved foreign order"})
+    assert allocated.status_code == 201, allocated.text
+    delivery_key = allocated.json()["fulfillment_key"]
+    picked = client.post(f"/api/v1/deliveries/{delivery_key}/pick", headers=maker,
+        json={"expected_revision": 1, "note": "Warehouse picked goods"})
+    assert picked.status_code == 200, picked.text
+    dispatch_url = f"/api/v1/deliveries/{delivery_key}/dispatch"
+    assert client.post(dispatch_url, headers=maker, json={
+        "expected_revision": 2, "note": "Premature foreign dispatch"}).status_code == 409
+    dispatch_release = client.post("/api/v1/deliveries/dispatch-releases", headers=maker, json={
+        "fulfillment_key": delivery_key, "carrier_name": "Road Carrier LLC",
+        "transport_reference": "BOOK-001", "packing_list_reference": "PACK-001",
+        "customs_declaration_reference": "CUSTOMS-001",
+        "destination_consignment_reference": "DEST-001", "valid_until": payload["valid_until"],
+    })
+    assert dispatch_release.status_code == 201, dispatch_release.text
+    review_url = f"/api/v1/deliveries/dispatch-releases/{dispatch_release.json()['release_key']}/approve"
+    assert client.post(review_url, headers=maker, json={
+        "expected_revision": 1, "note": "Self approval attempt"}).status_code == 403
+    checker = login("cross-checker")
+    assert client.post(review_url, headers=checker, json={
+        "expected_revision": 1, "note": "Checked shipment references"}).status_code == 200
+    maker = login("cross-maker")
+    dispatched = client.post(dispatch_url, headers=maker, json={
+        "expected_revision": 2, "note": "Approved foreign stock issue"})
+    assert dispatched.status_code == 200, dispatched.text
+    assert dispatched.json()["status"] == "dispatched"
+    assert dispatched.json()["invoice_eligible"] is False
+    delivered = client.post(f"/api/v1/deliveries/{delivery_key}/proof-of-delivery", headers=maker, json={
+        "expected_revision": 3, "note": "Receiver confirmed delivery",
+        "received_by": "Test Receiver", "pod_reference": "POD-001"})
+    assert delivered.status_code == 200, delivered.text
+    assert delivered.json()["invoice_eligible"] is False
+    invoice_url = f"/api/v1/customer-invoices/deliveries/{delivery_key}"
+    invoice_dates = {"invoice_date": day, "due_date": payload["valid_until"]}
+    assert client.post(invoice_url, headers=maker, json=invoice_dates).status_code == 409
+    pdf = base64.b64encode(b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF").decode()
+    evidence = lambda kind: {"kind": kind, "filename": f"{kind}.pdf",
+        "content_type": "application/pdf", "content_base64": pdf}
+    review_payload = {"fulfillment_key": delivery_key, "tax_treatment": "zero_rated",
+        "tax_basis": "Synthetic workflow fixture only; no legal export or VAT determination",
+        "valid_until": payload["valid_until"],
+        "documents": [evidence("customs_declaration"), evidence("commercial_transport")]}
+    incomplete = client.post("/api/v1/customer-invoices/export-tax-reviews", headers=maker,
+        json={**review_payload, "documents": review_payload["documents"][:1]})
+    assert incomplete.status_code == 409
+    prepared = client.post("/api/v1/customer-invoices/export-tax-reviews", headers=maker,
+        json=review_payload)
+    assert prepared.status_code == 201, prepared.text
+    review_key = prepared.json()["decision_key"]
+    doc_key = prepared.json()["documents"][0]["document_key"]
+    downloaded = client.get(f"/api/v1/customer-invoices/export-evidence/{doc_key}")
+    assert downloaded.status_code == 200 and downloaded.content.startswith(b"%PDF-")
+    decision_url = f"/api/v1/customer-invoices/export-tax-reviews/{review_key}/approve"
+    decision_body = {"expected_revision": 1,
+        "note": "Synthetic evidence pair checked for workflow behavior only"}
+    assert client.post(decision_url, headers=maker, json=decision_body).status_code == 403
+    checker = login("cross-checker")
+    assert client.post(decision_url, headers=checker, json=decision_body).status_code == 200
+    maker = login("cross-maker")
+    ready = client.get("/api/v1/customer-invoices").json()["ready_deliveries"]
+    assert next(row for row in ready if row["fulfillment_key"] == delivery_key)["invoice_draft_eligible"] is True
+    invoice = client.post(invoice_url, headers=maker, json=invoice_dates)
+    assert invoice.status_code == 201, invoice.text
+    assert invoice.json()["foreign_draft_only"] is True
+    assert invoice.json()["export_tax_decision_key"] == review_key
+    assert invoice.json()["total_amount"] == expected_total
+    exposure = invoice.json()["fx_exposure"]
+    assert exposure["state"] == "reference_only"
+    assert exposure["currency_code"] == currency
+    assert exposure["aed_reference_amount"] == expected_aed
+    assert exposure["rate_key"] == fx.json()["rate_key"]
+    assert exposure["settlement_enabled"] is False
+    workspace = client.get("/api/v1/customer-invoices").json()
+    saved = next(row for row in workspace["invoices"] if row["invoice_key"] == invoice.json()["invoice_key"])
+    assert saved["fx_exposure"] == exposure
+    assert saved["settlement_status"] == "not_released"
+    assert saved["posting_enabled"] is False
+    assert client.post(f"/api/v1/customer-invoices/{invoice.json()['invoice_key']}/submit",
+        headers=maker, json={"expected_revision": 1}).status_code == 409
+    with client.app.state.operational_sessions() as session:
+        assert customer_invoice_open_items(session, f"C-{country}") == []
+        assert session.scalar(select(func.count(OperationalDeliveryStockMovement.id))) == 1
+        assert session.scalar(select(func.count(OperationalPayment.id))) == 0
+        assert session.scalar(select(func.count(OperationalJournalBatch.id))) == 0
+        assert session.scalar(select(func.count(OperationalIntegratedPostingBatch.id))) == 0
+
+
 def test_warehouse_traceability_api_enforces_identity_scope_and_maker_checker(tmp_path, monkeypatch):
     password = "warehouse traceability test password"
     users_file = tmp_path / "warehouse-traceability-users.json"
@@ -368,12 +731,16 @@ def test_warehouse_traceability_api_enforces_identity_scope_and_maker_checker(tm
     assert login.status_code == 200
     headers = {"X-CSRF-Token": login.json()["csrf_token"]}
 
-    barcode = client.post("/api/v1/warehouse-controls/barcodes", headers=headers, json={
+    legacy_barcode = client.post("/api/v1/warehouse-controls/barcodes", headers=headers, json={
         "barcode_value": "BC-SHJ-001", "sku": "SKU-001", "location_code": "SHJ",
         "uom": "Piece",
     })
-    assert barcode.status_code == 201
-    assert barcode.json()["barcode_value"] == "BC-SHJ-001"
+    assert legacy_barcode.status_code == 409
+    with client.app.state.operational_sessions() as session:
+        # Historical warehouse identities remain scannable even though new
+        # product barcodes are now governed through the Products workspace.
+        register_barcode(session, barcode_value="BC-SHJ-001", sku="SKU-001",
+            location_code="SHJ", uom="Piece", actor="historical-import")
     serial = client.post("/api/v1/warehouse-controls/serials", headers=headers, json={
         "serial_number": "SN-SHJ-001", "sku": "SKU-001", "location_code": "SHJ",
     })
@@ -1373,7 +1740,7 @@ def test_preview_overview_and_product_register_use_clone_database(tmp_path):
     assert paginator.status_code == 200 and "pageSize = 25" in paginator.text
 
 
-def test_promoted_product_can_be_edited_and_deactivated_with_revision_control(tmp_path, monkeypatch):
+def test_legacy_product_writes_cannot_bypass_governed_editor(tmp_path, monkeypatch):
     monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
     monkeypatch.setenv("ASAS_ADMIN_USERNAME", "asas-admin")
     monkeypatch.setenv("ASAS_ADMIN_PASSWORD_HASH", hash_password("temporary strong password"))
@@ -1394,20 +1761,52 @@ def test_promoted_product_can_be_edited_and_deactivated_with_revision_control(tm
         "expected_revision": 1, "name": "Updated product", "category_name": "Cleaning",
         "brand_name": None, "purchase_price": "2.50", "selling_price": "4.00", "tax_rate": "5",
     })
-    assert updated.status_code == 200 and updated.json()["revision"] == 2
+    assert updated.status_code == 409
+    assert "governed Products editor" in updated.json()["detail"]
     stale = client.post("/api/v1/master-data/products/SKU-001/deactivate", headers=headers,
                         json={"expected_revision": 1})
     assert stale.status_code == 409
     inactive = client.post("/api/v1/master-data/products/SKU-001/deactivate", headers=headers,
-                           json={"expected_revision": 2, "note": "Stopped"})
-    assert inactive.status_code == 200 and inactive.json()["master_status"] == "inactive"
-    blocked_draft = client.post("/api/v1/drafts", headers=headers, json={
-        "document_type": "sale", "party_code": "CO-001", "location_code": "SHJ",
-        "discount_amount": "0", "lines": [{"sku": "SKU-001", "quantity": "1",
-            "uom": "Piece", "unit_price": "4.00", "tax_rate": "5"}],
-    })
-    assert blocked_draft.status_code == 422
-    assert "inactive in the operational master" in blocked_draft.json()["detail"]
+                           json={"expected_revision": 1, "note": "Stopped"})
+    assert inactive.status_code == 409
+    assert client.get("/api/v1/products?q=SKU-001").json()["items"][0]["master_status"] == "active"
+
+
+def test_product_editor_api_proposes_complete_inactive_hierarchy(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_ADMIN_USERNAME", "asas-admin")
+    monkeypatch.setenv("ASAS_ADMIN_PASSWORD_HASH", hash_password("temporary strong password"))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'product-editor.db'}")
+    client = preview_client(tmp_path)
+    login = client.post("/api/v1/auth/login", json={"username": "asas-admin", "password": "temporary strong password"}).json()
+    headers = {"X-CSRF-Token": login["csrf_token"]}
+    candidate = client.post("/api/v1/product-editor/barcodes/generate", headers=headers,
+        json={"sku": "NEW-001", "name": "New carton", "pack_level": "outer", "uom": "CARTON", "factor_to_base": "24"})
+    assert candidate.status_code == 200 and candidate.json()["reserved"] is False, (candidate.text,
+        [(r.path, getattr(r, "methods", None)) for r in client.app.routes if "product-editor" in r.path])
+    body = {"sku": "NEW-001", "name": "New carton", "category_name": "Packaging", "base_uom": "PCS",
+        "specifications": [{"specification_type": "Capacity", "specification_value": "500", "unit_label": "ml"}],
+        "uom_conversions": [{"uom": "CARTON", "factor_to_base": "24", "pack_level": "outer",
+            "barcode": candidate.json()["barcode"], "is_default_purchase": True}]}
+    duplicate = client.post("/api/v1/product-editor/duplicate-check", json=body)
+    assert duplicate.status_code == 200 and duplicate.json()["duplicate"] is False
+    missing = client.post("/api/v1/product-editor/changes", headers=headers, json={"product": body})
+    assert missing.status_code == 409 and "saved product category" in missing.json()["detail"]
+    for kind, name in (("category", "Packaging"), ("uom", "PCS"), ("uom", "CARTON")):
+        created = client.post(f"/api/v1/product-editor/master/{kind}", headers=headers, json={"name": name})
+        assert created.status_code == 201, created.text
+    assert client.post("/api/v1/product-editor/master/uom", headers=headers,
+        json={"name": "carton"}).status_code == 409
+    proposed = client.post("/api/v1/product-editor/changes", headers=headers, json={"product": body})
+    assert proposed.status_code == 201 and proposed.json()["status"] == "pending"
+    assert client.get("/api/v1/products?q=NEW-001").json()["total"] == 0
+    catalog = client.get("/api/v1/product-editor/catalog").json()
+    assert catalog["categories"] == ["Packaging"]
+    assert catalog["units"] == ["CARTON", "PCS"]
+    assert any(row["sku"] == "NEW-001" for row in catalog["pending"])
+    legacy = client.post("/api/v1/warehouse-controls/product-uoms", headers=headers,
+        json={"sku": "NEW-001", "uom": "BOX", "factor_to_base": "12", "pack_level": "outer"})
+    assert legacy.status_code in {409, 422}
 
 
 def test_operational_product_register_exposes_every_record_through_pagination(tmp_path, monkeypatch):
@@ -2004,6 +2403,49 @@ def test_cash_account_api_requires_independent_approval(tmp_path, monkeypatch):
     assert workspace["posting_enabled"] is False
 
 
+def test_fx_reference_api_stays_non_posting_and_requires_independent_approval(tmp_path, monkeypatch):
+    maker_password = "fx maker temporary password"
+    approver_password = "fx approver temporary password"
+    users_file = tmp_path / "fx-users.json"
+    users_file.write_text(json.dumps({"users": [
+        {"id": 1, "username": "fx-maker", "password_hash": hash_password(maker_password),
+         "roles": ["finance_maker"], "permissions": ["clone.read", "fx.rate.read", "fx.rate.prepare"],
+         "allowed_locations": ["*"]},
+        {"id": 2, "username": "fx-approver", "password_hash": hash_password(approver_password),
+         "roles": ["finance_approver"], "permissions": ["clone.read", "fx.rate.read", "fx.rate.approve"],
+         "allowed_locations": ["*"]},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'fx-api.db'}")
+    client = preview_client(tmp_path)
+    maker = client.post("/api/v1/auth/login", json={
+        "username": "fx-maker", "password": maker_password}).json()
+    day = date.today().isoformat()
+    payload = {"currency_code": "USD", "rate_date": day, "aed_per_unit": "3.67250000",
+        "source_name": "Published rate source", "source_reference": "Evidence document 123",
+        "reason": "Foreign supplier planning"}
+    assert client.post("/api/v1/finance/fx-rates", json=payload).status_code == 403
+    created = client.post("/api/v1/finance/fx-rates", json=payload,
+        headers={"X-CSRF-Token": maker["csrf_token"]})
+    assert created.status_code == 201 and created.json()["status"] == "pending"
+    key = created.json()["rate_key"]
+    lookup = f"/api/v1/finance/fx-rates/lookup?currency_code=USD&rate_date={day}"
+    assert client.get(lookup).status_code == 404
+    assert client.post(f"/api/v1/finance/fx-rates/{key}/approve",
+        json={"expected_revision": 1, "note": "Attempted self approval"},
+        headers={"X-CSRF-Token": maker["csrf_token"]}).status_code == 403
+    client.post("/api/v1/auth/logout", headers={"X-CSRF-Token": maker["csrf_token"]})
+    approver = client.post("/api/v1/auth/login", json={
+        "username": "fx-approver", "password": approver_password}).json()
+    approved = client.post(f"/api/v1/finance/fx-rates/{key}/approve",
+        json={"expected_revision": 1, "note": "Evidence independently checked"},
+        headers={"X-CSRF-Token": approver["csrf_token"]})
+    assert approved.status_code == 200 and approved.json()["status"] == "approved"
+    assert client.get(lookup).json()["purpose"] == "commercial_reference_only"
+    assert client.get("/api/v1/finance/fx-rates").json()["transaction_use_enabled"] is False
+
+
 def test_expense_and_petty_cash_workspace_is_wired():
     static = Path(__file__).parents[1] / "src" / "klen_clone" / "static"
     expense = (static / "expenses.js").read_text(encoding="utf-8")
@@ -2294,3 +2736,66 @@ def test_cutover_rehearsal_workspace_and_exports_are_wired_into_shell():
     assert 'data-route="cutover-rehearsal"' in shell
     assert "/static/cutover-rehearsal.js?v=" in shell
     assert "cutoverRehearsalWorkspace" in router
+
+
+def test_opening_ledger_api_is_permissioned_and_nonposting(tmp_path, monkeypatch):
+    users_file = tmp_path / "opening-users.json"
+    users_file.write_text(json.dumps({"users": [
+        {"id": 1, "username": "opening-maker", "password_hash": hash_password("maker password"),
+         "roles": ["finance_maker"], "permissions": ["clone.read", "opening_balance.read",
+            "opening_balance.prepare", "opening_balance.approve"], "allowed_locations": ["*"]},
+        {"id": 2, "username": "opening-checker", "password_hash": hash_password("checker password"),
+         "roles": ["finance_approver"], "permissions": ["clone.read", "opening_balance.read",
+            "opening_balance.approve"], "allowed_locations": ["*"]},
+    ]}), encoding="utf-8")
+    monkeypatch.setenv("ASAS_AUTH_ENABLED", "true")
+    monkeypatch.setenv("ASAS_USERS_FILE", str(users_file))
+    monkeypatch.setenv("ASAS_OPERATIONAL_DATABASE_URL", f"sqlite:///{tmp_path / 'opening.db'}")
+    client = preview_client(tmp_path)
+    with client.app.state.operational_sessions() as session:
+        for code in ("1100", "3100"):
+            account = session.scalar(select(OperationalChartAccount).where(
+                OperationalChartAccount.account_code == code))
+            account.status = "active"
+        session.commit()
+    maker = client.post("/api/v1/auth/login", json={
+        "username": "opening-maker", "password": "maker password"}).json()
+    headers = {"X-CSRF-Token": maker["csrf_token"]}
+    payload = {"cutoff_date": "2026-09-30", "source_reference": "SYNTHETIC-API",
+        "source_sha256": "a" * 64, "source_atomic": False,
+        "stock_evidence_reference": "SYNTHETIC-STOCK", "stock_value": "0.00",
+        "lines": [{"account_code": "1100", "debit": "10.00"},
+                  {"account_code": "3100", "credit": "10.00"}], "party_balances": []}
+    assert client.post("/api/v1/finance/opening-ledger", json=payload).status_code == 403
+    created = client.post("/api/v1/finance/opening-ledger", headers=headers, json=payload)
+    assert created.status_code == 200, created.text
+    key = created.json()["package_key"]
+    assert created.json()["posting_enabled"] is False
+    assert created.json()["opening_balances_certified"] is False
+    assert client.post("/api/v1/finance/opening-ledger", headers=headers, json=payload).status_code == 409
+    assert client.get("/api/v1/finance/opening-ledger").json()["items"][0]["package_key"] == key
+    submitted = client.post(f"/api/v1/finance/opening-ledger/{key}/submit", headers=headers,
+        json={"expected_revision": 1, "note": "Synthetic test"})
+    assert submitted.status_code == 200, submitted.text
+    assert client.post(f"/api/v1/finance/opening-ledger/{key}/approve", headers=headers,
+        json={"expected_revision": 2, "note": "Self approval attempt"}).status_code == 403
+    checker = client.post("/api/v1/auth/login", json={
+        "username": "opening-checker", "password": "checker password"}).json()
+    approved = client.post(f"/api/v1/finance/opening-ledger/{key}/approve",
+        headers={"X-CSRF-Token": checker["csrf_token"]},
+        json={"expected_revision": 2, "note": "Rehearsal mathematics checked"})
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "approved_rehearsal"
+    with client.app.state.operational_sessions() as session:
+        assert session.scalar(select(OperationalOpeningLedgerPackage)).posting_enabled is False
+
+
+def test_opening_ledger_accounting_workspace_is_wired():
+    static_root = Path(__file__).parents[1] / "src" / "klen_clone" / "static"
+    shell = (static_root / "erp.html").read_text(encoding="utf-8")
+    router = (static_root / "erp.js").read_text(encoding="utf-8")
+    panel = (static_root / "opening-ledger.js").read_text(encoding="utf-8")
+    assert '/static/opening-ledger.js?' in shell
+    assert 'await openingLedgerPanel()' in router
+    assert '/api/v1/finance/opening-ledger' in panel
+    assert 'posting' in panel and 'rehearsal' in panel

@@ -186,14 +186,14 @@ def decide_vat_adjustment(session: Session, row: OperationalVatAdjustment, *, ac
 def _vat_sources(session: Session, period: OperationalVatPeriod) -> list[dict]:
     rows: list[dict] = []
     for invoice in session.scalars(select(OperationalCustomerInvoice).where(
-            OperationalCustomerInvoice.status == "approved",
+            OperationalCustomerInvoice.status.in_(("approved", "posted")),
             OperationalCustomerInvoice.invoice_date.between(period.starts_on, period.ends_on))):
         rows.append({"source_type": "customer_invoice", "reference": invoice.invoice_no,
             "date": invoice.invoice_date, "location": invoice.location_code,
             "taxable": _money(invoice.subtotal - invoice.discount_amount),
             "output_vat": _money(invoice.tax_amount), "input_vat": Decimal("0.00")})
     for returned in session.scalars(select(OperationalSalesReturn).where(
-            OperationalSalesReturn.status == "approved",
+            OperationalSalesReturn.status.in_(("approved", "posted")),
             OperationalSalesReturn.return_date.between(period.starts_on, period.ends_on))):
         rows.append({"source_type": "sales_credit_note", "reference": returned.return_no,
             "date": returned.return_date, "location": returned.location_code,

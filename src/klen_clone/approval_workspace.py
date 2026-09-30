@@ -35,6 +35,8 @@ def _source(workflow: str, table: str, route: str, permissions: Iterable[str], s
 # decisions: users are routed to the owning workspace, whose existing endpoint
 # remains authoritative for permission, revision, scope and maker-checker checks.
 APPROVAL_SOURCES = (
+    _source("Product creation or amendment", "operational_product_change_requests", "products", {"product.approve"},
+            "pending", "change_key", "sku", "created_by"),
     _source("Operating branch", "operational_branches", "company-setup", {"enterprise.approve"},
             "pending_approval", "branch_key", "branch_code", "created_by"),
     _source("Warehouse activation", "operational_warehouses", "company-setup", {"enterprise.approve"},
@@ -68,6 +70,15 @@ APPROVAL_SOURCES = (
             "created_by", location="location_code"),
     _source("Sales return", "operational_sales_returns", "sales-returns", {"sales_return.approve"},
             "submitted", "return_key", "return_no", "created_by", location="location_code"),
+    _source("Pricing-only customer credit", "operational_customer_price_credits",
+            "sales-returns", {"customer_price_credit.approve"}, "submitted",
+            "credit_key", "credit_no", "created_by", location="location_code"),
+    _source("Customer refund", "operational_customer_refunds", "sales-returns",
+            {"customer_refund.approve"}, "submitted", "refund_key", "refund_no",
+            "created_by", location="location_code"),
+    _source("Refund compensating receipt", "operational_customer_refund_recoveries",
+            "sales-returns", {"customer_refund_recovery.approve"}, "submitted",
+            "recovery_key", "recovery_no", "created_by", location="location_code"),
     _source("Purchase return", "operational_purchase_returns", "purchase-returns", {"purchase_return.approve"},
             "submitted", "return_key", "return_no", "created_by", location="location_code"),
     _source("Receipt or payment", "operational_payments", "payments", {"payment.approve"},
